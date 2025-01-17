@@ -1,0 +1,3 @@
+nautilus-env/
+*.log
+__pycache__/
