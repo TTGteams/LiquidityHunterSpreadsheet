@@ -62,7 +62,19 @@ def trade_signal():
         df = pd.DataFrame([data])
 
         # Parse the timestamp with millisecond precision
-        df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S.%f')
+        #df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S.%f')
+        
+        # 1) First try parsing with seconds (but no fractional seconds)
+        df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+
+        # 2) For any rows that didn’t parse (NaT), try again with just minutes
+        mask = df['Time'].isna()
+        if mask.any():
+            df.loc[mask, 'Time'] = pd.to_datetime(
+                df.loc[mask, 'Time'],
+                format='%Y-%m-%d %H:%M',
+                errors='coerce'
+            )
 
         # Set 'Time' as the index
         df.set_index('Time', inplace=True)
@@ -70,7 +82,10 @@ def trade_signal():
         # Process the new data point through the algorithm
         with state_lock:
             signal = process_market_data(df)
-        trade_logger.info(f"Generated signal: {signal}")
+
+        # UPDATED: Only log a signal if not None
+        if signal is not None:
+            trade_logger.info(f"Generated signal: {signal}")
 
         # Return the signal
         return jsonify({'signal': signal}), 200

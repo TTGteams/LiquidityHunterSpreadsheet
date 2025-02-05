@@ -122,6 +122,9 @@ def update_bars_with_tick(tick_time, tick_price):
     """
     Incrementally build or update the current 15-minute bar,
     then finalize it when the bar ends and start a new bar.
+    
+    UPDATED: Logs a confirmation message to debug_logger after finalizing a bar,
+    including OHLC, RSI/MACD if enough data, and rolling bar count.
     """
     global current_bar_start, current_bar_data, bars
 
@@ -148,7 +151,39 @@ def update_bars_with_tick(tick_time, tick_price):
             current_bar_data["low"] = tick_price
     else:
         # We have crossed into a new 15-min bar => finalize the old bar
+        old_open = current_bar_data["open"]
+        old_high = current_bar_data["high"]
+        old_low = current_bar_data["low"]
+        old_close = current_bar_data["close"]
+
         bars.loc[current_bar_start] = current_bar_data
+
+        # ------------------ ADDED CODE: Log bar confirmation ------------------
+        bar_count = len(bars)
+        rsi_str = "Not enough data"
+        macd_str = "Not enough data"
+
+        # Example threshold for indicators:
+        if bar_count >= 35:
+            rolling_window_data = bars.tail(384).copy()
+            close_series = rolling_window_data["close"].dropna()
+            if len(close_series) >= 35:
+                # Compute RSI and MACD
+                rsi_vals = ta.rsi(close_series, length=14)
+                macd_vals = ta.macd(close_series, fast=12, slow=26, signal=9)
+                if rsi_vals is not None and not rsi_vals.dropna().empty:
+                    rsi_str = f"{rsi_vals.iloc[-1]:.2f}"
+                if macd_vals is not None and not macd_vals.dropna().empty:
+                    macd_line = macd_vals["MACD_12_26_9"]
+                    macd_str = f"{macd_line.iloc[-1]:.2f}"
+
+        debug_logger.info(
+            f"Finalized bar at {current_bar_start} | "
+            f"OHLC=({old_open},{old_high},{old_low},{old_close}) | "
+            f"Rolling bars count={bar_count}, max=384 | "
+            f"RSI={rsi_str}, MACD={macd_str}"
+        )
+        # ----------------------------------------------------------------------
 
         # Start a new bar
         current_bar_start = bar_start
