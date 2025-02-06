@@ -122,9 +122,6 @@ def update_bars_with_tick(tick_time, tick_price):
     """
     Incrementally build or update the current 15-minute bar,
     then finalize it when the bar ends and start a new bar.
-    
-    UPDATED: Logs a confirmation message to debug_logger after finalizing a bar,
-    including OHLC, RSI/MACD if enough data, and rolling bar count.
     """
     global current_bar_start, current_bar_data, bars
 
@@ -156,19 +153,21 @@ def update_bars_with_tick(tick_time, tick_price):
         old_low = current_bar_data["low"]
         old_close = current_bar_data["close"]
 
+        # Ensure bars has a proper DateTimeIndex
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            bars.index = pd.to_datetime(bars.index)
+
         bars.loc[current_bar_start] = current_bar_data
 
-        # ------------------ ADDED CODE: Log bar confirmation ------------------
         bar_count = len(bars)
         rsi_str = "Not enough data"
         macd_str = "Not enough data"
 
-        # Example threshold for indicators:
+        # If we have at least 35 bars, attempt to compute RSI/MACD
         if bar_count >= 35:
             rolling_window_data = bars.tail(384).copy()
             close_series = rolling_window_data["close"].dropna()
             if len(close_series) >= 35:
-                # Compute RSI and MACD
                 rsi_vals = ta.rsi(close_series, length=14)
                 macd_vals = ta.macd(close_series, fast=12, slow=26, signal=9)
                 if rsi_vals is not None and not rsi_vals.dropna().empty:
@@ -177,13 +176,13 @@ def update_bars_with_tick(tick_time, tick_price):
                     macd_line = macd_vals["MACD_12_26_9"]
                     macd_str = f"{macd_line.iloc[-1]:.2f}"
 
-        debug_logger.info(
+        debug_logger.warning(
             f"Finalized bar at {current_bar_start} | "
             f"OHLC=({old_open},{old_high},{old_low},{old_close}) | "
             f"Rolling bars count={bar_count}, max=384 | "
-            f"RSI={rsi_str}, MACD={macd_str}"
+            f"RSI={rsi_str}, MACD={macd_str} | "
+            f"Zones in dict={len(current_valid_zones_dict)}"
         )
-        # ----------------------------------------------------------------------
 
         # Start a new bar
         current_bar_start = bar_start
@@ -196,9 +195,12 @@ def update_bars_with_tick(tick_time, tick_price):
 
     # Keep last 72 hours of bars for indicator calculations
     cutoff_time = tick_time - pd.Timedelta(hours=72)
+    
+    # Ensure index is datetime before filtering
+    if not isinstance(bars.index, pd.DatetimeIndex):
+        bars.index = pd.to_datetime(bars.index)
+    
     bars = bars[bars.index >= cutoff_time]
-
-
 # --------------------------------------------------------------------------
 # ZONE DETECTION (CUMULATIVE LOGIC)
 # --------------------------------------------------------------------------
@@ -294,7 +296,6 @@ def set_support_resistance_lines(data):
     debug_logger.debug("Resistance_Line types: {}".format(data['Resistance_Line'].apply(lambda x: type(x)).unique()))
     return data
 
-
 # --------------------------------------------------------------------------
 # REVERTED remove_consecutive_losers to ALLOW second chances
 # --------------------------------------------------------------------------
@@ -337,7 +338,6 @@ def remove_consecutive_losers(trades, current_valid_zones_dict):
 
     return current_valid_zones_dict
 
-
 # --------------------------------------------------------------------------
 # Check current price vs. support/resistance to invalidate zones
 # --------------------------------------------------------------------------
@@ -368,7 +368,6 @@ def invalidate_zones_via_sup_and_resist(current_price, current_valid_zones_dict)
         del current_valid_zones_dict[zone_id]
 
     return current_valid_zones_dict
-
 
 # --------------------------------------------------------------------------
 # check_entry_conditions with explicit one-trade logic
@@ -469,7 +468,6 @@ def check_entry_conditions(data, i, current_valid_zones_dict):
 
     return current_valid_zones_dict
 
-
 # --------------------------------------------------------------------------
 # manage_trades
 # --------------------------------------------------------------------------
@@ -488,8 +486,15 @@ def manage_trades(current_price, current_time):
     trades_to_process = [t for t in trades if t['status'] == 'open']
     
     for trade in trades_to_process:
+        # Skip if trade is already closed (shouldn't happen but safe check)
+        if trade.get('status') != 'open':
+            continue
+            
+        # Track if this specific trade was closed in this iteration
+        trade_closed = False
+        
         if trade['direction'] == 'long':
-            if current_price <= trade['stop_loss']:
+            if current_price <= trade['stop_loss'] and not trade_closed:
                 trade_result = (trade['stop_loss'] - trade['entry_price']) * trade['position_size']
                 balance += trade_result
                 trade.update({
@@ -501,8 +506,9 @@ def manage_trades(current_price, current_time):
                 })
                 trade_logger.info(f"Long trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
                 closed_any_trade = True
+                trade_closed = True
 
-            elif current_price >= trade['take_profit']:
+            elif current_price >= trade['take_profit'] and not trade_closed:
                 trade_result = (trade['take_profit'] - trade['entry_price']) * trade['position_size']
                 balance += trade_result
                 trade.update({
@@ -514,9 +520,10 @@ def manage_trades(current_price, current_time):
                 })
                 trade_logger.info(f"Long trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
                 closed_any_trade = True
+                trade_closed = True
 
         elif trade['direction'] == 'short':
-            if current_price >= trade['stop_loss']:
+            if current_price >= trade['stop_loss'] and not trade_closed:
                 trade_result = (trade['entry_price'] - trade['stop_loss']) * trade['position_size']
                 balance += trade_result
                 trade.update({
@@ -528,8 +535,9 @@ def manage_trades(current_price, current_time):
                 })
                 trade_logger.info(f"Short trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
                 closed_any_trade = True
+                trade_closed = True
 
-            elif current_price <= trade['take_profit']:
+            elif current_price <= trade['take_profit'] and not trade_closed:
                 trade_result = (trade['entry_price'] - trade['take_profit']) * trade['position_size']
                 balance += trade_result
                 trade.update({
@@ -541,14 +549,13 @@ def manage_trades(current_price, current_time):
                 })
                 trade_logger.info(f"Short trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
                 closed_any_trade = True
+                trade_closed = True
 
     # Validate trade state after processing
     validate_trade_state(current_time, current_price)
     log_trade_state(current_time, "after_manage")
     
     return closed_any_trade
-
-
 # --------------------------------------------------------------------------
 # MAIN TICK HANDLER
 # --------------------------------------------------------------------------
@@ -576,6 +583,7 @@ def process_market_data(new_data_point):
         log_trade_state(tick_time, "start_processing")
 
         # 3) Append to historical ticks, trim to 12 hours
+        global historical_ticks
         historical_ticks = pd.concat([historical_ticks, new_data_point])
         latest_time = new_data_point.index[-1]
         cutoff_time = latest_time - pd.Timedelta(hours=12)
@@ -645,7 +653,11 @@ def process_market_data(new_data_point):
         # 13) Determine final signal: buy, sell, close, or None
         # -----------------------------------------------------------------
         if closed_any_trade:
-            raw_signal = 'close'
+            # Only generate close signal if we haven't already generated one for this trade
+            if last_non_hold_signal not in ['close']:
+                raw_signal = 'close'
+            else:
+                raw_signal = None
         elif new_trade_opened:
             # Figure out direction of the newly opened trade
             if trades[-1]['direction'] == 'long':
@@ -661,7 +673,7 @@ def process_market_data(new_data_point):
             raw_signal = None
 
         # 15) Update the last_non_hold_signal if we have a real signal
-        if raw_signal in ['buy', 'sell', 'close']:
+        if raw_signal is not None:
             last_non_hold_signal = raw_signal
 
         # 16) Log and return the final signal
@@ -673,22 +685,34 @@ def process_market_data(new_data_point):
     except Exception as e:
         debug_logger.error(f"Error in process_market_data: {e}", exc_info=True)
         return None
-
-
 # --------------------------------------------------------------------------
 # OPTIONAL: Warmup script integration
 # --------------------------------------------------------------------------
-try:
-    from secondary_warmer_script import warmup_data
-
-    def main():
+def main():
+    try:
+        from secondary_warmer_script import warmup_data
         precomputed_bars, precomputed_zones = warmup_data()
         load_preexisting_bars_and_indicators(precomputed_bars)
         load_preexisting_zones(precomputed_zones)
+        
+        # Get the latest RSI and MACD values
+        latest_rsi = precomputed_bars['RSI'].iloc[-1] if not precomputed_bars['RSI'].empty else "N/A"
+        latest_macd = precomputed_bars['MACD_Line'].iloc[-1] if not precomputed_bars['MACD_Line'].empty else "N/A"
+        latest_signal = precomputed_bars['Signal_Line'].iloc[-1] if not precomputed_bars['Signal_Line'].empty else "N/A"
+        
+        # Enhanced logging
+        debug_logger.warning(
+            f"Algorithm warmup completed successfully:\n"
+            f"- Loaded {len(precomputed_bars)} bars\n"
+            f"- Initialized {len(current_valid_zones_dict)} liquidity zones\n"
+            f"- Latest indicators:\n"
+            f"  * RSI: {latest_rsi:.2f}\n"
+            f"  * MACD: {latest_macd:.6f}\n"
+            f"  * Signal: {latest_signal:.6f}"
+        )
         trade_logger.info("Warm-up complete. Ready for live ticks.")
+        
+    except ImportError:
+        debug_logger.warning("secondary_warmer_script not found. Running with empty bars and zones.")
 
-    if __name__ == "__main__":
-        main()
 
-except ImportError:
-    debug_logger.warning("secondary_warmer_script not found. Running with empty bars and zones.")

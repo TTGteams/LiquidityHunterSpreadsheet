@@ -123,18 +123,7 @@ def fetch_data_from_sql():
     )
     cnxn = pyodbc.connect(conn_str)
     query = """
-SELECT 
-    [ID],
-    [BarDateTime],
-    [Identifier],
-    [BarSize],
-    [Open],
-    [High],
-    [Low],
-    [Close]
-FROM 
-(
-    SELECT TOP (300000)
+    SELECT TOP (300000) 
         [ID],
         [BarDateTime],
         [Identifier],
@@ -145,10 +134,7 @@ FROM
         [Close]
     FROM [TTG].[dbo].[HistoData]
     WHERE [Identifier] = 'EUR.USD'
-    ORDER BY [BarDateTime] DESC
-) AS Sub
-ORDER BY [BarDateTime] ASC;
-
+    ORDER BY [BarDateTime] DESC;
     """
     df = pd.read_sql(query, cnxn)
     cnxn.close()

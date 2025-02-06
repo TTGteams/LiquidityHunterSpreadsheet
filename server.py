@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import pandas as pd
-from algorithm import process_market_data  # Unchanged import for the main algo function
+import algorithm
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
@@ -12,7 +12,8 @@ trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
 
 trade_logger.setLevel(logging.INFO)
-debug_logger.setLevel(logging.INFO)  # Change to DEBUG if detailed logs are needed
+# CHANGED from INFO to WARNING:
+debug_logger.setLevel(logging.WARNING)
 
 trade_logger.propagate = False
 debug_logger.propagate = False
@@ -34,7 +35,8 @@ debug_handler = RotatingFileHandler(
     backupCount=2
 )
 
-# Capture DEBUG and above
+# Capture DEBUG and above, but the logger itself is set to WARNING,
+# so effectively we only see WARNING/ERROR/CRITICAL messages.
 debug_handler.setLevel(logging.DEBUG)
 debug_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 debug_handler.setFormatter(debug_formatter)
@@ -47,7 +49,8 @@ state_lock = threading.Lock()
 def trade_signal():
     try:
         content = request.json
-        trade_logger.info(f"Received data: {content}")  # Use trade_logger instead of root logger
+        # REMOVED LINE: trade_logger.info(f"Received data: {content}")
+
         data = content['data']
 
         # Validate input data
@@ -67,7 +70,7 @@ def trade_signal():
         # 1) First try parsing with seconds (but no fractional seconds)
         df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
 
-        # 2) For any rows that didn’t parse (NaT), try again with just minutes
+        # 2) For any rows that didn't parse (NaT), try again with just minutes
         mask = df['Time'].isna()
         if mask.any():
             df.loc[mask, 'Time'] = pd.to_datetime(
@@ -81,9 +84,9 @@ def trade_signal():
 
         # Process the new data point through the algorithm
         with state_lock:
-            signal = process_market_data(df)
+            signal = algorithm.process_market_data(df)
 
-        # UPDATED: Only log a signal if not None
+        # Only log if signal is not None
         if signal is not None:
             trade_logger.info(f"Generated signal: {signal}")
 
@@ -95,9 +98,9 @@ def trade_signal():
         return jsonify({'error': str(e)}), 400
 
 if __name__ == '__main__':
-    # NEW: Warm up the main algorithm before starting the server.py script
+    # Warm up the main algorithm before starting the server.py script
     import algorithm
     algorithm.main()  # Calls warmup_data() via algorithm.main(), so bars & zones are ready
 
     # Run the app with waitress or your preferred WSGI server
-    serve(app, host='0.0.0.0', port=5001)
+    serve(app, host='0.0.0.0', port=5000)
