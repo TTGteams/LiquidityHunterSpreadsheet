@@ -569,11 +569,11 @@ def process_market_data(new_data_point):
         raw_price = float(new_data_point['Price'].iloc[0])
         if raw_price < 0.5 or raw_price > 1.5:
             debug_logger.error(f"Received price ({raw_price}) outside normal range [0.5, 1.5]. Ignoring.")
-            return None
+            return 'hold'
 
         if pd.isna(new_data_point['Price'].iloc[0]):
             debug_logger.error("Received NaN or None price value")
-            return None
+            return 'hold'
 
         tick_time = new_data_point.index[-1]
         tick_price = float(new_data_point['Price'].iloc[-1])
@@ -600,11 +600,11 @@ def process_market_data(new_data_point):
 
         # 7) Check if we have enough bar data
         if bars.empty:
-            return None
+            return 'hold'
 
         rolling_window_data = bars.tail(384).copy()
         if len(rolling_window_data) < 35:
-            return None
+            return 'hold'
 
         rolling_window_data['close'] = rolling_window_data['close'].where(
             rolling_window_data['close'].notnull(), np.nan
@@ -615,11 +615,11 @@ def process_market_data(new_data_point):
         macd = ta.macd(rolling_window_data['close'], fast=12, slow=26, signal=9)
         
         if macd is None or macd.empty:
-            return None
+            return 'hold'
 
         macd.dropna(inplace=True)
         if macd.empty:
-            return None
+            return 'hold'
 
         rolling_window_data['MACD_Line'] = macd['MACD_12_26_9']
         rolling_window_data['Signal_Line'] = macd['MACDs_12_26_9']
@@ -650,14 +650,14 @@ def process_market_data(new_data_point):
         log_trade_state(tick_time, "end_processing")
 
         # -----------------------------------------------------------------
-        # 13) Determine final signal: buy, sell, close, or None
+        # 13) Determine final signal: buy, sell, close, or 'hold'
         # -----------------------------------------------------------------
         if closed_any_trade:
             # Only generate close signal if we haven't already generated one for this trade
             if last_non_hold_signal not in ['close']:
                 raw_signal = 'close'
             else:
-                raw_signal = None
+                raw_signal = 'hold'
         elif new_trade_opened:
             # Figure out direction of the newly opened trade
             if trades[-1]['direction'] == 'long':
@@ -665,26 +665,26 @@ def process_market_data(new_data_point):
             else:
                 raw_signal = 'sell'
         else:
-            raw_signal = None
+            raw_signal = 'hold'
 
         # 14) Block consecutive opens (either 'buy' or 'sell')
         if raw_signal in ['buy', 'sell'] and last_non_hold_signal in ['buy', 'sell']:
-            # Already had a 'buy' or 'sell' before, so block a new open
-            raw_signal = None
+            # Already had a 'buy' or 'sell' before, so return hold
+            raw_signal = 'hold'
 
         # 15) Update the last_non_hold_signal if we have a real signal
-        if raw_signal is not None:
+        if raw_signal not in ['hold']:
             last_non_hold_signal = raw_signal
 
-        # 16) Log and return the final signal
-        if raw_signal is not None:
+        # 16) Log only non-hold signals
+        if raw_signal not in ['hold']:
             trade_logger.info(f"Signal determined: {raw_signal}")
 
         return raw_signal
 
     except Exception as e:
         debug_logger.error(f"Error in process_market_data: {e}", exc_info=True)
-        return None
+        return 'hold'
 # --------------------------------------------------------------------------
 # OPTIONAL: Warmup script integration
 # --------------------------------------------------------------------------

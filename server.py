@@ -49,10 +49,7 @@ state_lock = threading.Lock()
 def trade_signal():
     try:
         content = request.json
-        # REMOVED LINE: trade_logger.info(f"Received data: {content}")
-
         data = content['data']
-
         # Validate input data
         required_fields = ['Time', 'Price']
         for field in required_fields:
@@ -63,13 +60,10 @@ def trade_signal():
 
         # Convert the data to a DataFrame
         df = pd.DataFrame([data])
-
-        # Parse the timestamp with millisecond precision
-        #df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S.%f')
         
         # 1) First try parsing with seconds (but no fractional seconds)
         df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
-
+        
         # 2) For any rows that didn't parse (NaT), try again with just minutes
         mask = df['Time'].isna()
         if mask.any():
@@ -78,21 +72,21 @@ def trade_signal():
                 format='%Y-%m-%d %H:%M',
                 errors='coerce'
             )
-
+            
         # Set 'Time' as the index
         df.set_index('Time', inplace=True)
-
+        
         # Process the new data point through the algorithm
         with state_lock:
             signal = algorithm.process_market_data(df)
-
-        # Only log if signal is not None
-        if signal is not None:
+            
+        # Only log if signal is not 'hold'
+        if signal != 'hold':
             trade_logger.info(f"Generated signal: {signal}")
-
-        # Return the signal
+            
+        # Always return the signal, even if it's 'hold'
         return jsonify({'signal': signal}), 200
-
+        
     except Exception as e:
         debug_logger.error(f"Error occurred: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 400
@@ -104,3 +98,4 @@ if __name__ == '__main__':
 
     # Run the app with waitress or your preferred WSGI server
     serve(app, host='0.0.0.0', port=5000)
+    
