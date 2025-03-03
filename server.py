@@ -50,6 +50,16 @@ def trade_signal():
     try:
         content = request.json
         data = content['data']
+        
+        # Extract currency from request, default to EUR.USD if not provided
+        currency = content.get('currency', 'EUR.USD')
+        
+        # Validate currency is in supported list
+        if currency not in algorithm.SUPPORTED_CURRENCIES:
+            error_msg = f"Unsupported currency: {currency}"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
+        
         # Validate input data
         required_fields = ['Time', 'Price']
         for field in required_fields:
@@ -61,31 +71,60 @@ def trade_signal():
         # Convert the data to a DataFrame
         df = pd.DataFrame([data])
         
-        # 1) First try parsing with seconds (but no fractional seconds)
-        df['Time'] = pd.to_datetime(df['Time'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+        # Add Currency column if provided in the request
+        if 'currency' in content:
+            df['Currency'] = content['currency']
         
-        # 2) For any rows that didn't parse (NaT), try again with just minutes
-        mask = df['Time'].isna()
-        if mask.any():
+        # Try multiple date formats in sequence until one works
+        # Format 1: Standard format with seconds (no ms) - '2023-05-15 14:30:00'
+        # Format 2: ISO format with T separator (no ms) - '2023-05-15T14:30:00'
+        # Format 3: Standard format with milliseconds - '2023-05-15 14:30:00.123'
+        # Format 4: ISO format with milliseconds - '2023-05-15T14:30:00.123'
+        # Format 5: Standard format with minutes only - '2023-05-15 14:30'
+        
+        # Initialize a series of NaT values
+        df['Time'] = pd.NaT
+        
+        # Try each format in sequence
+        formats_to_try = [
+            '%Y-%m-%d %H:%M:%S',      # Standard without ms
+            '%Y-%m-%dT%H:%M:%S',      # ISO format without ms
+            '%Y-%m-%d %H:%M:%S.%f',   # Standard with ms
+            '%Y-%m-%dT%H:%M:%S.%f',   # ISO format with ms
+            '%Y-%m-%d %H:%M'          # Minutes only
+        ]
+        
+        for fmt in formats_to_try:
+            # Only try to parse rows that are still NaT
+            mask = df['Time'].isna()
+            if not mask.any():
+                break  # All rows parsed, no need to try more formats
+                
             df.loc[mask, 'Time'] = pd.to_datetime(
-                df.loc[mask, 'Time'],
-                format='%Y-%m-%d %H:%M',
-                errors='coerce'
+                df.loc[mask, 'Time'].astype(str),  # Ensure string type
+                format=fmt,
+                errors='coerce'  # Don't raise error, just return NaT for failed parsing
             )
+        
+        # Check if we have any rows that still couldn't be parsed
+        if df['Time'].isna().any():
+            error_msg = "Could not parse time in any supported format"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
             
         # Set 'Time' as the index
         df.set_index('Time', inplace=True)
         
         # Process the new data point through the algorithm
         with state_lock:
-            signal = algorithm.process_market_data(df)
+            signal, processed_currency = algorithm.process_market_data(df, currency)
             
         # Only log if signal is not 'hold'
         if signal != 'hold':
-            trade_logger.info(f"Generated signal: {signal}")
+            trade_logger.info(f"Generated {processed_currency} signal: {signal}")
             
-        # Always return the signal, even if it's 'hold'
-        return jsonify({'signal': signal}), 200
+        # Always return the signal and currency, even if it's 'hold'
+        return jsonify({'signal': signal, 'currency': processed_currency}), 200
         
     except Exception as e:
         debug_logger.error(f"Error occurred: {e}", exc_info=True)
@@ -98,4 +137,3 @@ if __name__ == '__main__':
 
     # Run the app with waitress or your preferred WSGI server
     serve(app, host='0.0.0.0', port=5000)
-    
