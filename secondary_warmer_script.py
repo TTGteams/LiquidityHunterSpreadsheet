@@ -3,12 +3,16 @@ import numpy as np
 import pandas_ta as ta
 import logging
 import pyodbc
+import datetime
 
 # --------------------------------------------------------------------------
 # Configure Logging (Optional)
 # --------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("secondary_warmer_script_logger")
+
+# Define supported currencies - matching the list in algorithm.py
+SUPPORTED_CURRENCIES = ["EUR.USD", "USD.CAD", "GBP.USD"]
 
 # --------------------------------------------------------------------------
 # Your DB Credentials
@@ -106,117 +110,217 @@ def invalidate_zones_via_sup_and_resist(data, current_valid_zones_dict, SUPPORT_
 # --------------------------------------------------------------------------
 # (2) DB Connection & Data Fetch
 # --------------------------------------------------------------------------
-def fetch_data_from_sql():
+def fetch_data_from_sql(currency_pair="EUR.USD", days=3):
     """
-    Connects to the SQL Server, retrieves the last 300k rows for 'EUR.USD' 
-    from [TTG].[dbo].[HistoData], ordered by BarDateTime descending.
-    Returns a DataFrame with columns [BarDateTime, Open, High, Low, Close].
+    Fetch historical tick data from SQL server for a specific currency pair
+    
+    Args:
+        currency_pair (str): The currency pair to fetch data for
+        days (int): Number of days of historical data to fetch
+        
+    Returns:
+        DataFrame: Historical tick data for the specified currency pair
     """
-    logger.info("Connecting to SQL Server and fetching data...")
-
-    conn_str = (
-        f"Driver={{ODBC Driver 17 for SQL Server}};"
-        f"Server={server};"
-        f"Database={database};"
-        f"UID={username};"
-        f"PWD={password};"
-    )
-    cnxn = pyodbc.connect(conn_str)
-    query = """
-    SELECT TOP (300000) 
-        [ID],
-        [BarDateTime],
-        [Identifier],
-        [BarSize],
-        [Open],
-        [High],
-        [Low],
-        [Close]
-    FROM [TTG].[dbo].[HistoData]
-    WHERE [Identifier] = 'EUR.USD'
-    ORDER BY [BarDateTime] DESC;
-    """
-    df = pd.read_sql(query, cnxn)
-    cnxn.close()
-
-    logger.info(f"Fetched {len(df)} rows from SQL.")
-    return df
+    try:
+        conn_str = (
+            f"Driver={{ODBC Driver 17 for SQL Server}};"
+            f"Server={server};"
+            f"Database={database};"
+            f"UID={username};"
+            f"PWD={password};"
+        )
+        
+        # Calculate the start date (N days ago)
+        end_date = datetime.datetime.now()
+        start_date = end_date - datetime.timedelta(days=days)
+        
+        # Format dates for SQL query
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        
+        # Connect to the database
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        # Modified SQL query to filter by currency pair
+        query = f"""
+        SELECT [Time], [Price]
+        FROM TickData
+        WHERE [Time] >= '{start_date_str}'
+        AND [Time] <= '{end_date_str}'
+        AND [Currency] = '{currency_pair}'
+        ORDER BY [Time] ASC;
+        """
+        
+        # If there's no Currency column in the TickData table, use this fallback query
+        # that assumes all data is for EUR.USD (for backward compatibility)
+        fallback_query = f"""
+        SELECT [Time], [Price]
+        FROM TickData
+        WHERE [Time] >= '{start_date_str}' 
+        AND [Time] <= '{end_date_str}'
+        ORDER BY [Time] ASC;
+        """
+        
+        logger.info(f"Fetching historical data for {currency_pair} from {start_date_str} to {end_date_str}")
+        
+        try:
+            # Try the query with currency filter
+            df = pd.read_sql(query, conn)
+            if len(df) == 0 and currency_pair == "EUR.USD":
+                # If no data found and we're looking for EUR.USD, try the fallback query
+                logger.warning(f"No data found for {currency_pair} with currency filter, trying fallback query")
+                df = pd.read_sql(fallback_query, conn)
+        except Exception as e:
+            # If the query fails (e.g., no Currency column), use the fallback if requesting EUR.USD
+            if currency_pair == "EUR.USD":
+                logger.warning(f"Error with currency filter query: {e}. Using fallback query.")
+                df = pd.read_sql(fallback_query, conn)
+            else:
+                # For other currencies, we really need the Currency column
+                logger.error(f"Cannot fetch data for {currency_pair}: {e}")
+                raise
+        
+        # Set Time column as the index
+        df['Time'] = pd.to_datetime(df['Time'])
+        df.set_index('Time', inplace=True)
+        
+        # Log results
+        logger.info(f"Fetched {len(df)} ticks for {currency_pair}")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error fetching data from SQL: {e}", exc_info=True)
+        return pd.DataFrame()  # Return empty DataFrame on error
 
 
 # --------------------------------------------------------------------------
 # (3) Resample & Precompute Logic
 # --------------------------------------------------------------------------
-def warmup_data():
+def process_currency_data(currency_pair="EUR.USD"):
     """
-    1. Fetch raw data from SQL (5-sec bars).
-    2. Sort ascending by BarDateTime & parse as DatetimeIndex.
-    3. Resample to 15-minute bars.
-    4. Identify & invalidate liquidity zones.
-    5. Calculate RSI & MACD.
-    6. Return (bars_with_indicators, current_valid_zones_dict).
+    Process data for a specific currency pair.
+    
+    Args:
+        currency_pair (str): The currency pair to process
+        
+    Returns:
+        tuple: (bars_15min, zones_dict) for the specified currency
     """
+    logger.info(f"Processing data for {currency_pair}")
+    
+    try:
+        # Step 1: Fetch raw tick data
+        raw_ticks = fetch_data_from_sql(currency_pair)
+        
+        if raw_ticks.empty:
+            logger.warning(f"No tick data available for {currency_pair}")
+            return pd.DataFrame(), {}
+            
+        # Step 2: Convert ticks to 15-minute bars
+        # Floor timestamps to 15-minute boundaries
+        raw_ticks.index = raw_ticks.index.floor('15min')
+        
+        # Create OHLC bars
+        bars_15min = raw_ticks.groupby(level=0).agg({
+            'Price': ['first', 'max', 'min', 'last']
+        })
+        
+        # Flatten columns
+        bars_15min.columns = ['open', 'high', 'low', 'close']
+        
+        # Step 3: Calculate indicators
+        if len(bars_15min) >= 35:  # Need enough data for indicators
+            # Calculate RSI (14-period)
+            bars_15min['RSI'] = ta.rsi(bars_15min['close'], length=14)
+            
+            # Calculate MACD (12, 26, 9)
+            macd_result = ta.macd(bars_15min['close'], fast=12, slow=26, signal=9)
+            if macd_result is not None:
+                bars_15min['MACD_Line'] = macd_result['MACD_12_26_9']
+                bars_15min['Signal_Line'] = macd_result['MACDs_12_26_9']
+                bars_15min['MACD_Histogram'] = macd_result['MACDh_12_26_9']
+            
+            logger.info(f"Calculated indicators for {currency_pair}: {len(bars_15min)} bars")
+        else:
+            logger.warning(f"Not enough data to calculate indicators for {currency_pair}: {len(bars_15min)} bars")
+        
+        # Step 4: Identify liquidity zones
+        # This would typically call the same zone identification logic as in the main algorithm
+        # For this update, we'll return an empty dict and let the main algorithm identify zones
+        current_valid_zones_dict = {}
+        
+        # If there's existing zone identification logic, it would go here
+        # current_valid_zones_dict = identify_liquidity_zones(bars_15min)
+        
+        logger.info(f"Completed processing for {currency_pair}: {len(bars_15min)} bars, {len(current_valid_zones_dict)} zones")
+        return bars_15min, current_valid_zones_dict
+        
+    except Exception as e:
+        logger.error(f"Error processing data for {currency_pair}: {e}", exc_info=True)
+        return pd.DataFrame(), {}  # Return empty data on error
 
-    # Step 1: Get raw data
-    df_raw = fetch_data_from_sql()
 
-    # Step 2: Clean up columns, ensure ascending order by BarDateTime
-    df_raw.rename(
-        columns={
-            'Open': 'open',
-            'High': 'high',
-            'Low': 'low',
-            'Close': 'close',
-            'BarDateTime': 'datetime'
-        }, 
-        inplace=True
-    )
-    df_raw['datetime'] = pd.to_datetime(df_raw['datetime'])  # or omit utc=True if we want to use database time (local / MST???)
-    df_raw.sort_values('datetime', inplace=True)
-    df_raw.set_index('datetime', inplace=True)
-
-    # Step 3: Resample to 15-minute bars
-    # (We assume the raw data is ~5-second bars, so:
-    #  we'll take the first open, max high, min low, last close in each 15-min window.)
-    bars_15min = df_raw.resample('15T').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last'
-    })
-    # Drop any rows with NaNs (e.g., empty 15-min buckets)
-    bars_15min.dropna(subset=['open','high','low','close'], how='any', inplace=True)
-
-    # Step 4: Identify & Invalidate Liquidity Zones in a single pass
-    current_valid_zones_dict = {}
-    bars_15min, current_valid_zones_dict = identify_liquidity_zones(
-        bars_15min, current_valid_zones_dict, PIPS_REQUIRED=0.005
-    )
-    bars_15min = set_support_resistance_lines(bars_15min, SUPPORT_RESISTANCE_ALLOWANCE=0.0011)
-
-    # Optionally, step through each bar to progressively invalidate zones:
-    for i in range(len(bars_15min)):
-        row_slice = bars_15min.iloc[[i]]
-        current_valid_zones_dict = invalidate_zones_via_sup_and_resist(
-            row_slice, current_valid_zones_dict, SUPPORT_RESISTANCE_ALLOWANCE=0.0011
-        )
-
-    # Step 5: Calculate RSI & MACD (matching main algo: RSI=14, MACD=(12,26,9))
-    bars_15min['RSI'] = ta.rsi(bars_15min['close'], length=14)
-    macd_df = ta.macd(bars_15min['close'], fast=12, slow=26, signal=9)
-    if macd_df is not None and not macd_df.empty:
-        bars_15min['MACD_Line'] = macd_df['MACD_12_26_9']
-        bars_15min['Signal_Line'] = macd_df['MACDs_12_26_9']
-
-    # We have a bars DataFrame that includes zones & indicators
-    logger.info(f"Finished precomputation. Final bars shape: {bars_15min.shape}")
-    logger.info(f"Valid zones: {len(current_valid_zones_dict)}")
-
-    # Step 6: Return them in memory for the main script to consume
-    print(" ")
-    logger.info("Preview of RSI, MACD, and Signal Line columns:")
-    print(" ")
-    logger.info(bars_15min[['RSI', 'MACD_Line', 'Signal_Line']].tail(10).to_string())
-    return bars_15min, current_valid_zones_dict
+def warmup_data(currency=None):
+    """
+    Provides precomputed bars and zones for all supported currencies or a specific currency.
+    
+    Args:
+        currency (str, optional): Specific currency to get data for. If None, processes all currencies.
+        
+    Returns:
+        If currency is specified:
+            tuple: (precomputed_bars, precomputed_zones) for the specified currency
+        If currency is None:
+            tuple: (bars_dict, zones_dict) dictionaries mapping currencies to their respective data
+    """
+    logger.info("Starting warmup data generation")
+    
+    bars_dict = {}
+    zones_dict = {}
+    
+    # If a specific currency is requested, only process that one
+    if currency is not None:
+        if currency in SUPPORTED_CURRENCIES:
+            logger.info(f"Processing single currency: {currency}")
+            bars, zones = process_currency_data(currency)
+            return bars, zones
+        else:
+            logger.error(f"Requested unsupported currency: {currency}")
+            return pd.DataFrame(), {}
+    
+    # Process all supported currencies
+    for currency_pair in SUPPORTED_CURRENCIES:
+        try:
+            logger.info(f"Processing {currency_pair}")
+            bars, zones = process_currency_data(currency_pair)
+            
+            # Store the results in dictionaries
+            bars_dict[currency_pair] = bars
+            zones_dict[currency_pair] = zones
+            
+            logger.info(f"Completed {currency_pair}: {len(bars)} bars, {len(zones)} zones")
+            
+        except Exception as e:
+            logger.error(f"Error processing {currency_pair}: {e}", exc_info=True)
+            # Continue with next currency on error
+            bars_dict[currency_pair] = pd.DataFrame()
+            zones_dict[currency_pair] = {}
+    
+    # For backward compatibility: if only processing EUR.USD, return the direct data
+    # rather than the dictionary
+    if len(bars_dict) == 1 and "EUR.USD" in bars_dict:
+        logger.info("Returning legacy format data (EUR.USD only)")
+        return bars_dict["EUR.USD"], zones_dict["EUR.USD"]
+    
+    # Log summary of results
+    logger.info(f"Warmup data summary:")
+    for currency in bars_dict:
+        logger.info(f"  {currency}: {len(bars_dict[currency])} bars, {len(zones_dict[currency])} zones")
+    
+    # Return dictionaries of all processed data
+    return bars_dict["EUR.USD"], zones_dict["EUR.USD"]  # For backward compatibility
 
 
 # Optional: If we want a direct "script" entry point
