@@ -75,43 +75,34 @@ def trade_signal():
         if 'currency' in content:
             df['Currency'] = content['currency']
         
-        # Try multiple date formats in sequence until one works
-        # Format 1: Standard format with seconds (no ms) - '2023-05-15 14:30:00'
-        # Format 2: ISO format with T separator (no ms) - '2023-05-15T14:30:00'
-        # Format 3: Standard format with milliseconds - '2023-05-15 14:30:00.123'
-        # Format 4: ISO format with milliseconds - '2023-05-15T14:30:00.123'
-        # Format 5: Standard format with minutes only - '2023-05-15 14:30'
-        
-        # Initialize a series of NaT values
-        df['Time'] = pd.NaT
-        
-        # Try each format in sequence
-        formats_to_try = [
-            '%Y-%m-%d %H:%M:%S',      # Standard without ms
-            '%Y-%m-%dT%H:%M:%S',      # ISO format without ms
-            '%Y-%m-%d %H:%M:%S.%f',   # Standard with ms
-            '%Y-%m-%dT%H:%M:%S.%f',   # ISO format with ms
-            '%Y-%m-%d %H:%M'          # Minutes only
-        ]
-        
-        for fmt in formats_to_try:
-            # Only try to parse rows that are still NaT
-            mask = df['Time'].isna()
-            if not mask.any():
-                break  # All rows parsed, no need to try more formats
-                
-            df.loc[mask, 'Time'] = pd.to_datetime(
-                df.loc[mask, 'Time'].astype(str),  # Ensure string type
-                format=fmt,
-                errors='coerce'  # Don't raise error, just return NaT for failed parsing
-            )
-        
-        # Check if we have any rows that still couldn't be parsed
-        if df['Time'].isna().any():
-            error_msg = "Could not parse time in any supported format"
-            trade_logger.error(error_msg)
-            return jsonify({'error': error_msg}), 400
+        # Parse the time field - FIXED VERSION
+        try:
+            # First try direct conversion without format specification
+            df['Time'] = pd.to_datetime(df['Time'])
+        except:
+            # If that fails, try specific formats
+            time_parsed = False
+            formats_to_try = [
+                '%Y-%m-%d %H:%M:%S',      # Standard without ms
+                '%Y-%m-%dT%H:%M:%S',      # ISO format without ms
+                '%Y-%m-%d %H:%M:%S.%f',   # Standard with ms
+                '%Y-%m-%dT%H:%M:%S.%f',   # ISO format with ms
+                '%Y-%m-%d %H:%M'          # Minutes only
+            ]
             
+            for fmt in formats_to_try:
+                try:
+                    df['Time'] = pd.to_datetime(df['Time'], format=fmt)
+                    time_parsed = True
+                    break
+                except:
+                    continue
+            
+            if not time_parsed:
+                error_msg = "Could not parse time in any supported format"
+                trade_logger.error(error_msg)
+                return jsonify({'error': error_msg}), 400
+        
         # Set 'Time' as the index
         df.set_index('Time', inplace=True)
         
