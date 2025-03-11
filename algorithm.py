@@ -643,7 +643,8 @@ def invalidate_zones_via_sup_and_resist(current_price, valid_zones_dict, currenc
     if currency not in current_valid_zones_dict:
         current_valid_zones_dict[currency] = {}
         
-    zones_dict = valid_zones_dict if not isinstance(valid_zones_dict, dict) else valid_zones_dict[currency]
+    # This should check if valid_zones_dict is a nested dictionary (with currency keys)
+    zones_dict = valid_zones_dict[currency] if currency in valid_zones_dict else valid_zones_dict
     
     for zone_id, zone_data in list(zones_dict.items()):
         zone_start = zone_data['start_price']
@@ -705,9 +706,13 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
     if currency not in balance:
         balance[currency] = 100000
         
-    # Get currency-specific data
+    # Get currency-specific data - make sure valid_zones_dict is properly accessed
     trades_for_currency = trades[currency]
-    zones_dict = valid_zones_dict if not isinstance(valid_zones_dict, dict) else valid_zones_dict[currency]
+    
+    # FIXED LOGIC: Always expect valid_zones_dict to be our main dictionary with currency keys
+    if currency not in valid_zones_dict:
+        valid_zones_dict[currency] = {}
+    zones_dict = valid_zones_dict[currency]
     
     # Current price and time
     current_time = data.index[bar_index]
@@ -1652,7 +1657,7 @@ def main():
                         bars_data, zones_data = result
                         
                         # Check if we received dictionaries of currencies or direct data
-                        if isinstance(bars_data, dict) and not isinstance(next(iter(bars_data), None), str):
+                        if isinstance(bars_data, dict) and bars_data and isinstance(next(iter(bars_data.keys()) if bars_data else None), str):
                             # We received a dictionary with DataFrames for each currency
                             if currency in bars_data:
                                 precomputed_bars = bars_data[currency]
