@@ -142,21 +142,21 @@ def fetch_data_from_sql(currency_pair="EUR.USD", days=3):
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
         
-        # Modified SQL query to filter by currency pair
+        # Modified SQL query to filter by currency pair - USING HISTODATA TABLE
         query = f"""
         SELECT [Time], [Price]
-        FROM TickData
+        FROM HistoData 
         WHERE [Time] >= '{start_date_str}'
         AND [Time] <= '{end_date_str}'
         AND [Currency] = '{currency_pair}'
         ORDER BY [Time] ASC;
         """
         
-        # If there's no Currency column in the TickData table, use this fallback query
+        # If there's no Currency column in the HistoData table, use this fallback query
         # that assumes all data is for EUR.USD (for backward compatibility)
         fallback_query = f"""
         SELECT [Time], [Price]
-        FROM TickData
+        FROM HistoData
         WHERE [Time] >= '{start_date_str}' 
         AND [Time] <= '{end_date_str}'
         ORDER BY [Time] ASC;
