@@ -24,8 +24,9 @@ LIQUIDITY_ZONE_ALERT = 0.002
 DEMAND_ZONE_RSI_TOP = 70
 SUPPLY_ZONE_RSI_BOTTOM = 30
 INVALIDATE_ZONE_LENGTH = 0.0013
-COOLDOWN_SECONDS = 3600
+COOLDOWN_SECONDS = 7200
 RISK_PROPORTION = 0.03
+MAX_PIP_LOSS = 0.0030  # 30 pips maximum loss
 
 # Replace existing DB credential variables with a configuration dictionary
 DB_CONFIG = {
@@ -58,6 +59,13 @@ last_non_hold_signal = {currency: None for currency in SUPPORTED_CURRENCIES}
 
 # Zone formation tracking
 cumulative_zone_info = {currency: None for currency in SUPPORTED_CURRENCIES}
+
+# Add at the top with other constants
+VALID_PRICE_RANGES = {
+    "EUR.USD": (0.5, 1.5),    # EUR.USD typically 1.0-1.2
+    "USD.CAD": (1.2, 1.5),    # USD.CAD typically 1.3-1.4
+    "GBP.USD": (0.8, 1.8)     # GBP.USD typically 1.2-1.4
+}
 
 # --------------------------------------------------------------------------
 # PRE-EXISTING DATA LOADING FUNCTIONS
@@ -867,11 +875,6 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
     """
     Enhanced version with better state tracking and validation.
     Manages open trades for stop loss and take profit.
-    
-    Args:
-        current_price: The current market price
-        current_time: The current timestamp
-        currency: The currency pair to manage trades for
     """
     global trades, balance
     debug_logger.info(f"Managing trades at {current_time} price {current_price}")
@@ -884,82 +887,124 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
     trades_to_process = [t for t in trades[currency] if t['status'] == 'open']
     
     for trade in trades_to_process:
-        # Skip if trade is already closed (shouldn't happen but safe check)
+        # Skip if trade is already closed
         if trade.get('status') != 'open':
             continue
             
         # Track if this specific trade was closed in this iteration
         trade_closed = False
         
-        if trade['direction'] == 'long':
-            if current_price <= trade['stop_loss'] and not trade_closed:
-                trade_result = (trade['stop_loss'] - trade['entry_price']) * trade['position_size']
+        try:
+            # ADDED: Check max pip loss first before regular SL/TP checks
+            current_pip_loss = round(
+                (trade['entry_price'] - current_price) if trade['direction'] == 'long' 
+                else (current_price - trade['entry_price']), 
+                5
+            )
+            
+            # If max loss exceeded, close immediately
+            if current_pip_loss >= MAX_PIP_LOSS:
+                trade_result = round((current_price - trade['entry_price']) * trade['position_size'], 2)
+                if trade['direction'] == 'short':
+                    trade_result = -trade_result
+                    
                 balance[currency] += trade_result
+                
                 trade.update({
                     'status': 'closed',
                     'exit_time': current_time,
-                    'exit_price': trade['stop_loss'],
+                    'exit_price': current_price,
                     'profit_loss': trade_result,
-                    'close_reason': 'stop_loss'
+                    'close_reason': 'max_pip_loss'
                 })
-                trade_logger.info(f"{currency} Long trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
+                
+                debug_logger.warning(
+                    f"\n\nFORCE CLOSING {currency} TRADE - MAX PIP LOSS EXCEEDED IN MANAGEMENT\n"
+                    f"Entry: {trade['entry_price']:.5f}\n"
+                    f"Current: {current_price:.5f}\n"
+                    f"Pip Loss: {current_pip_loss*10000:.1f}\n"
+                    f"Time in trade: {current_time - trade['entry_time']}"
+                )
+                
                 closed_any_trade = True
                 trade_closed = True
+                continue  # Skip to next trade
+            
+            # Only proceed with normal SL/TP checks if we haven't closed for max loss
+            if trade['direction'] == 'long':
+                if current_price <= trade['stop_loss'] and not trade_closed:
+                    trade_result = (trade['stop_loss'] - trade['entry_price']) * trade['position_size']
+                    balance[currency] += trade_result
+                    trade.update({
+                        'status': 'closed',
+                        'exit_time': current_time,
+                        'exit_price': trade['stop_loss'],
+                        'profit_loss': trade_result,
+                        'close_reason': 'stop_loss'
+                    })
+                    trade_logger.info(f"{currency} Long trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
+                    closed_any_trade = True
+                    trade_closed = True
 
-            elif current_price >= trade['take_profit'] and not trade_closed:
-                trade_result = (trade['take_profit'] - trade['entry_price']) * trade['position_size']
-                balance[currency] += trade_result
-                trade.update({
-                    'status': 'closed',
-                    'exit_time': current_time,
-                    'exit_price': trade['take_profit'],
-                    'profit_loss': trade_result,
-                    'close_reason': 'take_profit'
-                })
-                trade_logger.info(f"{currency} Long trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
-                closed_any_trade = True
-                trade_closed = True
+                elif current_price >= trade['take_profit'] and not trade_closed:
+                    trade_result = (trade['take_profit'] - trade['entry_price']) * trade['position_size']
+                    balance[currency] += trade_result
+                    trade.update({
+                        'status': 'closed',
+                        'exit_time': current_time,
+                        'exit_price': trade['take_profit'],
+                        'profit_loss': trade_result,
+                        'close_reason': 'take_profit'
+                    })
+                    trade_logger.info(f"{currency} Long trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
+                    closed_any_trade = True
+                    trade_closed = True
 
-        elif trade['direction'] == 'short':
-            if current_price >= trade['stop_loss'] and not trade_closed:
-                trade_result = (trade['entry_price'] - trade['stop_loss']) * trade['position_size']
-                balance[currency] += trade_result
-                trade.update({
-                    'status': 'closed',
-                    'exit_time': current_time,
-                    'exit_price': trade['stop_loss'],
-                    'profit_loss': trade_result,
-                    'close_reason': 'stop_loss'
-                })
-                trade_logger.info(f"{currency} Short trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
-                closed_any_trade = True
-                trade_closed = True
+            elif trade['direction'] == 'short':
+                if current_price >= trade['stop_loss'] and not trade_closed:
+                    trade_result = (trade['entry_price'] - trade['stop_loss']) * trade['position_size']
+                    balance[currency] += trade_result
+                    trade.update({
+                        'status': 'closed',
+                        'exit_time': current_time,
+                        'exit_price': trade['stop_loss'],
+                        'profit_loss': trade_result,
+                        'close_reason': 'stop_loss'
+                    })
+                    trade_logger.info(f"{currency} Short trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
+                    closed_any_trade = True
+                    trade_closed = True
 
-            elif current_price <= trade['take_profit'] and not trade_closed:
-                trade_result = (trade['entry_price'] - trade['take_profit']) * trade['position_size']
-                balance[currency] += trade_result
-                trade.update({
-                    'status': 'closed',
-                    'exit_time': current_time,
-                    'exit_price': trade['take_profit'],
-                    'profit_loss': trade_result,
-                    'close_reason': 'take_profit'
-                })
-                trade_logger.info(f"{currency} Short trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
-                closed_any_trade = True
-                trade_closed = True
+                elif current_price <= trade['take_profit'] and not trade_closed:
+                    trade_result = (trade['entry_price'] - trade['take_profit']) * trade['position_size']
+                    balance[currency] += trade_result
+                    trade.update({
+                        'status': 'closed',
+                        'exit_time': current_time,
+                        'exit_price': trade['take_profit'],
+                        'profit_loss': trade_result,
+                        'close_reason': 'take_profit'
+                    })
+                    trade_logger.info(f"{currency} Short trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
+                    closed_any_trade = True
+                    trade_closed = True
+                    
+        except Exception as e:
+            debug_logger.error(f"Error in trade management: {e}", exc_info=True)
+            # Force close trade on error as a safety measure
+            trade.update({
+                'status': 'closed',
+                'exit_time': current_time,
+                'exit_price': current_price,
+                'profit_loss': 0,
+                'close_reason': 'error_in_trade_management'
+            })
+            closed_any_trade = True
+            trade_closed = True
 
     # Validate trade state after processing
     validate_trade_state(current_time, current_price, currency)
     log_trade_state(current_time, "after_manage", currency)
-    
-    # Add at the end before returning:
-    debug_logger.warning(f"\n\nMANAGE_TRADES RESULT for {currency}:")
-    debug_logger.warning(f"  Current price: {current_price:.5f}")
-    debug_logger.warning(f"  Open trades before: {len(trades_to_process)}")
-    debug_logger.warning(f"  Trades closed: {closed_any_trade}")
-    if closed_any_trade:
-        debug_logger.warning(f"  >>> IMPORTANT: Trade was closed but did it generate a signal?")
     
     return closed_any_trade
 
@@ -1433,7 +1478,7 @@ def store_bar_in_sql(bar_data):
 
 def store_zones_in_sql(zones_data):
     """
-    Stores multiple liquidity zones in the SQL database.
+    Stores multiple liquidity zones in the SQL database, preventing duplicates.
     
     Args:
         zones_data (list): List of zone dictionaries
@@ -1449,13 +1494,9 @@ def store_zones_in_sql(zones_data):
         debug_logger.info("No zones to store in SQL database")
         return True
     
-    # Track success/failure for each zone
-    success_count = 0
-    failure_count = 0
-    
     # Required fields for each zone
     required_fields = ['currency', 'zone_start_price', 'zone_end_price', 
-                       'zone_size', 'zone_type']
+                      'zone_size', 'zone_type']
     
     conn = None
     cursor = None
@@ -1475,7 +1516,6 @@ def store_zones_in_sql(zones_data):
                     is_valid = False
                     
             if not is_valid:
-                failure_count += 1
                 continue
                 
             try:
@@ -1486,30 +1526,49 @@ def store_zones_in_sql(zones_data):
                 zone_end_price = round(zone['zone_end_price'], 6)
                 zone_size = round(zone['zone_size'], 6)
                 
+                # Check if this zone already exists
                 cursor.execute("""
-                INSERT INTO FXStrat_AlgorithmZones 
-                (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
-                VALUES (?, ?, ?, ?, ?, ?)
+                SELECT COUNT(*) 
+                FROM FXStrat_AlgorithmZones 
+                WHERE Currency = ? 
+                AND ZoneStartPrice = ? 
+                AND ZoneEndPrice = ? 
+                AND ZoneType = ?
+                AND CAST(ConfirmationTime AS datetime2(0)) = CAST(? AS datetime2(0))
                 """, 
                 zone['currency'],
                 zone_start_price,
                 zone_end_price,
-                zone_size,
                 zone['zone_type'],
                 confirmation_time
                 )
                 
-                success_count += 1
+                count = cursor.fetchone()[0]
+                
+                if count == 0:  # Only insert if zone doesn't exist
+                    cursor.execute("""
+                    INSERT INTO FXStrat_AlgorithmZones 
+                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """, 
+                    zone['currency'],
+                    zone_start_price,
+                    zone_end_price,
+                    zone_size,
+                    zone['zone_type'],
+                    confirmation_time
+                    )
+                    debug_logger.info(f"New zone stored: {zone['currency']} {zone['zone_type']} at {zone_start_price}")
+                else:
+                    debug_logger.info(f"Skipped duplicate zone: {zone['currency']} {zone['zone_type']} at {zone_start_price}")
                 
             except Exception as e:
-                debug_logger.error(f"Error inserting zone: {e}")
-                failure_count += 1
+                debug_logger.error(f"Error processing zone: {e}")
+                continue
         
         # Commit all successful inserts
         conn.commit()
-        
-        debug_logger.info(f"Zone storage complete: {success_count} succeeded, {failure_count} failed")
-        return failure_count == 0  # Only return True if all succeeded
+        return True
     
     except Exception as e:
         debug_logger.error(f"Error storing zones data in SQL: {e}", exc_info=True)
@@ -1642,8 +1701,15 @@ def process_market_data(new_data_point, currency="EUR.USD"):
 
         # 1) Basic checks on the incoming tick
         raw_price = float(new_data_point['Price'].iloc[0])
-        if raw_price < 0.5 or raw_price > 1.5:
-            debug_logger.error(f"Received {currency} price ({raw_price}) outside normal range [0.5, 1.5]. Ignoring.")
+        
+        # Get valid range for this currency
+        min_price, max_price = VALID_PRICE_RANGES.get(currency, (0.5, 1.5))  # Default to EUR.USD range
+        
+        if raw_price < min_price or raw_price > max_price:
+            debug_logger.error(
+                f"Received {currency} price ({raw_price}) outside valid range "
+                f"[{min_price}, {max_price}]. Ignoring."
+            )
             return ('hold', currency)
 
         if pd.isna(new_data_point['Price'].iloc[0]):
@@ -1750,6 +1816,13 @@ def process_market_data(new_data_point, currency="EUR.USD"):
 
         # 12) Final validations and logging - reduced verbosity
         validate_trade_state(tick_time, tick_price, currency)
+
+        # Add pip-based loss check right after existing trade management
+        pip_loss_closure = check_pip_based_loss(tick_price, tick_time, currency)
+        
+        # If we closed due to pip loss, treat it like any other closure
+        if pip_loss_closure:
+            closed_any_trade = True
 
         # -----------------------------------------------------------------
         # 13) Determine final signal: buy, sell, close, or 'hold'
@@ -1891,3 +1964,88 @@ def main():
     except Exception as e:
         debug_logger.error(f"Unexpected error in main initialization: {e}", exc_info=True)
         debug_logger.warning("Algorithm continuing with minimal initialization")
+
+def check_pip_based_loss(current_price, current_time, currency):
+    """
+    Monitors open trades for pip-based losses and forces closure if loss exceeds MAX_PIP_LOSS.
+    Added safety checks and precise pip calculation.
+    """
+    if currency not in SUPPORTED_CURRENCIES:
+        debug_logger.error(f"Unsupported currency in check_pip_based_loss: {currency}")
+        return False
+        
+    global trades, balance
+    
+    force_closed = False
+    open_trades = [t for t in trades[currency] if t['status'] == 'open']
+    
+    for trade in open_trades:
+        try:
+            # More precise pip loss calculation with rounding to avoid floating point issues
+            current_pip_loss = round(
+                (trade['entry_price'] - current_price) if trade['direction'] == 'long' 
+                else (current_price - trade['entry_price']), 
+                5  # Round to 5 decimal places for precision
+            )
+            
+            # Double validation of pip loss
+            pip_loss_check = current_pip_loss >= MAX_PIP_LOSS
+            absolute_price_diff = abs(trade['entry_price'] - current_price)
+            absolute_check = absolute_price_diff >= MAX_PIP_LOSS
+            
+            # Log significant losses even if not at max loss yet
+            if current_pip_loss >= (MAX_PIP_LOSS * 0.8):  # Log at 80% of max loss
+                debug_logger.warning(
+                    f"SIGNIFICANT LOSS ALERT - {currency}\n"
+                    f"Entry: {trade['entry_price']:.5f}\n"
+                    f"Current: {current_price:.5f}\n"
+                    f"Loss: {current_pip_loss*10000:.1f} pips\n"
+                    f"Time in trade: {current_time - trade['entry_time']}"
+                )
+            
+            # Force close if EITHER check indicates we've hit max loss
+            if pip_loss_check or absolute_check:
+                debug_logger.warning(
+                    f"\n\nFORCE CLOSING {currency} TRADE - MAX PIP LOSS EXCEEDED\n"
+                    f"Entry: {trade['entry_price']:.5f}\n"
+                    f"Current: {current_price:.5f}\n"
+                    f"Pip Loss: {current_pip_loss*10000:.1f}\n"
+                    f"Time in trade: {current_time - trade['entry_time']}"
+                )
+                
+                # Calculate actual loss with precise rounding
+                trade_result = round((current_price - trade['entry_price']) * trade['position_size'], 2)
+                if trade['direction'] == 'short':
+                    trade_result = -trade_result
+                    
+                balance[currency] += trade_result
+                
+                trade.update({
+                    'status': 'closed',
+                    'exit_time': current_time,
+                    'exit_price': current_price,
+                    'profit_loss': trade_result,
+                    'close_reason': 'max_pip_loss'
+                })
+                
+                trade_logger.warning(
+                    f"{currency} trade force closed due to max pip loss.\n"
+                    f"Loss: {current_pip_loss*10000:.1f} pips, P/L: {trade_result:.2f}\n"
+                    f"Trade duration: {current_time - trade['entry_time']}"
+                )
+                
+                force_closed = True
+                
+        except Exception as e:
+            debug_logger.error(f"Error in pip loss calculation: {e}", exc_info=True)
+            # Force close trade on error as a safety measure
+            trade.update({
+                'status': 'closed',
+                'exit_time': current_time,
+                'exit_price': current_price,
+                'profit_loss': 0,
+                'close_reason': 'error_in_pip_loss_check'
+            })
+            force_closed = True
+            
+    return force_closed

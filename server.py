@@ -5,6 +5,8 @@ import threading
 import logging
 from logging.handlers import RotatingFileHandler
 from waitress import serve
+import pytz
+import datetime
 
 app = Flask(__name__)
 
@@ -12,33 +14,42 @@ trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
 
 trade_logger.setLevel(logging.INFO)
-# CHANGED from INFO to WARNING:
 debug_logger.setLevel(logging.WARNING)
 
 trade_logger.propagate = False
 debug_logger.propagate = False
 
+# Custom formatter class to handle MST timezone
+class MSTFormatter(logging.Formatter):
+    def converter(self, timestamp):
+        dt = datetime.datetime.fromtimestamp(timestamp)
+        mst_tz = pytz.timezone('MST')
+        return dt.astimezone(mst_tz)
+    
+    def formatTime(self, record, datefmt=None):
+        dt = self.converter(record.created)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S.%f %Z')
+
+# Keep existing size-based rotation but update formatter
 trade_handler = RotatingFileHandler(
     'trade_log.log',
     maxBytes=100000000,  # 100MB per file
     backupCount=5
 )
 trade_handler.setLevel(logging.INFO)
-trade_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+trade_formatter = MSTFormatter('%(asctime)s - %(levelname)s - %(message)s')
 trade_handler.setFormatter(trade_formatter)
 trade_logger.addHandler(trade_handler)
 
 debug_handler = RotatingFileHandler(
     'debug_log.log',
-    # 10MB per file
-    maxBytes=10000000,
+    maxBytes=10000000,  # 10MB per file
     backupCount=2
 )
-
-# Capture DEBUG and above, but the logger itself is set to WARNING,
-# so effectively we only see WARNING/ERROR/CRITICAL messages.
 debug_handler.setLevel(logging.DEBUG)
-debug_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+debug_formatter = MSTFormatter('%(asctime)s - %(levelname)s - %(message)s')
 debug_handler.setFormatter(debug_formatter)
 debug_logger.addHandler(debug_handler)
 
