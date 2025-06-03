@@ -33,7 +33,7 @@ DB_CONFIG = {
     'server': '192.168.50.100',
     'database': 'TTG',
     'username': 'djaime',
-    'password': 'Enrique30072000!',
+    'password': 'Enrique30072000!2',
     'driver': 'ODBC Driver 17 for SQL Server'
 }
 
@@ -1317,21 +1317,14 @@ def save_zone_to_database(zone_id, zone_data, currency="EUR.USD"):
 
 def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD"):
     """
-    Saves a trade signal to the database.
-    
-    Args:
-        signal_type: Type of signal (buy, sell, close)
-        price: The price when the signal was generated
-        signal_time: The time when the signal was generated
-        currency: The currency pair this signal belongs to
+    Saves a trade signal to the database with duplicate prevention aligned with 15-minute bars.
     """
     if signal_type == 'hold':
-        return True  # Don't log 'hold' signals
+        return True
         
     if signal_time is None:
         signal_time = datetime.datetime.now()
     
-    # Format price to 5 decimals as requested
     price = round(price, 5)
     
     conn = None
@@ -1342,20 +1335,44 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
             return False
         
         cursor = conn.cursor()
+        
+        # Check for duplicate signals within the same 15-minute bar
+        # This aligns with our bar-based trading logic
         cursor.execute("""
-        INSERT INTO FXStrat_TradeSignalsSent 
-        (SignalTime, SignalType, Price, Currency)
-        VALUES (?, ?, ?, ?)
+        SELECT COUNT(*) 
+        FROM FXStrat_TradeSignalsSent 
+        WHERE SignalType = ? 
+        AND Currency = ?
+        AND Price = ?
+        AND SignalTime BETWEEN DATEADD(minute, -15, ?) AND ?
         """, 
-        signal_time,
         signal_type,
+        currency,
         price,
-        currency
+        signal_time,
+        signal_time
         )
         
-        conn.commit()
-        debug_logger.info(f"Saved {currency} signal to database: {signal_type} at {price}")
-        return True
+        count = cursor.fetchone()[0]
+        
+        if count == 0:  # Only insert if no duplicate exists
+            cursor.execute("""
+            INSERT INTO FXStrat_TradeSignalsSent 
+            (SignalTime, SignalType, Price, Currency)
+            VALUES (?, ?, ?, ?)
+            """, 
+            signal_time,
+            signal_type,
+            price,
+            currency
+            )
+            
+            conn.commit()
+            debug_logger.warning(f"New {currency} {signal_type} signal stored at {price:.5f}")
+            return True
+        else:
+            debug_logger.info(f"Skipped duplicate {currency} {signal_type} signal at {price:.5f} (already exists in current 15m bar)")
+            return True
     
     except Exception as e:
         debug_logger.error(f"Error saving {currency} signal to database: {e}", exc_info=True)
@@ -1381,6 +1398,144 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
 # --------------------------------------------------------------------------
 # SQL DATA STORAGE FUNCTIONS
 # --------------------------------------------------------------------------
+def sync_zones_to_database(currency="EUR.USD"):
+    """
+    Synchronizes the current valid zones in memory with the database for a specific currency.
+    This function handles INSERT (new zones), UPDATE (if needed), and DELETE (invalidated zones).
+    Called every 15 minutes when a bar completes.
+    
+    Args:
+        currency (str): The currency pair to sync zones for
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if currency not in current_valid_zones_dict:
+        debug_logger.warning(f"No zone dictionary found for {currency}")
+        return True  # Nothing to sync
+    
+    current_zones = current_valid_zones_dict[currency]
+    
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            debug_logger.error("Failed to sync zones - no database connection")
+            return False
+        
+        cursor = conn.cursor()
+        
+        # Step 1: Get all zones currently in database for this currency
+        cursor.execute("""
+        SELECT ZoneStartPrice, ZoneEndPrice, ZoneType, ConfirmationTime 
+        FROM FXStrat_AlgorithmZones 
+        WHERE Currency = ?
+        ORDER BY ConfirmationTime DESC
+        """, currency)
+        
+        db_zones = cursor.fetchall()
+        db_zone_keys = {(round(float(row[0]), 6), round(float(row[1]), 6)) for row in db_zones}
+        
+        # Step 2: Get current memory zones keys (rounded for comparison)
+        memory_zone_keys = {(round(float(key[0]), 6), round(float(key[1]), 6)) for key in current_zones.keys()}
+        
+        # Step 3: Find zones to add (in memory but not in DB)
+        zones_to_add = memory_zone_keys - db_zone_keys
+        
+        # Step 4: Find zones to remove (in DB but not in memory)
+        zones_to_remove = db_zone_keys - memory_zone_keys
+        
+        # Step 5: Add new zones to database
+        zones_added = 0
+        for zone_key in zones_to_add:
+            # Find the matching zone data in current_zones
+            matching_zone = None
+            for original_key, zone_data in current_zones.items():
+                rounded_original = (round(float(original_key[0]), 6), round(float(original_key[1]), 6))
+                if rounded_original == zone_key:
+                    matching_zone = zone_data
+                    break
+            
+            if matching_zone:
+                try:
+                    confirmation_time = matching_zone.get('confirmation_time', datetime.datetime.now())
+                    
+                    cursor.execute("""
+                    INSERT INTO FXStrat_AlgorithmZones 
+                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """, 
+                    currency,
+                    zone_key[0],  # Already rounded
+                    zone_key[1],  # Already rounded
+                    round(matching_zone.get('zone_size', abs(zone_key[1] - zone_key[0])), 6),
+                    matching_zone.get('zone_type', 'unknown'),
+                    confirmation_time
+                    )
+                    zones_added += 1
+                except Exception as e:
+                    debug_logger.error(f"Error adding zone {zone_key}: {e}")
+                    continue
+        
+        # Step 6: Remove invalidated zones from database
+        zones_removed = 0
+        for zone_key in zones_to_remove:
+            try:
+                cursor.execute("""
+                DELETE FROM FXStrat_AlgorithmZones 
+                WHERE Currency = ? 
+                AND ABS(ZoneStartPrice - ?) <= 0.000001  
+                AND ABS(ZoneEndPrice - ?) <= 0.000001
+                """, 
+                currency,
+                zone_key[0],
+                zone_key[1]
+                )
+                zones_removed += cursor.rowcount
+            except Exception as e:
+                debug_logger.error(f"Error removing zone {zone_key}: {e}")
+                continue
+        
+        # Commit all changes
+        conn.commit()
+        
+        # Log results
+        if zones_added > 0 or zones_removed > 0:
+            debug_logger.warning(
+                f"\n\n{'='*20} {currency} ZONE SYNC COMPLETED {'='*20}\n"
+                f"Added to DB: {zones_added} zones\n"
+                f"Removed from DB: {zones_removed} zones\n"
+                f"Total zones in memory: {len(current_zones)}\n"
+                f"Total zones in DB: {len(db_zone_keys) + zones_added - zones_removed}\n"
+                f"{'='*65}\n"
+            )
+        else:
+            debug_logger.info(f"{currency} zone sync completed - no changes needed")
+        
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"Error syncing zones for {currency}: {e}", exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        return False
+    
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
 def store_bar_in_sql(bar_data):
     """
     Stores a single bar's data in the SQL database.
@@ -1478,13 +1633,7 @@ def store_bar_in_sql(bar_data):
 
 def store_zones_in_sql(zones_data):
     """
-    Stores multiple liquidity zones in the SQL database, preventing duplicates.
-    
-    Args:
-        zones_data (list): List of zone dictionaries
-            
-    Returns:
-        bool: True if all zones were stored successfully, False otherwise
+    Stores multiple liquidity zones in the SQL database with enhanced duplicate prevention.
     """
     if not zones_data or not isinstance(zones_data, list):
         debug_logger.error("Invalid zones data provided to store_zones_in_sql")
@@ -1494,7 +1643,6 @@ def store_zones_in_sql(zones_data):
         debug_logger.info("No zones to store in SQL database")
         return True
     
-    # Required fields for each zone
     required_fields = ['currency', 'zone_start_price', 'zone_end_price', 
                       'zone_size', 'zone_type']
     
@@ -1521,31 +1669,31 @@ def store_zones_in_sql(zones_data):
             try:
                 confirmation_time = zone.get('confirmation_time', None)
                 
-                # Format zone prices and size to 6 decimals as requested
+                # Format zone prices and size to 6 decimals
                 zone_start_price = round(zone['zone_start_price'], 6)
                 zone_end_price = round(zone['zone_end_price'], 6)
                 zone_size = round(zone['zone_size'], 6)
                 
-                # Check if this zone already exists
+                # Enhanced duplicate check: Look for similar zones within a small price range
                 cursor.execute("""
                 SELECT COUNT(*) 
                 FROM FXStrat_AlgorithmZones 
                 WHERE Currency = ? 
-                AND ZoneStartPrice = ? 
-                AND ZoneEndPrice = ? 
                 AND ZoneType = ?
-                AND CAST(ConfirmationTime AS datetime2(0)) = CAST(? AS datetime2(0))
+                AND ABS(ZoneStartPrice - ?) <= 0.0001  -- Allow 1 pip difference
+                AND ABS(ZoneEndPrice - ?) <= 0.0001    -- Allow 1 pip difference
+                AND ABS(DATEDIFF(minute, ConfirmationTime, ?)) <= 15  -- Within 15 minutes
                 """, 
                 zone['currency'],
+                zone['zone_type'],
                 zone_start_price,
                 zone_end_price,
-                zone['zone_type'],
-                confirmation_time
+                confirmation_time if confirmation_time else datetime.datetime.now()
                 )
                 
                 count = cursor.fetchone()[0]
                 
-                if count == 0:  # Only insert if zone doesn't exist
+                if count == 0:  # Only insert if no similar zone exists
                     cursor.execute("""
                     INSERT INTO FXStrat_AlgorithmZones 
                     (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
@@ -1566,7 +1714,6 @@ def store_zones_in_sql(zones_data):
                 debug_logger.error(f"Error processing zone: {e}")
                 continue
         
-        # Commit all successful inserts
         conn.commit()
         return True
     
@@ -1735,10 +1882,19 @@ def process_market_data(new_data_point, currency="EUR.USD"):
         # 4) Update bars and check if a bar was finalized
         finalized_bar_data = update_bars_with_tick(tick_time, tick_price, currency)
         
-        # If a bar was finalized, store it and log zones
+        # If a bar was finalized, store it and sync zones to database
         if finalized_bar_data:
             # Store the finalized bar in SQL
             store_bar_in_sql(finalized_bar_data)
+            
+            # SYNC ZONES TO DATABASE - This ensures DB stays in sync with current_valid_zones_dict
+            # Called every 15 minutes when a bar completes to:
+            # - Add new zones that were created in memory
+            # - Remove zones that were invalidated from memory
+            # - Keep database as the single source of truth for historical zone analysis
+            sync_success = sync_zones_to_database(currency)
+            if not sync_success:
+                debug_logger.warning(f"Failed to sync zones to database for {currency}")
             
             # Log zone status after bar completion only if we have zones
             if current_valid_zones_dict[currency]:
@@ -1885,9 +2041,9 @@ def main():
         else:
             debug_logger.info("Database successfully initialized")
         
-        # Import warmup_data function with currency-specific handling capabilities
+        # Import warmup_data function from run_test.py (which now includes testing and warmup)
         try:
-            from secondary_warmer_script import warmup_data
+            from run_test import warmup_data
             
             # Process each supported currency individually to handle both old and new return formats
             for currency in SUPPORTED_CURRENCIES:
@@ -1959,7 +2115,7 @@ def main():
             trade_logger.info("Warm-up complete. Ready for live ticks.")
             
         except ImportError:
-            debug_logger.warning("\n\nsecondary_warmer_script not found. Running with empty bars and zones.\n")
+            debug_logger.warning("\n\nrun_test.py not found. Running with empty bars and zones.\n")
             
     except Exception as e:
         debug_logger.error(f"Unexpected error in main initialization: {e}", exc_info=True)

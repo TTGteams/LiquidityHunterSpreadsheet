@@ -7,6 +7,8 @@ from logging.handlers import RotatingFileHandler
 from waitress import serve
 import pytz
 import datetime
+import requests
+import time
 
 app = Flask(__name__)
 
@@ -65,6 +67,9 @@ def trade_signal():
         # Extract currency from request, default to EUR.USD if not provided
         currency = content.get('currency', 'EUR.USD')
         
+        # Check if this is a forwarded signal from batch processing
+        is_forwarded = content.get('source') == 'batch_forward'
+        
         # Validate currency is in supported list
         if currency not in algorithm.SUPPORTED_CURRENCIES:
             error_msg = f"Unsupported currency: {currency}"
@@ -79,7 +84,17 @@ def trade_signal():
                 trade_logger.error(error_msg)
                 return jsonify({'error': error_msg}), 400
 
-        # Convert the data to a DataFrame
+        # For forwarded signals, just log and return (avoid double processing)
+        if is_forwarded:
+            trade_logger.info(f"Forwarded signal received: {currency} at {data['Price']}")
+            # Return a placeholder response for monitoring systems
+            return jsonify({
+                'signal': 'forwarded', 
+                'currency': currency, 
+                'source': 'batch_processing'
+            }), 200
+
+        # Convert the data to a DataFrame (only for non-forwarded signals)
         df = pd.DataFrame([data])
         
         # Add Currency column if provided in the request
@@ -132,10 +147,215 @@ def trade_signal():
         debug_logger.error(f"Error occurred: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 400
 
-if __name__ == '__main__':
-    # Warm up the main algorithm before starting the server.py script
-    import algorithm
-    algorithm.main()  # Calls warmup_data() via algorithm.main(), so bars & zones are ready
+@app.route('/trade_signal_batch', methods=['POST'])
+def trade_signal_batch():
+    """
+    Batch endpoint for processing multiple price ticks sequentially.
+    Used by testing scripts to speed up historical data processing.
+    Maintains tick-by-tick algorithm behavior.
+    
+    Also forwards non-hold signals to /trade_signal endpoint for external monitoring.
+    """
+    try:
+        content = request.json
+        data_points = content['data']  # Expecting array of {Time, Price} objects
+        currency = content.get('currency', 'EUR.USD')
+        
+        # Validate currency
+        if currency not in algorithm.SUPPORTED_CURRENCIES:
+            error_msg = f"Unsupported currency: {currency}"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
+        
+        # Validate data_points is a list
+        if not isinstance(data_points, list):
+            error_msg = "Data must be an array of price points"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
+        
+        results = []
+        signals_count = {'buy': 0, 'sell': 0, 'close': 0, 'hold': 0}
+        
+        # Process each data point sequentially
+        for i, data_point in enumerate(data_points):
+            try:
+                # Validate required fields
+                if 'Time' not in data_point or 'Price' not in data_point:
+                    results.append({'error': 'Missing Time or Price field', 'index': i})
+                    continue
+                
+                # Create DataFrame for single data point
+                df = pd.DataFrame([data_point])
+                
+                # Parse time using same logic as single endpoint
+                try:
+                    df['Time'] = pd.to_datetime(df['Time'])
+                except:
+                    # Try specific formats
+                    time_parsed = False
+                    formats_to_try = [
+                        '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S.%f',
+                        '%Y-%m-%dT%H:%M:%S.%f',
+                        '%Y-%m-%d %H:%M'
+                    ]
+                    
+                    for fmt in formats_to_try:
+                        try:
+                            df['Time'] = pd.to_datetime(df['Time'], format=fmt)
+                            time_parsed = True
+                            break
+                        except:
+                            continue
+                    
+                    if not time_parsed:
+                        results.append({'error': 'Could not parse time', 'index': i})
+                        continue
+                
+                # Set index
+                df.set_index('Time', inplace=True)
+                
+                # Process through algorithm
+                with state_lock:
+                    signal, processed_currency = algorithm.process_market_data(df, currency)
+                
+                # Track signal counts
+                signals_count[signal] = signals_count.get(signal, 0) + 1
+                
+                # Add to results
+                signal_result = {
+                    'index': i,
+                    'signal': signal,
+                    'currency': processed_currency,
+                    'time': data_point['Time'],
+                    'price': data_point['Price']
+                }
+                results.append(signal_result)
+                
+                # Forward non-hold signals to /trade_signal endpoint for external monitoring
+                if signal != 'hold':
+                    forward_signal_to_trade_endpoint(signal_result)
+                
+                # Log non-hold signals only once (removed duplicate logging)
+                # Logging is now handled by the notification endpoint
+                
+            except Exception as e:
+                results.append({'error': str(e), 'index': i})
+                debug_logger.error(f"Error processing batch item {i}: {e}")
+        
+        # Return summary
+        return jsonify({
+            'results': results,
+            'summary': {
+                'total_processed': len(data_points),
+                'successful': len([r for r in results if 'signal' in r]),
+                'failed': len([r for r in results if 'error' in r]),
+                'signals_count': signals_count
+            }
+        }), 200
+        
+    except Exception as e:
+        debug_logger.error(f"Error in batch processing: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 400
 
-    # Run the app with waitress or your preferred WSGI server
+def run_post_startup_warmup():
+    """
+    Run the complete warmup sequence after server startup.
+    This runs in a background thread to avoid blocking the server.
+    """
+    try:
+        # Wait a moment for server to be fully ready
+        debug_logger.info("Waiting 2 seconds for server to be ready...")
+        time.sleep(2)
+        
+        debug_logger.info("Starting post-startup warmup sequence...")
+        
+        # Import and run the complete warmup sequence (all 3 modes)
+        try:
+            from run_test import warmup_data
+            
+            # Run warmup_data (which runs ALL modes by default)
+            debug_logger.info("Calling warmup_data function...")
+            result = warmup_data()  # FIXED: Removed invalid startup_mode parameter
+            
+            debug_logger.info("Post-startup warmup completed successfully")
+            trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
+            
+        except Exception as e:
+            debug_logger.error(f"Error during post-startup warmup: {e}", exc_info=True)
+            debug_logger.warning("Server will continue with empty algorithm state")
+            
+    except Exception as e:
+        debug_logger.error(f"Fatal error in post-startup warmup: {e}", exc_info=True)
+
+# Add signal forwarding function
+def forward_signal_to_trade_endpoint(signal_data):
+    """
+    Forward signals to the original /trade_signal endpoint for external monitoring.
+    This is async and lightweight - just forwards the original tick data, not reprocessing.
+    """
+    def do_forward():
+        try:
+            # Forward the original tick data to /trade_signal (same format as individual requests)
+            forward_payload = {
+                "data": {
+                    "Time": signal_data['time'], 
+                    "Price": signal_data['price']
+                },
+                "currency": signal_data['currency'],
+                "source": "batch_forward"  # Flag to indicate this is a forward, not original
+            }
+            
+            # Quick forward with short timeout
+            response = requests.post("http://localhost:5000/trade_signal", 
+                                   json=forward_payload, 
+                                   timeout=2)  # Short timeout for forwarding
+            
+            if response.status_code == 200:
+                debug_logger.info(f"Successfully forwarded {signal_data['signal']} to /trade_signal")
+            else:
+                debug_logger.warning(f"Failed to forward signal: HTTP {response.status_code}")
+                
+        except Exception as e:
+            debug_logger.warning(f"Error forwarding to /trade_signal: {e}")
+            # Don't raise - forwarding failures shouldn't break batch processing
+    
+    # Run in background thread to avoid blocking
+    import threading
+    threading.Thread(target=do_forward, daemon=True).start()
+
+# Removed /signal_notification endpoint - all signals now forwarded to /trade_signal 
+# for better compatibility with external monitoring systems
+
+if __name__ == '__main__':
+    # Show immediate startup message
+    print("Starting Algorithm Trading Server...")
+    print("Initializing database connections...")
+    
+    # Import algorithm but DON'T run warmup during startup (avoid circular dependency)
+    import algorithm
+    
+    # Initialize database and basic algorithm state
+    debug_logger.info("Initializing algorithm database connections...")
+    algorithm.initialize_database()
+    
+    print("Starting Flask server on port 5000...")
+    debug_logger.info("Starting server...")
+    
+    # Start the warmup sequence in a background thread AFTER server starts
+    print("Starting background warmup process...")
+    print("   (This will take 5-10 minutes to complete)")
+    print("   Server will be ready for API calls immediately")
+    print("")
+    
+    warmup_thread = threading.Thread(target=run_post_startup_warmup, daemon=True)
+    warmup_thread.start()
+    
+    # Start the server (this will block and keep the server running)
+    debug_logger.info("Server starting on http://0.0.0.0:5000")
+    print("Server is now running and accepting requests!")
+    print("Warmup process running in background...")
+    print("API available at: http://localhost:5000")
+    print("")
     serve(app, host='0.0.0.0', port=5000)
