@@ -31,7 +31,7 @@ MAX_PIP_LOSS = 0.0030  # 30 pips maximum loss
 # Replace existing DB credential variables with a configuration dictionary
 DB_CONFIG = {
     'server': '192.168.50.100',
-    'database': 'TTG',
+    'database': 'FXStrat',  # Changed from 'TTG' to 'FXStrat'
     'username': 'djaime',
     'password': 'Enrique30072000!2',
     'driver': 'ODBC Driver 17 for SQL Server'

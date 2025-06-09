@@ -356,6 +356,6 @@ if __name__ == '__main__':
     debug_logger.info("Server starting on http://0.0.0.0:5000")
     print("Server is now running and accepting requests!")
     print("Warmup process running in background...")
-    print("API available at: http://localhost:5000")
+    print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
     print("")
     serve(app, host='0.0.0.0', port=5000)

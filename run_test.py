@@ -33,7 +33,7 @@ PATTERN_REPEATS = 3  # Repeat the pattern 3 times
 # Database configuration (same as secondary_warmer_script.py)
 DB_CONFIG = {
     'server': '192.168.50.100',
-    'database': 'TTG',
+    'database': 'FXStrat',  # Changed from 'TTG' to 'FXStrat'
     'username': 'djaime',
     'password': 'Enrique30072000!2',
     'driver': 'ODBC Driver 17 for SQL Server'
@@ -229,6 +229,7 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     """
     Send historical data to the API endpoint in batches using the batch endpoint.
     Also collects the zones that were created during backtesting.
+    Now saves backtest signals to separate table.
     
     Args:
         df (DataFrame): Historical data to send
@@ -243,6 +244,9 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     failed_count = 0
     signals_generated = {'buy': 0, 'sell': 0, 'close': 0, 'hold': 0}
     
+    # Generate backtest datetime for Mode 2
+    backtest_datetime = datetime.datetime.now()
+    
     total_records = len(df)
     total_batches = (total_records + batch_size - 1) // batch_size
     
@@ -253,6 +257,7 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     print(f"Sending {total_records:,} records in {total_batches} batches of {batch_size}")
     logger.info("Using batch endpoint for efficient processing...")
     print("Using batch endpoint for efficient processing...")
+    logger.info(f"Backtest DateTime: {backtest_datetime}")
     
     start_time = time.time()
     
@@ -304,8 +309,19 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
                 for signal_type, count in batch_signals.items():
                     signals_generated[signal_type] = signals_generated.get(signal_type, 0) + count
                 
-                # Only log significant signals (reduce duplicate logging)
+                # Save non-hold signals to backtest table
                 results = resp_json.get('results', [])
+                for result in results:
+                    if 'signal' in result and result['signal'] != 'hold':
+                        save_backtest_signal(
+                            result['signal'],
+                            result['price'],
+                            result['time'],
+                            currency,
+                            backtest_datetime
+                        )
+                
+                # Log significant signals (reduce duplicate logging)
                 non_hold_signals = [r for r in results if 'signal' in r and r['signal'] != 'hold']
                 
                 # Log summary instead of individual signals to reduce duplicate logging
@@ -314,11 +330,11 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
                     first_signal = non_hold_signals[0]
                     if len(non_hold_signals) == 1:
                         logger.warning(
-                            f"SIGNAL GENERATED: {first_signal['signal'].upper()} "
-                            f"at {first_signal['price']:.5f} ({first_signal['time']})"
+                            f"BACKTEST SIGNAL: {first_signal['signal'].upper()} "
+                            f"at {first_signal['price']:.5f} ({first_signal['time']}) [DateTime: {backtest_datetime}]"
                         )
                     else:
-                        logger.warning(f"Batch {batch_num+1}: {len(non_hold_signals)} signals generated")
+                        logger.warning(f"Batch {batch_num+1}: {len(non_hold_signals)} signals generated [DateTime: {backtest_datetime}]")
             else:
                 # If batch fails, count all as failed
                 failed_count += len(batch_data)
@@ -339,7 +355,9 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     logging.getLogger().handlers[0].flush()
     
     logger.info(f"Completed in {elapsed_time:.1f} seconds")
+    logger.info(f"Backtest signals saved to table with DateTime: {backtest_datetime}")
     print(f"Completed in {elapsed_time:.1f} seconds")
+    print(f"Backtest signals saved to table with DateTime: {backtest_datetime}")
     
     return successful_count, failed_count, signals_generated
 
@@ -500,6 +518,7 @@ def print_compressed_signals(signals, successful_count, failed_count):
 def run_mode_1_signal_test():
     """
     Mode 1: Send arbitrary test signals to verify API connectivity
+    Note: Signals are NOT saved to database as they are arbitrary test patterns
     """
     print("="*60)
     print("MODE 1: SIGNAL TEST - STARTING API TEST SEQUENCE")
@@ -509,10 +528,12 @@ def run_mode_1_signal_test():
     print(f"Test Currency: {TEST_CURRENCY}")
     print(f"Signal Delay: {SIGNAL_DELAY} seconds")
     print(f"Pattern Repeats: {PATTERN_REPEATS}")
+    print("Note: Test signals will NOT be saved to database (arbitrary patterns)")
     print("")
     
     # Log endpoint information for this mode
     logger.info("MODE 1: API connectivity test using /trade_signal endpoint")
+    logger.info("Mode 1 signals are NOT saved to database (arbitrary test patterns)")
     
     print("Testing API connectivity...")
     
@@ -536,12 +557,13 @@ def run_mode_1_signal_test():
             current_time = datetime.datetime.now()
             timestamp_str = current_time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Send the signal
+            # Send the signal to API (for connectivity testing only)
             success = send_test_signal(signal_type, TEST_PRICE, TEST_CURRENCY, timestamp_str)[0]
             
             if success:
                 all_sent_signals.append(signal_type)
                 successful_signals += 1
+                # Note: No database saving for Mode 1 signals
             else:
                 failed_signals += 1
             
@@ -559,6 +581,7 @@ def run_mode_1_signal_test():
     print(f"Total signals sent: {total_signals}")
     print(f"Successful: {successful_signals}")
     print(f"Failed: {failed_signals}")
+    print("Note: Test signals were not saved to database")
     
     return failed_signals == 0
 
@@ -847,6 +870,69 @@ def main():
     # When run standalone, execute all modes and don't return warmup data
     warmup_data()
     return True
+
+# NEW FUNCTION: Save backtest signals to separate table
+def save_backtest_signal(signal_type, price, signal_time, currency, backtest_datetime):
+    """
+    Save a backtest signal to the FXStrat_BackTestSignals table.
+    Only used for Mode 2 (historical backtest) signals.
+    
+    Args:
+        signal_type (str): The signal type ('buy', 'sell', 'close', 'hold')
+        price (float): The price value
+        signal_time (str): The timestamp string
+        currency (str): The currency pair
+        backtest_datetime (datetime): Date and time when the backtest was run
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if signal_type == 'hold':
+        return True  # Don't save hold signals
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return False
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO FXStrat_BackTestSignals 
+        (SignalTime, SignalType, Price, Currency, BackTestDateTime, IsBacktest)
+        VALUES (?, ?, ?, ?, ?, 1)
+        """, 
+        signal_time,
+        signal_type,
+        round(price, 5),
+        currency,
+        backtest_datetime
+        )
+        
+        conn.commit()
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error saving backtest signal: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        return False
+    
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
 if __name__ == "__main__":
     try:
