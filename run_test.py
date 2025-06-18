@@ -8,6 +8,10 @@ This script combines testing and warmup functionality:
 3. Warmup Mode: Prepares zones and bars for algorithm initialization
 
 The script runs all three modes in sequence when called by the algorithm.
+
+DATABASE NOTE:
+- Historical data (HistoData table) is fetched from TTG database
+- All other operations (zones, signals, etc.) use FXStrat database
 """
 
 import requests
@@ -71,21 +75,27 @@ logger.info("="*80)
 warmup_bars = {}
 warmup_zones = {}
 
-def get_db_connection():
+def get_db_connection(database_override=None):
     """
     Creates and returns a connection to the SQL Server database.
+    
+    Args:
+        database_override (str, optional): Override the default database. If None, uses DB_CONFIG['database']
     """
+    # Use override database if provided, otherwise use default
+    database_name = database_override if database_override else DB_CONFIG['database']
+    
     conn_str = (
         f"Driver={{{DB_CONFIG['driver']}}};"
         f"Server={DB_CONFIG['server']};"
-        f"Database={DB_CONFIG['database']};"
+        f"Database={database_name};"
         f"UID={DB_CONFIG['username']};"
         f"PWD={DB_CONFIG['password']};"
     )
     
     try:
         conn = pyodbc.connect(conn_str)
-        logger.info(f"Successfully connected to {DB_CONFIG['database']} on {DB_CONFIG['server']}")
+        logger.info(f"Successfully connected to {database_name} on {DB_CONFIG['server']}")
         return conn
     except Exception as e:
         logger.error(f"Database connection error: {e}")
@@ -104,7 +114,8 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=75000):
     """
     conn = None
     try:
-        conn = get_db_connection()
+        # Use TTG database for historical data
+        conn = get_db_connection(database_override="TTG")
         if conn is None:
             return pd.DataFrame()
         
@@ -120,7 +131,7 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=75000):
         ORDER BY [BarDateTime] ASC
         """
         
-        logger.info(f"Fetching {limit:,} most recent {currency_pair} prices from database...")
+        logger.info(f"Fetching {limit:,} most recent {currency_pair} prices from TTG database...")
         
         # Execute query and load into DataFrame
         df = pd.read_sql(query, conn)
@@ -163,7 +174,8 @@ def process_warmup_data(currency_pair="EUR.USD"):
         # Fetch 3 days of historical tick data for warmup
         conn = None
         try:
-            conn = get_db_connection()
+            # Use TTG database for historical data
+            conn = get_db_connection(database_override="TTG")
             if conn is None:
                 return pd.DataFrame(), {}
             
