@@ -1020,27 +1020,33 @@ def get_db_connection():
     Returns:
         pyodbc.Connection or None: Database connection object if successful, None otherwise
     """
+    # Build connection string with pooling settings
+    conn_str = (
+        f"Driver={{{DB_CONFIG['driver']}}};"
+        f"Server={DB_CONFIG['server']};"
+        f"Database={DB_CONFIG['database']};"
+        f"UID={DB_CONFIG['username']};"
+        f"PWD={DB_CONFIG['password']};"
+        f"Connection Timeout=30;"  # Add connection timeout
+        f"TrustServerCertificate=yes;"  # Add for SSL/TLS issues
+    )
+    
     # Check for existing connection
     if not hasattr(get_db_connection, "_connection") or get_db_connection._connection is None:
         # Create new connection if none exists
-        conn_str = (
-            f"Driver={{{DB_CONFIG['driver']}}};"
-            f"Server={DB_CONFIG['server']};"
-            f"Database={DB_CONFIG['database']};"
-            f"UID={DB_CONFIG['username']};"
-            f"PWD={DB_CONFIG['password']};"
-        )
-        
         try:
-            get_db_connection._connection = pyodbc.connect(conn_str)
+            get_db_connection._connection = pyodbc.connect(conn_str, autocommit=False)
+            get_db_connection._connection.timeout = 30  # Set query timeout
             debug_logger.info(f"Successfully connected to {DB_CONFIG['database']} on {DB_CONFIG['server']}")
         except Exception as e:
             debug_logger.error(f"Database connection error: {e}", exc_info=True)
             get_db_connection._connection = None
+            return None
     
     # Test if connection is still valid, reconnect if needed
     if get_db_connection._connection is not None:
         try:
+            # Use a simpler test query that should work even on busy servers
             cursor = get_db_connection._connection.cursor()
             cursor.execute("SELECT 1")
             cursor.fetchone()  # Actually fetch the result
@@ -1052,19 +1058,16 @@ def get_db_connection():
             except:
                 pass
             get_db_connection._connection = None
+            
             # Create a fresh connection - don't use recursion to avoid stack overflow
             try:
-                conn_str = (
-                    f"Driver={{{DB_CONFIG['driver']}}};"
-                    f"Server={DB_CONFIG['server']};"
-                    f"Database={DB_CONFIG['database']};"
-                    f"UID={DB_CONFIG['username']};"
-                    f"PWD={DB_CONFIG['password']};"
-                )
-                get_db_connection._connection = pyodbc.connect(conn_str)
+                get_db_connection._connection = pyodbc.connect(conn_str, autocommit=False)
+                get_db_connection._connection.timeout = 30
+                debug_logger.info("Successfully reconnected to database")
             except Exception as reconnect_error:
                 debug_logger.error(f"Failed to reconnect: {reconnect_error}")
                 get_db_connection._connection = None
+                return None
     
     return get_db_connection._connection
 
@@ -1297,8 +1300,12 @@ def save_bar_to_database(bar_data, currency="EUR.USD"):
         return False
     
     finally:
-        if conn:
-            conn.close()
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        # DO NOT close the connection when using connection pooling
 
 def save_zone_to_database(zone_id, zone_data, currency="EUR.USD"):
     """
@@ -1389,11 +1396,7 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
                 cursor.close()
             except:
                 pass
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+        # DO NOT close the connection when using connection pooling
 
 # --------------------------------------------------------------------------
 # SQL DATA STORAGE FUNCTIONS
@@ -1530,11 +1533,7 @@ def sync_zones_to_database(currency="EUR.USD"):
                 cursor.close()
             except:
                 pass
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+        # DO NOT close the connection when using connection pooling
 
 def store_bar_in_sql(bar_data):
     """
@@ -1625,11 +1624,9 @@ def store_bar_in_sql(bar_data):
                 cursor.close()
             except:
                 pass
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+        # DO NOT close the connection when using connection pooling
+        # The connection is managed by get_db_connection()
+        # Removing the connection close to fix the issue
 
 def store_zones_in_sql(zones_data):
     """
@@ -1732,11 +1729,7 @@ def store_zones_in_sql(zones_data):
                 cursor.close()
             except:
                 pass
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
+        # DO NOT close the connection when using connection pooling
 
 # --------------------------------------------------------------------------
 # ATR CALCULATION - OPTIMIZATION
@@ -2205,3 +2198,4 @@ def check_pip_based_loss(current_price, current_time, currency):
             force_closed = True
             
     return force_closed
+
