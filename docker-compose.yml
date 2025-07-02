@@ -50,11 +50,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
-          cpus: '1.0'
+          memory: 4G
+          cpus: '4.0'
         reservations:
-          memory: 512M
-          cpus: '0.5'
+          memory: 1G
+          cpus: '2.0'
     
     # Health check configuration
     healthcheck:
