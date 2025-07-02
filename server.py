@@ -388,7 +388,7 @@ def run_post_startup_warmup():
             
             # Run warmup_data with skip parameters
             debug_logger.info("Calling warmup_data function...")
-            result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
+            result = warmup_data()
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
