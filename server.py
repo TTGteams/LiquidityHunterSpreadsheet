@@ -9,8 +9,16 @@ import pytz
 import datetime
 import requests
 import time
+import sys
+import signal
+import subprocess
+import atexit
 
 app = Flask(__name__)
+
+# Global variables for skip settings
+SKIP_MODE2 = False
+SKIP_MODE3 = False
 
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
@@ -259,28 +267,134 @@ def trade_signal_batch():
         debug_logger.error(f"Error in batch processing: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 400
 
+# Global variable to track IB process
+ib_process = None
+
+def start_ib_live_trading():
+    """
+    Start the IB live trading script as a subprocess.
+    """
+    global ib_process
+    
+    try:
+        import subprocess
+        import os
+        
+        debug_logger.info("Starting IB Live Trading...")
+        
+        # Start the IB trading script
+        ib_process = subprocess.Popen(
+            [sys.executable, 'ib_live_trading_enhanced.py'],
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        debug_logger.info(f"IB Live Trading started with PID: {ib_process.pid}")
+        trade_logger.info("IB Live Trading system activated")
+        
+        # Start a thread to monitor the IB process
+        monitor_thread = threading.Thread(target=monitor_ib_process, daemon=True)
+        monitor_thread.start()
+        
+    except Exception as e:
+        debug_logger.error(f"Failed to start IB Live Trading: {e}", exc_info=True)
+
+def monitor_ib_process():
+    """
+    Monitor the IB process and restart it if it crashes.
+    """
+    global ib_process
+    
+    while ib_process is not None:
+        try:
+            # Check if process is still running
+            if ib_process.poll() is not None:
+                debug_logger.warning("IB Live Trading process has stopped")
+                
+                # Wait a moment before restarting
+                time.sleep(5)
+                
+                debug_logger.info("Restarting IB Live Trading...")
+                start_ib_live_trading()
+                break
+            
+            # Read and log output from IB process
+            try:
+                line = ib_process.stdout.readline()
+                if line:
+                    debug_logger.info(f"IB: {line.strip()}")
+            except:
+                pass
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            debug_logger.error(f"Error monitoring IB process: {e}")
+            time.sleep(5)
+
+def stop_ib_live_trading():
+    """
+    Stop the IB live trading process gracefully.
+    """
+    global ib_process
+    
+    if ib_process is not None:
+        try:
+            debug_logger.info("Stopping IB Live Trading...")
+            ib_process.terminate()
+            
+            # Wait for graceful shutdown
+            try:
+                ib_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                debug_logger.warning("IB process didn't stop gracefully, forcing shutdown...")
+                ib_process.kill()
+                ib_process.wait()
+            
+            ib_process = None
+            debug_logger.info("IB Live Trading stopped")
+            
+        except Exception as e:
+            debug_logger.error(f"Error stopping IB process: {e}")
+
 def run_post_startup_warmup():
     """
-    Run the complete warmup sequence after server startup.
+    Run the complete warmup sequence after server startup, then start IB live trading.
     This runs in a background thread to avoid blocking the server.
     """
+    global SKIP_MODE2, SKIP_MODE3
+    
     try:
         # Wait a moment for server to be fully ready
         debug_logger.info("Waiting 2 seconds for server to be ready...")
         time.sleep(2)
         
-        debug_logger.info("Starting post-startup warmup sequence...")
+        if SKIP_MODE2 or SKIP_MODE3:
+            skipped_modes = []
+            if SKIP_MODE2:
+                skipped_modes.append("Mode 2 (Historical)")
+            if SKIP_MODE3:
+                skipped_modes.append("Mode 3 (Warmup)")
+            debug_logger.info(f"Starting post-startup warmup sequence... SKIPPING: {', '.join(skipped_modes)}")
+        else:
+            debug_logger.info("Starting post-startup warmup sequence...")
         
-        # Import and run the complete warmup sequence (all 3 modes)
+        # Import and run the complete warmup sequence
         try:
             from run_test import warmup_data
             
-            # Run warmup_data (which runs ALL modes by default)
+            # Run warmup_data with skip parameters
             debug_logger.info("Calling warmup_data function...")
-            result = warmup_data()  # FIXED: Removed invalid startup_mode parameter
+            result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
+            
+            # Now start IB live trading
+            start_ib_live_trading()
             
         except Exception as e:
             debug_logger.error(f"Error during post-startup warmup: {e}", exc_info=True)
@@ -328,9 +442,43 @@ def forward_signal_to_trade_endpoint(signal_data):
 # Removed /signal_notification endpoint - all signals now forwarded to /trade_signal 
 # for better compatibility with external monitoring systems
 
+# Signal handling for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    debug_logger.info(f"Received signal {signum}, shutting down gracefully...")
+    stop_ib_live_trading()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Register cleanup function for normal exit
+atexit.register(stop_ib_live_trading)
+
 if __name__ == '__main__':
+    # Parse command line arguments for skip options
+    if len(sys.argv) > 1:
+        if sys.argv[1].lower() == "skip":
+            SKIP_MODE2 = True
+            SKIP_MODE3 = True
+            print("Server started with SKIP mode - will skip Modes 2 and 3 during startup")
+        elif sys.argv[1].lower() == "help" or sys.argv[1].lower() == "--help":
+            print("Usage: python server.py [skip]")
+            print("  skip: Skip Modes 2 and 3 during startup warmup (faster startup)")
+            print("  (no argument): Run all modes during startup (normal operation)")
+            sys.exit(0)
+        else:
+            print(f"Unknown argument: {sys.argv[1]}")
+            print("Usage: python server.py [skip]")
+            print("  skip: Skip Modes 2 and 3 during startup warmup")
+            print("  (no argument): Run all modes during startup")
+            sys.exit(1)
+    
     # Show immediate startup message
     print("Starting Algorithm Trading Server...")
+    if SKIP_MODE2 and SKIP_MODE3:
+        print("SKIP MODE: Will skip historical backtest and warmup preparation")
     print("Initializing database connections...")
     
     # Import algorithm but DON'T run warmup during startup (avoid circular dependency)
@@ -345,7 +493,10 @@ if __name__ == '__main__':
     
     # Start the warmup sequence in a background thread AFTER server starts
     print("Starting background warmup process...")
-    print("   (This will take 5-10 minutes to complete)")
+    if SKIP_MODE2 and SKIP_MODE3:
+        print("   (SKIP MODE: Only signal test will run - much faster startup)")
+    else:
+        print("   (This will take 5-10 minutes to complete)")
     print("   Server will be ready for API calls immediately")
     print("")
     
@@ -355,7 +506,10 @@ if __name__ == '__main__':
     # Start the server (this will block and keep the server running)
     debug_logger.info("Server starting on http://0.0.0.0:5000")
     print("Server is now running and accepting requests!")
-    print("Warmup process running in background...")
+    if SKIP_MODE2 and SKIP_MODE3:
+        print("Warmup process running in background (SKIP MODE - faster)...")
+    else:
+        print("Warmup process running in background...")
     print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
     print("")
     serve(app, host='0.0.0.0', port=5000)
