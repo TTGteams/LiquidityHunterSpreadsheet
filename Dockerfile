@@ -1,7 +1,7 @@
 # Use an official Python runtime as a base image
 FROM python:3.12.5
 
-# Install system dependencies and Microsoft SQL Server requirements
+# Install system dependencies including curl for health checks
 RUN apt-get update && apt-get install -y \
     gnupg2 \
     curl \
@@ -26,13 +26,31 @@ WORKDIR /app
 
 # Copy the requirements file and install dependencies
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy the application code
 COPY . .
+
+# No longer need startup script - orchestration integrated into server.py
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Environment variables for configuration
+ENV FLASK_ENV=production
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 # Expose the port that Flask will run on
 EXPOSE 5000
 
-# Run the Flask application
+# Add health check for the complete system
+# The health check waits longer during startup to allow for warmup (35 min + buffer)
+HEALTHCHECK --interval=60s --timeout=15s --start-period=2400s --retries=3 \
+    CMD curl -f http://localhost:5000/trade_signal -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}' \
+    || exit 1
+
+# Run the Flask server which now orchestrates both services internally
 CMD ["python", "server.py"]
