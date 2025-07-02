@@ -1,20 +1,84 @@
 version: '3.8'
+
 services:
-  flask_app:
+  trading_system:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: forex_trading_system
     ports:
       - "5000:5000"
     environment:
+      # Flask configuration
       FLASK_ENV: production
+      PYTHONUNBUFFERED: 1
+      PYTHONPATH: /app
+      
+      # Database configuration (can be overridden via env file)
+      DB_SERVER: "192.168.50.100"
+      DB_DATABASE: "FXStrat"
+      DB_USERNAME: "djaime"
+      DB_PASSWORD: "Enrique30072000!2"
+      
+      # Interactive Brokers configuration
+      IB_HOST: "127.0.0.1"
+      IB_PORT: "7497"
+      IB_CLIENT_ID: "6969"
+      
+      # Trading configuration
+      POSITION_SIZE: "100000"
+      API_URL: "http://localhost:5000/trade_signal"
+      
+      # Accept EULA for SQL Server components
       ACCEPT_EULA: Y
+      
     volumes:
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      
+      # Mount the application code for development (remove in production)
       - .:/app
+      
+      # Mount a persistent data directory for any cached data
+      - trading_data:/app/data
+      
     networks:
-      - app_network
+      - trading_network
+      
+    # Restart policy for robustness
+    restart: unless-stopped
+    
+    # Resource limits to prevent container from consuming too much memory
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
+      interval: 60s
+      timeout: 15s
+      start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
+      retries: 3
+    
+
 
 networks:
-  app_network:
+  trading_network:
     driver: bridge
+    name: forex_trading_net
+
+volumes:
+  # Persistent storage for logs and data
+  trading_data:
+    driver: local
+    
+  # Persistent storage for SQL Server (if using local SQL Server)
+  # sqlserver_data:
+  #   driver: local
     
