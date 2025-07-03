@@ -272,6 +272,7 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     logger.info(f"Backtest DateTime: {backtest_datetime}")
     
     start_time = time.time()
+    signals_buffer = []  # Buffer for batch saving
     
     for batch_num in range(total_batches):
         start_idx = batch_num * batch_size
@@ -321,17 +322,22 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
                 for signal_type, count in batch_signals.items():
                     signals_generated[signal_type] = signals_generated.get(signal_type, 0) + count
                 
-                # Save non-hold signals to backtest table
+                # Collect non-hold signals for batch saving
                 results = resp_json.get('results', [])
                 for result in results:
                     if 'signal' in result and result['signal'] != 'hold':
-                        save_backtest_signal(
-                            result['signal'],
-                            result['price'],
-                            result['time'],
-                            currency,
-                            backtest_datetime
-                        )
+                        signals_buffer.append({
+                            'signal_type': result['signal'],
+                            'price': result['price'],
+                            'signal_time': result['time'],
+                            'currency': currency,
+                            'backtest_datetime': backtest_datetime
+                        })
+                
+                # Save when buffer reaches 50 signals
+                if len(signals_buffer) >= 50:
+                    save_backtest_signals_batch(signals_buffer)
+                    signals_buffer = []  # Clear buffer
                 
                 # Log significant signals (reduce duplicate logging)
                 non_hold_signals = [r for r in results if 'signal' in r and r['signal'] != 'hold']
@@ -362,6 +368,10 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
             time.sleep(delay_between_batches)
     
     elapsed_time = time.time() - start_time
+    
+    # Save any remaining signals in buffer
+    if signals_buffer:
+        save_backtest_signals_batch(signals_buffer)
     
     # Final flush
     logging.getLogger().handlers[0].flush()
@@ -804,13 +814,15 @@ def run_mode_3_warmup():
     
     return True
 
-def warmup_data(currency=None):
+def warmup_data(currency=None, skip_mode2=False, skip_mode3=False):
     """
     Main entry point called by the algorithm.
     Runs all three modes and returns warmup data.
     
     Args:
         currency (str, optional): Specific currency to get data for. If None, processes all currencies.
+        skip_mode2 (bool): If True, skip Mode 2 (Historical Backtest)
+        skip_mode3 (bool): If True, skip Mode 3 (Warmup Preparation)
         
     Returns:
         If currency is specified:
@@ -821,27 +833,57 @@ def warmup_data(currency=None):
     global warmup_bars, warmup_zones
     
     try:
-        # Run all three modes in sequence
+        # Determine which modes to run
+        modes_to_run = []
+        if not False:  # Mode 1 always runs (can't skip API connectivity test)
+            modes_to_run.append("Mode 1 (Signal Test)")
+        if not skip_mode2:
+            modes_to_run.append("Mode 2 (Historical Test)")
+        if not skip_mode3:
+            modes_to_run.append("Mode 3 (Warmup)")
+        
+        # Display startup message
         print("\n" + "="*80)
         print("STARTING COMBINED TEST AND WARMUP SEQUENCE")
+        if skip_mode2 or skip_mode3:
+            skipped_modes = []
+            if skip_mode2:
+                skipped_modes.append("Mode 2 (Historical)")
+            if skip_mode3:
+                skipped_modes.append("Mode 3 (Warmup)")
+            print(f"SKIPPING: {', '.join(skipped_modes)}")
+        print(f"RUNNING: {', '.join(modes_to_run)}")
         print("="*80 + "\n")
         
-        # Mode 1: Signal Test
+        # Mode 1: Signal Test (always runs)
         mode1_success = run_mode_1_signal_test()
         if not mode1_success:
             logger.error("Mode 1 failed - API connectivity issues")
             # Continue anyway for warmup
         
-        # Mode 2: Historical Test (no unnecessary delay)
-        print("\nStarting Mode 2...")
-        mode2_success = run_mode_2_historical_test()
-        if not mode2_success:
-            logger.warning("Mode 2 had some failures but continuing")
+        # Mode 2: Historical Test (conditional)
+        mode2_success = True  # Default to success if skipped
+        if not skip_mode2:
+            print("\nStarting Mode 2...")
+            mode2_success = run_mode_2_historical_test()
+            if not mode2_success:
+                logger.warning("Mode 2 had some failures but continuing")
+        else:
+            print("\nSkipping Mode 2 (Historical Test) as requested")
+            logger.info("MODE 2: Skipped by server request")
         
-        # Mode 3: Warmup (no unnecessary delay)
-        print("\nStarting Mode 3...")
-        logger.info("MODE 3: Warmup data preparation from database")
-        mode3_success = run_mode_3_warmup()
+        # Mode 3: Warmup (conditional)
+        mode3_success = True  # Default to success if skipped
+        if not skip_mode3:
+            print("\nStarting Mode 3...")
+            logger.info("MODE 3: Warmup data preparation from database")
+            mode3_success = run_mode_3_warmup()
+        else:
+            print("\nSkipping Mode 3 (Warmup) as requested")
+            logger.info("MODE 3: Skipped by server request")
+            # Initialize empty warmup data if mode 3 is skipped
+            warmup_bars = {curr: pd.DataFrame() for curr in SUPPORTED_CURRENCIES}
+            warmup_zones = {curr: {} for curr in SUPPORTED_CURRENCIES}
         
         # Overall summary
         print("\n\n")
@@ -849,9 +891,15 @@ def warmup_data(currency=None):
         print("ALL MODES COMPLETED")
         print("="*80)
         print(f"Mode 1 (Signal Test): {'PASSED' if mode1_success else 'FAILED'}")
-        print(f"Mode 2 (Historical Test): {'PASSED' if mode2_success else 'PARTIAL'}")
-        print(f"Mode 3 (Warmup): {'PASSED' if mode3_success else 'FAILED'}")
-        
+        if not skip_mode2:
+            print(f"Mode 2 (Historical Test): {'PASSED' if mode2_success else 'PARTIAL'}")
+        else:
+            print("Mode 2 (Historical Test): SKIPPED")
+        if not skip_mode3:
+            print(f"Mode 3 (Warmup): {'PASSED' if mode3_success else 'FAILED'}")
+        else:
+            print("Mode 3 (Warmup): SKIPPED")
+
         # Final flush before returning
         logging.getLogger().handlers[0].flush()
         
@@ -884,6 +932,52 @@ def main():
     return True
 
 # NEW FUNCTION: Save backtest signals to separate table
+def save_backtest_signals_batch(signals_batch):
+    """
+    Save multiple backtest signals in a single database transaction.
+    """
+    if not signals_batch:
+        return 0
+        
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return 0
+        
+        cursor = conn.cursor()
+        
+        # Prepare batch data (exclude hold signals)
+        batch_data = [
+            (s['signal_time'], s['signal_type'], round(s['price'], 5), 
+             s['currency'], s['backtest_datetime'], 1)
+            for s in signals_batch 
+            if s['signal_type'] != 'hold'
+        ]
+        
+        if batch_data:
+            cursor.executemany("""
+            INSERT INTO FXStrat_BackTestSignals 
+            (SignalTime, SignalType, Price, Currency, BackTestDateTime, IsBacktest)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, batch_data)
+            
+            conn.commit()
+            
+    except Exception as e:
+        logger.error(f"Error saving batch of {len(signals_batch)} signals: {e}")
+        if conn:
+            conn.rollback()
+                
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+                
+    return len(batch_data) if batch_data else 0
+
 def save_backtest_signal(signal_type, price, signal_time, currency, backtest_datetime):
     """
     Save a backtest signal to the FXStrat_BackTestSignals table.
@@ -975,4 +1069,4 @@ if __name__ == "__main__":
         exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        exit(1) 
+        exit(1)
