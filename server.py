@@ -282,14 +282,22 @@ def start_ib_live_trading():
         
         debug_logger.info("Starting IB Live Trading...")
         
-        # Start the IB trading script
+        # Pass environment variables to subprocess
+        env = os.environ.copy()
+        
+        # Log critical environment variables for debugging
+        debug_logger.info(f"IB_HOST from environment: {env.get('IB_HOST', 'NOT SET')}")
+        debug_logger.info(f"IB_PORT from environment: {env.get('IB_PORT', 'NOT SET')}")
+        
+        # Start the IB trading script with environment
         ib_process = subprocess.Popen(
             [sys.executable, 'ib_live_trading_enhanced.py'],
             cwd=os.getcwd(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
-            bufsize=1
+            bufsize=1,
+            env=env  # Pass the environment variables
         )
         
         debug_logger.info(f"IB Live Trading started with PID: {ib_process.pid}")

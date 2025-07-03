@@ -9,6 +9,10 @@ Consolidated version with all optimizations:
 """
 
 from ib_insync import *
+import nest_asyncio
+# Apply nest_asyncio to handle event loop conflicts when run as subprocess
+nest_asyncio.apply()
+
 import requests
 import logging
 import datetime
@@ -101,6 +105,7 @@ class EnhancedIBTradingBot:
         self.position_lock = threading.Lock()
         
         logger.info(f"[INIT] Enhanced IB Trading Bot initialized for {len(self.currency_pairs)} currencies")
+        logger.info(f"[INIT] IB connection will use: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
 
     def connect_to_ib(self):
         """Connect to IB with enhanced error handling"""
@@ -159,7 +164,7 @@ class EnhancedIBTradingBot:
                             raise Exception(f"Unknown currency pair: {ib_currency}")
                     
                     self.contracts[api_currency] = contract
-                    ticker = util.run(self.ib.reqMktData(contract, '', False, False))
+                    ticker = self.ib.reqMktData(contract, '', False, False)
                     self.tickers[api_currency] = ticker
                     
                     logger.info(f"[OK] Market data: {api_currency}")
@@ -598,7 +603,7 @@ class EnhancedIBTradingBot:
             if self.is_connected:
                 for currency, ticker in list(self.tickers.items()):
                     try:
-                        util.run(self.ib.cancelMktData(ticker.contract))
+                        self.ib.cancelMktData(ticker.contract)
                     except:
                         pass
                 
@@ -663,12 +668,12 @@ class EnhancedIBTradingBot:
             if self.pending_orders:
                 for order_id in list(self.pending_orders.keys()):
                     try:
-                        util.run(self.ib.cancelOrder(order_id))
+                        self.ib.cancelOrder(order_id)
                     except:
                         pass
             
             if self.ib.isConnected():
-                util.run(self.ib.disconnect())
+                self.ib.disconnect()
             
             logger.info("[OK] Shutdown complete")
             
@@ -678,14 +683,26 @@ class EnhancedIBTradingBot:
 if __name__ == "__main__":
     import os
     
+    # Log environment variables for debugging
+    logger = logging.getLogger(__name__)
+    logger.info(f"IB_HOST environment variable: {os.environ.get('IB_HOST', 'NOT SET')}")
+    logger.info(f"IB_PORT environment variable: {os.environ.get('IB_PORT', 'NOT SET')}")
+    logger.info(f"Running in Docker: {'Yes' if os.environ.get('IB_HOST') == 'host.docker.internal' else 'No'}")
+    
     # Read configuration from environment variables (for Docker)
     # Falls back to defaults if not in Docker
+    ib_host = os.environ.get('IB_HOST', '127.0.0.1')
+    ib_port = int(os.environ.get('IB_PORT', '7497'))
+    client_id = int(os.environ.get('IB_CLIENT_ID', '6969'))
+    
+    logger.info(f"Creating bot with host={ib_host}, port={ib_port}, clientId={client_id}")
+    
     bot = EnhancedIBTradingBot(
-        ib_host=os.environ.get('IB_HOST', '127.0.0.1'),
-        ib_port=int(os.environ.get('IB_PORT', '7497')),
-        client_id=int(os.environ.get('IB_CLIENT_ID', '6969')),
+        ib_host=ib_host,
+        ib_port=ib_port,
+        client_id=client_id,
         api_url=os.environ.get('API_URL', 'http://localhost:5000/trade_signal'),
         position_size=int(os.environ.get('POSITION_SIZE', '100000'))
     )
     
-    bot.run() 
+    bot.run()
