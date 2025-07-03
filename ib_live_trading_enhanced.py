@@ -43,7 +43,7 @@ except Exception:
 class EnhancedIBTradingBot:
     def __init__(self, 
                  ib_host='127.0.0.1', 
-                 ib_port=7497, 
+                 ib_port=7497,  # TWS paper trading port
                  client_id=1,
                  api_url='http://localhost:5000/trade_signal',
                  position_size=30000):
@@ -676,12 +676,16 @@ class EnhancedIBTradingBot:
             logger.error(f"[ERROR] Shutdown error: {e}")
 
 if __name__ == "__main__":
+    import os
+    
+    # Read configuration from environment variables (for Docker)
+    # Falls back to defaults if not in Docker
     bot = EnhancedIBTradingBot(
-        ib_host='127.0.0.1',
-        ib_port=7497,
-        client_id=6969,
-        api_url='http://localhost:5000/trade_signal',
-        position_size=100000
+        ib_host=os.environ.get('IB_HOST', '127.0.0.1'),
+        ib_port=int(os.environ.get('IB_PORT', '7497')),
+        client_id=int(os.environ.get('IB_CLIENT_ID', '6969')),
+        api_url=os.environ.get('API_URL', 'http://localhost:5000/trade_signal'),
+        position_size=int(os.environ.get('POSITION_SIZE', '100000'))
     )
     
     bot.run() 
