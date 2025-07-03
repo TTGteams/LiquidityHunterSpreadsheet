@@ -19,7 +19,7 @@ services:
       DB_PASSWORD: "Enrique30072000!2"
       
       # Interactive Brokers configuration
-      IB_HOST: "127.0.0.1"
+      IB_HOST: "host.docker.internal"  # Special Docker hostname to reach host machine
       IB_PORT: "7497"
       IB_CLIENT_ID: "6969"
       
@@ -75,8 +75,3 @@ volumes:
   # Persistent storage for logs and data
   trading_data:
     driver: local
-    
-  # Persistent storage for SQL Server (if using local SQL Server)
-  # sqlserver_data:
-  #   driver: local
-    
