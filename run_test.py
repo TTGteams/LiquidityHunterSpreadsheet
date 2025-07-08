@@ -157,87 +157,7 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=60000):
         if conn:
             conn.close()
 
-def process_warmup_data(currency_pair="EUR.USD"):
-    """
-    Process historical data to create bars and identify zones for warmup.
-    This replicates the zone identification logic from the algorithm.
-    
-    Args:
-        currency_pair (str): The currency pair to process
-        
-    Returns:
-        tuple: (bars_15min, zones_dict) for the specified currency
-    """
-    logger.info(f"Processing warmup data for {currency_pair}")
-    
-    try:
-        # Fetch 3 days of historical tick data for warmup
-        conn = None
-        try:
-            # Use TTG database for historical data
-            conn = get_db_connection(database_override="TTG")
-            if conn is None:
-                return pd.DataFrame(), {}
-            
-            # Get 3 days of data for warmup
-            end_date = datetime.datetime.now()
-            start_date = end_date - datetime.timedelta(days=3)
-            
-            query = f"""
-            SELECT [BarDateTime], [Close]
-            FROM HistoData 
-            WHERE [Identifier] = '{currency_pair}'
-            AND [BarDateTime] >= '{start_date.strftime('%Y-%m-%d')}'
-            AND [BarDateTime] <= '{end_date.strftime('%Y-%m-%d')}'
-            ORDER BY [BarDateTime] ASC
-            """
-            
-            raw_ticks = pd.read_sql(query, conn)
-            raw_ticks = raw_ticks.rename(columns={'BarDateTime': 'Time', 'Close': 'Price'})
-            raw_ticks['Time'] = pd.to_datetime(raw_ticks['Time'])
-            raw_ticks.set_index('Time', inplace=True)
-            
-        finally:
-            if conn:
-                conn.close()
-        
-        if raw_ticks.empty:
-            logger.warning(f"No tick data available for {currency_pair}")
-            return pd.DataFrame(), {}
-            
-        # Convert ticks to 15-minute bars using resampling
-        bars_15min = raw_ticks.resample('15min')['Price'].ohlc()
-        
-        # Note: pandas ohlc() automatically creates columns named: open, high, low, close
-        
-        # Calculate indicators if we have enough data
-        if len(bars_15min) >= 35:
-            # Calculate RSI (14-period)
-            bars_15min['RSI'] = ta.rsi(bars_15min['close'], length=14)
-            
-            # Calculate MACD (12, 26, 9)
-            macd_result = ta.macd(bars_15min['close'], fast=12, slow=26, signal=9)
-            if macd_result is not None:
-                bars_15min['MACD_Line'] = macd_result['MACD_12_26_9']
-                bars_15min['Signal_Line'] = macd_result['MACDs_12_26_9']
-                bars_15min['MACD_Histogram'] = macd_result['MACDh_12_26_9']
-            
-            logger.info(f"Calculated indicators for {currency_pair}: {len(bars_15min)} bars")
-        else:
-            logger.warning(f"Not enough data to calculate indicators for {currency_pair}: {len(bars_15min)} bars")
-        
-        # Note: Zone identification will happen during the backtest phase
-        # We return empty zones here and let the backtest populate them
-        zones_dict = {}
-        
-        logger.info(f"Completed warmup processing for {currency_pair}: {len(bars_15min)} bars")
-        return bars_15min, zones_dict
-        
-    except Exception as e:
-        logger.error(f"Error processing warmup data for {currency_pair}: {e}", exc_info=True)
-        return pd.DataFrame(), {}
-
-def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_between_batches=0.002):
+def send_historical_data_to_api(df, currency="EUR.USD", batch_size=300, delay_between_batches=0.02):
     """
     Send historical data to the API endpoint in batches using the batch endpoint.
     Also collects the zones that were created during backtesting.
@@ -382,86 +302,6 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=400, delay_be
     print(f"Backtest signals saved to table with DateTime: {backtest_datetime}")
     
     return successful_count, failed_count, signals_generated
-
-def extract_zones_from_algorithm():
-    """
-    Extract the zones that were created during the backtest from the algorithm's memory.
-    This requires querying the algorithm's state after the backtest.
-    
-    ENHANCED: Now properly rounds zone prices to prevent floating point issues.
-    """
-    global warmup_zones
-    
-    # Since we can't directly access the algorithm's memory from here,
-    # we'll query the database for zones that were created during the backtest
-    conn = None
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            return {}
-        
-        # Get zones created in the last hour (during our backtest)
-        query = """
-        SELECT Currency, 
-               ROUND(ZoneStartPrice, 6) as ZoneStartPrice, 
-               ROUND(ZoneEndPrice, 6) as ZoneEndPrice, 
-               ZoneSize, 
-               ZoneType, 
-               ConfirmationTime
-        FROM FXStrat_AlgorithmZones
-        WHERE CreatedAt >= DATEADD(hour, -1, GETDATE())
-        AND AlgoInstance = ?
-        ORDER BY ConfirmationTime DESC
-        """
-        
-        cursor = conn.cursor()
-        
-        # Get the instance ID from algorithm module if available
-        algo_instance = 1  # Default
-        try:
-            import algorithm
-            if hasattr(algorithm, 'ALGO_INSTANCE'):
-                algo_instance = algorithm.ALGO_INSTANCE
-        except:
-            pass
-            
-        cursor.execute(query, algo_instance)
-        
-        zones_by_currency = {currency: {} for currency in SUPPORTED_CURRENCIES}
-        
-        for row in cursor.fetchall():
-            currency = row[0]
-            # Ensure consistent rounding
-            zone_start = round(float(row[1]), 6)
-            zone_end = round(float(row[2]), 6)
-            zone_size = float(row[3])
-            zone_type = row[4]
-            confirmation_time = row[5]
-            
-            zone_id = (zone_start, zone_end)
-            
-            # Skip if we already have this zone (handles any remaining duplicates)
-            if zone_id not in zones_by_currency[currency]:
-                zones_by_currency[currency][zone_id] = {
-                    'start_price': zone_start,
-                    'end_price': zone_end,
-                    'zone_size': zone_size,
-                    'zone_type': zone_type,
-                    'confirmation_time': confirmation_time
-                }
-        
-        logger.info(f"Extracted zones from database:")
-        for currency, zones in zones_by_currency.items():
-            logger.info(f"  {currency}: {len(zones)} zones")
-        
-        return zones_by_currency
-        
-    except Exception as e:
-        logger.error(f"Error extracting zones: {e}")
-        return {currency: {} for currency in SUPPORTED_CURRENCIES}
-    finally:
-        if conn:
-            conn.close()
 
 def send_test_signal(signal_type, price, currency, timestamp):
     """
@@ -672,8 +512,8 @@ def process_single_currency(currency):
         successful, failed, signals = send_historical_data_to_api(
             historical_data, 
             currency=currency,
-            batch_size=400,  # Original batch size with better delay management
-            delay_between_batches=0.01  # 5x increase from 0.002 to prevent overload
+            batch_size=300,  # Reduced from 400 to prevent server overload
+            delay_between_batches=0.02  # Increased from 0.01 to give server more time
         )
         
         # Currency-specific summary
@@ -801,6 +641,7 @@ def run_mode_2_historical_test():
 def run_mode_3_warmup():
     """
     Mode 3: Prepare warmup data (bars and zones) for all supported currencies
+    Now retrieves data directly from the algorithm's current state via API
     """
     global warmup_bars, warmup_zones
     
@@ -809,21 +650,72 @@ def run_mode_3_warmup():
     print("MODE 3: WARMUP - PREPARING DATA FOR ALGORITHM")
     print("="*60)
     
-    # Extract zones that were created during the backtest
-    warmup_zones = extract_zones_from_algorithm()
-    
-    # Process each supported currency
-    for currency in SUPPORTED_CURRENCIES:
-        logger.info(f"Processing warmup data for {currency}")
-        bars, _ = process_warmup_data(currency)
-        warmup_bars[currency] = bars
+    # Get algorithm state from API instead of database
+    try:
+        response = requests.get("http://localhost:5000/algorithm_state", timeout=10)
         
-        # Use the zones from the backtest if available, otherwise empty
-        if currency not in warmup_zones:
-            warmup_zones[currency] = {}
+        if response.status_code != 200:
+            logger.error(f"Failed to get algorithm state: HTTP {response.status_code}")
+            # Initialize empty data on failure
+            warmup_bars = {curr: pd.DataFrame() for curr in SUPPORTED_CURRENCIES}
+            warmup_zones = {curr: {} for curr in SUPPORTED_CURRENCIES}
+            return False
+        
+        state_data = response.json()
+        currencies_data = state_data.get('currencies', {})
+        
+        # Process each currency's data
+        for currency in SUPPORTED_CURRENCIES:
+            if currency not in currencies_data:
+                logger.warning(f"No state data for {currency}")
+                warmup_bars[currency] = pd.DataFrame()
+                warmup_zones[currency] = {}
+                continue
+            
+            currency_state = currencies_data[currency]
+            
+            # Process zones - convert string keys back to tuples
+            zones = {}
+            for zone_key_str, zone_data in currency_state.get('zones', {}).items():
+                # Parse the key format: "start_end"
+                if '_' in zone_key_str:
+                    parts = zone_key_str.split('_')
+                    if len(parts) == 2:
+                        try:
+                            zone_id = (float(parts[0]), float(parts[1]))
+                            zones[zone_id] = zone_data
+                        except ValueError:
+                            logger.warning(f"Invalid zone key format: {zone_key_str}")
+            
+            warmup_zones[currency] = zones
+            
+            # Process bars
+            bars_list = currency_state.get('bars', [])
+            if bars_list:
+                # Convert to DataFrame
+                df = pd.DataFrame(bars_list)
+                df['time'] = pd.to_datetime(df['time'])
+                df.set_index('time', inplace=True)
+                
+                # Ensure columns are in the expected order
+                df = df[['open', 'high', 'low', 'close'] + 
+                       [col for col in df.columns if col not in ['open', 'high', 'low', 'close']]]
+                
+                warmup_bars[currency] = df
+            else:
+                warmup_bars[currency] = pd.DataFrame()
+            
+            logger.info(f"Retrieved {currency} state: {len(warmup_bars[currency])} bars, {len(warmup_zones[currency])} zones")
+    
+    except Exception as e:
+        logger.error(f"Error retrieving algorithm state: {e}", exc_info=True)
+        # Initialize empty data on error
+        warmup_bars = {curr: pd.DataFrame() for curr in SUPPORTED_CURRENCIES}
+        warmup_zones = {curr: {} for curr in SUPPORTED_CURRENCIES}
+        return False
     
     # Summary
-    print("\nWarmup data prepared:")
+    print("\nWarmup data prepared from algorithm state:")
     for currency in SUPPORTED_CURRENCIES:
         bar_count = len(warmup_bars[currency]) if currency in warmup_bars else 0
         zone_count = len(warmup_zones[currency]) if currency in warmup_zones else 0

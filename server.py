@@ -185,6 +185,68 @@ def execute_command():
         debug_logger.error(f"Error executing command: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+@app.route('/algorithm_state', methods=['GET'])
+def get_algorithm_state():
+    """Get the current state of the algorithm including zones and bars for all currencies"""
+    try:
+        import algorithm
+        
+        # Prepare state data for all currencies
+        state_data = {}
+        
+        for currency in algorithm.SUPPORTED_CURRENCIES:
+            # Get zones for this currency
+            zones = {}
+            if currency in algorithm.current_valid_zones_dict:
+                # Convert zone tuples to strings for JSON serialization
+                for zone_id, zone_data in algorithm.current_valid_zones_dict[currency].items():
+                    zone_key = f"{zone_id[0]:.6f}_{zone_id[1]:.6f}" if isinstance(zone_id, tuple) else str(zone_id)
+                    zones[zone_key] = {
+                        'start_price': zone_data.get('start_price'),
+                        'end_price': zone_data.get('end_price'),
+                        'zone_size': zone_data.get('zone_size'),
+                        'zone_type': zone_data.get('zone_type'),
+                        'confirmation_time': zone_data.get('confirmation_time').isoformat() if zone_data.get('confirmation_time') else None
+                    }
+            
+            # Get bars for this currency (last 384 for indicators)
+            bars_data = []
+            if currency in algorithm.bars and not algorithm.bars[currency].empty:
+                recent_bars = algorithm.bars[currency].tail(384)
+                for idx, row in recent_bars.iterrows():
+                    bar = {
+                        'time': idx.isoformat(),
+                        'open': float(row['open']),
+                        'high': float(row['high']),
+                        'low': float(row['low']),
+                        'close': float(row['close'])
+                    }
+                    # Add indicators if available
+                    if 'RSI' in row and not pd.isna(row['RSI']):
+                        bar['RSI'] = float(row['RSI'])
+                    if 'MACD_Line' in row and not pd.isna(row['MACD_Line']):
+                        bar['MACD_Line'] = float(row['MACD_Line'])
+                    if 'Signal_Line' in row and not pd.isna(row['Signal_Line']):
+                        bar['Signal_Line'] = float(row['Signal_Line'])
+                    bars_data.append(bar)
+            
+            state_data[currency] = {
+                'zones': zones,
+                'zones_count': len(zones),
+                'bars': bars_data,
+                'bars_count': len(bars_data)
+            }
+        
+        return jsonify({
+            'status': 'success',
+            'timestamp': datetime.datetime.now().isoformat(),
+            'currencies': state_data
+        }), 200
+        
+    except Exception as e:
+        debug_logger.error(f"Error getting algorithm state: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/trade_signal_batch', methods=['POST'])
 def trade_signal_batch():
     """
@@ -627,4 +689,4 @@ if __name__ == '__main__':
     print("Fast restart: SKIP_WARMUP then RESTART")
     print("")
     # Increase worker threads to handle concurrent requests better
-    serve(app, host='0.0.0.0', port=5000, threads=16)  # 16 threads for parallel processing of 3 currencies
+    serve(app, host='0.0.0.0', port=5000, threads=32)  # 32 threads - high capacity without lock contention risk
