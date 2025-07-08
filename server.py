@@ -254,7 +254,7 @@ def trade_signal_batch():
     Used by testing scripts to speed up historical data processing.
     Maintains tick-by-tick algorithm behavior.
     
-    Also forwards non-hold signals to /trade_signal endpoint for external monitoring.
+    Note: Signal forwarding has been disabled to prevent connection exhaustion during backtesting.
     """
     try:
         content = request.json
@@ -334,8 +334,9 @@ def trade_signal_batch():
                 results.append(signal_result)
                 
                 # Forward non-hold signals to /trade_signal endpoint for external monitoring
-                if signal != 'hold':
-                    forward_signal_to_trade_endpoint(signal_result)
+                # COMMENTED OUT: This causes connection exhaustion during high-volume backtesting
+                # if signal != 'hold':
+                #     forward_signal_to_trade_endpoint(signal_result)
                 
                 # Log non-hold signals only once (removed duplicate logging)
                 # Logging is now handled by the notification endpoint
@@ -526,40 +527,42 @@ def run_post_startup_warmup():
         debug_logger.error(f"Fatal error in post-startup warmup: {e}", exc_info=True)
 
 # Add signal forwarding function
-def forward_signal_to_trade_endpoint(signal_data):
-    """
-    Forward signals to the original /trade_signal endpoint for external monitoring.
-    This is async and lightweight - just forwards the original tick data, not reprocessing.
-    """
-    def do_forward():
-        try:
-            # Forward the original tick data to /trade_signal (same format as individual requests)
-            forward_payload = {
-                "data": {
-                    "Time": signal_data['time'], 
-                    "Price": signal_data['price']
-                },
-                "currency": signal_data['currency'],
-                "source": "batch_forward"  # Flag to indicate this is a forward, not original
-            }
-            
-            # Quick forward with short timeout
-            response = requests.post("http://localhost:5000/trade_signal", 
-                                   json=forward_payload, 
-                                   timeout=2)  # Short timeout for forwarding
-            
-            if response.status_code == 200:
-                debug_logger.info(f"Successfully forwarded {signal_data['signal']} to /trade_signal")
-            else:
-                debug_logger.warning(f"Failed to forward signal: HTTP {response.status_code}")
-                
-        except Exception as e:
-            debug_logger.warning(f"Error forwarding to /trade_signal: {e}")
-            # Don't raise - forwarding failures shouldn't break batch processing
-    
-    # Run in background thread to avoid blocking
-    import threading
-    threading.Thread(target=do_forward, daemon=True).start()
+# COMMENTED OUT: This function caused connection exhaustion during high-volume backtesting
+# Keeping for reference in case needed for live trading scenarios
+# def forward_signal_to_trade_endpoint(signal_data):
+#     """
+#     Forward signals to the original /trade_signal endpoint for external monitoring.
+#     This is async and lightweight - just forwards the original tick data, not reprocessing.
+#     """
+#     def do_forward():
+#         try:
+#             # Forward the original tick data to /trade_signal (same format as individual requests)
+#             forward_payload = {
+#                 "data": {
+#                     "Time": signal_data['time'], 
+#                     "Price": signal_data['price']
+#                 },
+#                 "currency": signal_data['currency'],
+#                 "source": "batch_forward"  # Flag to indicate this is a forward, not original
+#             }
+#             
+#             # Quick forward with short timeout
+#             response = requests.post("http://localhost:5000/trade_signal", 
+#                                    json=forward_payload, 
+#                                    timeout=2)  # Short timeout for forwarding
+#             
+#             if response.status_code == 200:
+#                 debug_logger.info(f"Successfully forwarded {signal_data['signal']} to /trade_signal")
+#             else:
+#                 debug_logger.warning(f"Failed to forward signal: HTTP {response.status_code}")
+#                 
+#         except Exception as e:
+#             debug_logger.warning(f"Error forwarding to /trade_signal: {e}")
+#             # Don't raise - forwarding failures shouldn't break batch processing
+#     
+#     # Run in background thread to avoid blocking
+#     import threading
+#     threading.Thread(target=do_forward, daemon=True).start()
 
 # Removed /signal_notification endpoint - all signals now forwarded to /trade_signal 
 # for better compatibility with external monitoring systems

@@ -67,8 +67,9 @@ logger.info("RUN_TEST SCRIPT STARTUP - API ENDPOINT CONFIGURATION")
 logger.info("="*80)
 logger.info(f"Primary API Endpoint: {API_URL}")
 logger.info(f"Batch API Endpoint: http://localhost:5000/trade_signal_batch")
-logger.info(f"Signal Forward Endpoint: http://localhost:5000/trade_signal") 
-logger.info("Signal Flow: Batch Processing -> Algorithm -> Forward to Primary Endpoint")
+# Updated to reflect that forwarding has been disabled
+logger.info("Signal Flow: Batch Processing -> Algorithm (forwarding disabled for performance)")
+logger.info("Note: Signal forwarding to /trade_signal has been disabled to prevent connection exhaustion")
 logger.info("="*80)
 
 # Global variables to store warmup data
@@ -101,13 +102,13 @@ def get_db_connection(database_override=None):
         logger.error(f"Database connection error: {e}")
         return None
 
-def fetch_historical_data(currency_pair="EUR.USD", limit=60000):
+def fetch_historical_data(currency_pair="EUR.USD", limit=50000):
     """
     Fetch the most recent historical prices for a specific currency from the database.
     
     Args:
         currency_pair (str): The currency pair to fetch
-        limit (int): Number of records to fetch (60k for good historical coverage)
+        limit (int): Number of records to fetch (50k for good historical coverage)
         
     Returns:
         DataFrame: Historical price data with Time and Price columns
@@ -486,7 +487,7 @@ def process_single_currency(currency):
         print(f"{'='*60}")
         
         # Fetch historical data for this currency
-        historical_data = fetch_historical_data(currency, limit=60000)
+        historical_data = fetch_historical_data(currency, limit=50000)
         
         if historical_data.empty:
             logger.error(f"No historical data retrieved for {currency}")
@@ -561,7 +562,7 @@ def run_mode_2_historical_test():
     print("")
     
     # Log endpoint information for this mode
-    logger.info("MODE 2: Historical backtest using /trade_signal_batch endpoint -> signals forwarded to /trade_signal")
+    logger.info("MODE 2: Historical backtest using /trade_signal_batch endpoint (forwarding disabled)")
     
     overall_success = True
     total_successful = 0
