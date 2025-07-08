@@ -20,6 +20,9 @@ app = Flask(__name__)
 SKIP_MODE2 = False
 SKIP_MODE3 = False
 
+# Global variable to store IB bot instance for commands
+ib_bot_instance = None
+
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
 
@@ -155,6 +158,33 @@ def trade_signal():
         debug_logger.error(f"Error occurred: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 400
 
+@app.route('/command', methods=['POST'])
+def execute_command():
+    """Execute commands via HTTP endpoint instead of stdin"""
+    try:
+        content = request.json
+        command = content.get('command', '').strip().upper()
+        
+        if not command:
+            return jsonify({'error': 'No command provided'}), 400
+        
+        # Check if IB bot is available
+        if ib_bot_instance is None:
+            return jsonify({'error': 'IB trading not yet started'}), 503
+        
+        # Execute command through the bot's command handler
+        result = ib_bot_instance.execute_command(command)
+        
+        return jsonify({
+            'command': command,
+            'result': result,
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        debug_logger.error(f"Error executing command: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/trade_signal_batch', methods=['POST'])
 def trade_signal_batch():
     """
@@ -274,7 +304,7 @@ def start_ib_live_trading():
     """
     Start the IB live trading script as a subprocess.
     """
-    global ib_process
+    global ib_process, ib_bot_instance
     
     try:
         import subprocess
@@ -288,6 +318,7 @@ def start_ib_live_trading():
         # Log critical environment variables for debugging
         debug_logger.info(f"IB_HOST from environment: {env.get('IB_HOST', 'NOT SET')}")
         debug_logger.info(f"IB_PORT from environment: {env.get('IB_PORT', 'NOT SET')}")
+        debug_logger.info(f"ALGO_INSTANCE from environment: {env.get('ALGO_INSTANCE', '1')}")
         
         # Start the IB trading script with environment
         ib_process = subprocess.Popen(
@@ -380,6 +411,27 @@ def run_post_startup_warmup():
         debug_logger.info("Waiting 2 seconds for server to be ready...")
         time.sleep(2)
         
+        # Check for skip_warmup.flag file (set by IB command listener)
+        skip_file_exists = False
+        try:
+            import os
+            if os.path.exists('skip_warmup.flag'):
+                skip_file_exists = True
+                debug_logger.info("Found skip_warmup.flag - will skip warmup modes")
+                # Delete the flag so it only applies once
+                try:
+                    os.remove('skip_warmup.flag')
+                    debug_logger.info("Deleted skip_warmup.flag")
+                except Exception as e:
+                    debug_logger.warning(f"Could not delete skip_warmup.flag: {e}")
+        except Exception as e:
+            debug_logger.error(f"Error checking for skip_warmup.flag: {e}")
+        
+        # Apply skip flag if it existed
+        if skip_file_exists:
+            SKIP_MODE2 = True
+            SKIP_MODE3 = True
+        
         if SKIP_MODE2 or SKIP_MODE3:
             skipped_modes = []
             if SKIP_MODE2:
@@ -396,7 +448,7 @@ def run_post_startup_warmup():
             
             # Run warmup_data with skip parameters
             debug_logger.info("Calling warmup_data function...")
-            result = warmup_data()
+            result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
@@ -457,6 +509,38 @@ def signal_handler(signum, frame):
     stop_ib_live_trading()
     sys.exit(0)
 
+def check_restart_flag():
+    """Monitor for restart flag and initiate graceful shutdown"""
+    import os
+    while True:
+        try:
+            if os.path.exists('restart_requested.flag'):
+                debug_logger.info("Restart flag detected - initiating graceful shutdown")
+                trade_logger.info("RESTART command received - shutting down for restart")
+                
+                # Stop IB trading first
+                stop_ib_live_trading()
+                
+                # Give it a moment to clean up
+                time.sleep(2)
+                
+                # Remove the restart flag
+                try:
+                    os.remove('restart_requested.flag')
+                except:
+                    pass
+                
+                # Restart the current process with same arguments
+                debug_logger.info("Executing restart...")
+                python = sys.executable
+                os.execl(python, python, *sys.argv)
+                
+            time.sleep(1)  # Check every second
+            
+        except Exception as e:
+            debug_logger.error(f"Error checking restart flag: {e}")
+            time.sleep(1)
+
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
@@ -483,8 +567,12 @@ if __name__ == '__main__':
             print("  (no argument): Run all modes during startup")
             sys.exit(1)
     
+    # Get algorithm instance from environment variable
+    import os
+    ALGO_INSTANCE = int(os.environ.get('ALGO_INSTANCE', '1'))
+    
     # Show immediate startup message
-    print("Starting Algorithm Trading Server...")
+    print(f"Starting Algorithm Trading Server - Instance #{ALGO_INSTANCE}...")
     if SKIP_MODE2 and SKIP_MODE3:
         print("SKIP MODE: Will skip historical backtest and warmup preparation")
     print("Initializing database connections...")
@@ -492,8 +580,11 @@ if __name__ == '__main__':
     # Import algorithm but DON'T run warmup during startup (avoid circular dependency)
     import algorithm
     
+    # Set the instance ID in the algorithm module
+    algorithm.ALGO_INSTANCE = ALGO_INSTANCE
+    
     # Initialize database and basic algorithm state
-    debug_logger.info("Initializing algorithm database connections...")
+    debug_logger.info(f"Initializing algorithm database connections for instance {ALGO_INSTANCE}...")
     algorithm.initialize_database()
     
     print("Starting Flask server on port 5000...")
@@ -511,6 +602,11 @@ if __name__ == '__main__':
     warmup_thread = threading.Thread(target=run_post_startup_warmup, daemon=True)
     warmup_thread.start()
     
+    # Start restart monitoring thread
+    restart_monitor = threading.Thread(target=check_restart_flag, daemon=True)
+    restart_monitor.start()
+    debug_logger.info("Restart monitor started")
+    
     # Start the server (this will block and keep the server running)
     debug_logger.info("Server starting on http://0.0.0.0:5000")
     print("Server is now running and accepting requests!")
@@ -520,4 +616,15 @@ if __name__ == '__main__':
         print("Warmup process running in background...")
     print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
     print("")
-    serve(app, host='0.0.0.0', port=5000)
+    print("COMMAND LISTENER: After IB Live Trading starts, you can use these commands:")
+    print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
+    print("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+    print("  SKIP_WARMUP - Skip warmup on next restart")
+    print("  RESTART - Restart the server")
+    print("  STATUS - Show current positions")
+    print("  HELP - Show all commands")
+    print("")
+    print("Fast restart: SKIP_WARMUP then RESTART")
+    print("")
+    # Increase worker threads to handle concurrent requests better
+    serve(app, host='0.0.0.0', port=5000, threads=8)  # Default is 4, increase to 8

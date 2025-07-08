@@ -11,6 +11,11 @@ services:
       FLASK_ENV: production
       PYTHONUNBUFFERED: 1
       PYTHONPATH: /app
+
+      #########################################
+      # Algorithm instance ID (change to 2 or 3 on other machines)
+      ALGO_INSTANCE: "1"
+      #########################################
       
       # Database configuration (can be overridden via env file)
       DB_SERVER: "192.168.50.100"

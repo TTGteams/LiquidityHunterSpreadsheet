@@ -387,6 +387,8 @@ def extract_zones_from_algorithm():
     """
     Extract the zones that were created during the backtest from the algorithm's memory.
     This requires querying the algorithm's state after the backtest.
+    
+    ENHANCED: Now properly rounds zone prices to prevent floating point issues.
     """
     global warmup_zones
     
@@ -400,33 +402,53 @@ def extract_zones_from_algorithm():
         
         # Get zones created in the last hour (during our backtest)
         query = """
-        SELECT Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime
+        SELECT Currency, 
+               ROUND(ZoneStartPrice, 6) as ZoneStartPrice, 
+               ROUND(ZoneEndPrice, 6) as ZoneEndPrice, 
+               ZoneSize, 
+               ZoneType, 
+               ConfirmationTime
         FROM FXStrat_AlgorithmZones
         WHERE CreatedAt >= DATEADD(hour, -1, GETDATE())
+        AND AlgoInstance = ?
         ORDER BY ConfirmationTime DESC
         """
         
         cursor = conn.cursor()
-        cursor.execute(query)
+        
+        # Get the instance ID from algorithm module if available
+        algo_instance = 1  # Default
+        try:
+            import algorithm
+            if hasattr(algorithm, 'ALGO_INSTANCE'):
+                algo_instance = algorithm.ALGO_INSTANCE
+        except:
+            pass
+            
+        cursor.execute(query, algo_instance)
         
         zones_by_currency = {currency: {} for currency in SUPPORTED_CURRENCIES}
         
         for row in cursor.fetchall():
             currency = row[0]
-            zone_start = float(row[1])
-            zone_end = float(row[2])
+            # Ensure consistent rounding
+            zone_start = round(float(row[1]), 6)
+            zone_end = round(float(row[2]), 6)
             zone_size = float(row[3])
             zone_type = row[4]
             confirmation_time = row[5]
             
             zone_id = (zone_start, zone_end)
-            zones_by_currency[currency][zone_id] = {
-                'start_price': zone_start,
-                'end_price': zone_end,
-                'zone_size': zone_size,
-                'zone_type': zone_type,
-                'confirmation_time': confirmation_time
-            }
+            
+            # Skip if we already have this zone (handles any remaining duplicates)
+            if zone_id not in zones_by_currency[currency]:
+                zones_by_currency[currency][zone_id] = {
+                    'start_price': zone_start,
+                    'end_price': zone_end,
+                    'zone_size': zone_size,
+                    'zone_type': zone_type,
+                    'confirmation_time': confirmation_time
+                }
         
         logger.info(f"Extracted zones from database:")
         for currency, zones in zones_by_currency.items():
@@ -1069,4 +1091,4 @@ if __name__ == "__main__":
         exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        exit(1)
+        exit(1) 

@@ -37,6 +37,9 @@ DB_CONFIG = {
     'driver': 'ODBC Driver 17 for SQL Server'
 }
 
+# Algorithm instance ID (set by server.py)
+ALGO_INSTANCE = 1  # Default to 1, will be overridden by server.py
+
 # Initialize global variables as dictionaries with currency keys
 # Raw tick-by-tick data (trimmed to 12 hours)
 historical_ticks = {currency: pd.DataFrame() for currency in SUPPORTED_CURRENCIES}
@@ -67,6 +70,59 @@ VALID_PRICE_RANGES = {
     "GBP.USD": (0.8, 1.8)     # GBP.USD typically 1.2-1.4
 }
 
+# SQL script to clean duplicate zones - to be run manually
+CLEAN_DUPLICATE_ZONES_SQL = """
+-- Clean up duplicate zones in FXStrat_AlgorithmZones
+-- This script identifies and removes duplicate zones, keeping only the oldest one
+
+WITH DuplicateZones AS (
+    SELECT 
+        ID,
+        Currency,
+        ZoneType,
+        ROUND(ZoneStartPrice, 6) AS RoundedStart,
+        ROUND(ZoneEndPrice, 6) AS RoundedEnd,
+        ConfirmationTime,
+        CreatedAt,
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                Currency, 
+                ZoneType,
+                ROUND(ZoneStartPrice, 4),  -- Group by 4 decimals (0.1 pip precision)
+                ROUND(ZoneEndPrice, 4)
+            ORDER BY 
+                CreatedAt ASC,  -- Keep the oldest
+                ID ASC          -- Tie-breaker
+        ) AS RowNum
+    FROM FXStrat_AlgorithmZones
+)
+DELETE FROM FXStrat_AlgorithmZones
+WHERE ID IN (
+    SELECT ID 
+    FROM DuplicateZones 
+    WHERE RowNum > 1
+);
+
+-- Show results
+SELECT 
+    Currency,
+    COUNT(*) AS TotalZones,
+    COUNT(DISTINCT CONCAT(
+        Currency, '_',
+        ZoneType, '_',
+        ROUND(ZoneStartPrice, 4), '_',
+        ROUND(ZoneEndPrice, 4)
+    )) AS UniqueZones,
+    COUNT(*) - COUNT(DISTINCT CONCAT(
+        Currency, '_',
+        ZoneType, '_',
+        ROUND(ZoneStartPrice, 4), '_',
+        ROUND(ZoneEndPrice, 4)
+    )) AS DuplicatesRemaining
+FROM FXStrat_AlgorithmZones
+GROUP BY Currency;
+"""
+
 # --------------------------------------------------------------------------
 # PRE-EXISTING DATA LOADING FUNCTIONS
 # --------------------------------------------------------------------------
@@ -86,8 +142,20 @@ def load_preexisting_zones(zones_dict, currency="EUR.USD"):
         current_valid_zones_dict[currency] = {}
         
     for zone_id, zone_data in zones_dict.items():
-        if zone_id not in current_valid_zones_dict[currency]:
-            current_valid_zones_dict[currency][zone_id] = zone_data
+        # CRITICAL FIX: Round zone ID components to prevent floating point issues
+        if isinstance(zone_id, tuple) and len(zone_id) == 2:
+            rounded_zone_id = (round(zone_id[0], 6), round(zone_id[1], 6))
+        else:
+            rounded_zone_id = zone_id
+            
+        if rounded_zone_id not in current_valid_zones_dict[currency]:
+            # Also ensure the zone_data has rounded prices
+            if 'start_price' in zone_data:
+                zone_data['start_price'] = round(zone_data['start_price'], 6)
+            if 'end_price' in zone_data:
+                zone_data['end_price'] = round(zone_data['end_price'], 6)
+                
+            current_valid_zones_dict[currency][rounded_zone_id] = zone_data
         
     debug_logger.info(f"After load, {currency} has {len(current_valid_zones_dict[currency])} zones.")
 
@@ -481,8 +549,13 @@ def identify_liquidity_zones(data, current_valid_zones_dict, currency="EUR.USD",
                     zone_start = current_run['high']
                     zone_end = current_run['low']
 
+                # CRITICAL FIX: Round zone prices to prevent floating point duplicates
+                zone_start = round(zone_start, 6)  # 6 decimals for consistency
+                zone_end = round(zone_end, 6)
+                
                 zone_id = (zone_start, zone_end)
                 
+                # Only check if zone exists in memory dictionary
                 if zone_id not in current_valid_zones_dict:
                     # Create zone object with all required fields
                     zone_object = {
@@ -1116,6 +1189,7 @@ def create_tables_if_not_exist():
             RSI FLOAT NULL,
             MACD_Line FLOAT NULL,
             Signal_Line FLOAT NULL,
+            AlgoInstance INT DEFAULT 1,
             CreatedAt DATETIME DEFAULT GETDATE()
         );
         
@@ -1134,6 +1208,7 @@ def create_tables_if_not_exist():
             ZoneSize FLOAT,
             ZoneType NVARCHAR(10),
             ConfirmationTime DATETIME NULL,
+            AlgoInstance INT DEFAULT 1,
             CreatedAt DATETIME DEFAULT GETDATE()
         );
         
@@ -1150,6 +1225,7 @@ def create_tables_if_not_exist():
             SignalType NVARCHAR(20),
             Price FLOAT,
             Currency NVARCHAR(10),
+            AlgoInstance INT DEFAULT 1,
             CreatedAt DATETIME DEFAULT GETDATE()
         );
         
@@ -1275,8 +1351,8 @@ def save_bar_to_database(bar_data, currency="EUR.USD"):
         cursor.execute("""
         INSERT INTO FXStrat_AlgorithmBars 
         (Currency, BarStartTime, BarEndTime, OpenPrice, HighPrice, LowPrice, ClosePrice, 
-         ZonesCount, RSI, MACD_Line, Signal_Line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ZonesCount, RSI, MACD_Line, Signal_Line, AlgoInstance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, 
         currency, 
         bar_start_time, 
@@ -1288,7 +1364,8 @@ def save_bar_to_database(bar_data, currency="EUR.USD"):
         len(current_valid_zones_dict[currency]) if currency in current_valid_zones_dict else 0,
         rsi_value,
         macd_value,
-        signal_value
+        signal_value,
+        ALGO_INSTANCE
         )
         
         conn.commit()
@@ -1352,12 +1429,14 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         AND Currency = ?
         AND Price = ?
         AND SignalTime BETWEEN DATEADD(minute, -15, ?) AND ?
+        AND AlgoInstance = ?
         """, 
         signal_type,
         currency,
         price,
         signal_time,
-        signal_time
+        signal_time,
+        ALGO_INSTANCE
         )
         
         count = cursor.fetchone()[0]
@@ -1365,13 +1444,14 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         if count == 0:  # Only insert if no duplicate exists
             cursor.execute("""
             INSERT INTO FXStrat_TradeSignalsSent 
-            (SignalTime, SignalType, Price, Currency)
-            VALUES (?, ?, ?, ?)
+            (SignalTime, SignalType, Price, Currency, AlgoInstance)
+            VALUES (?, ?, ?, ?, ?)
             """, 
             signal_time,
             signal_type,
             price,
-            currency
+            currency,
+            ALGO_INSTANCE
             )
             
             conn.commit()
@@ -1407,6 +1487,8 @@ def sync_zones_to_database(currency="EUR.USD"):
     This function handles INSERT (new zones), UPDATE (if needed), and DELETE (invalidated zones).
     Called every 15 minutes when a bar completes.
     
+    ENHANCED: Now properly handles floating point precision and prevents duplicate zones.
+    
     Args:
         currency (str): The currency pair to sync zones for
         
@@ -1431,23 +1513,40 @@ def sync_zones_to_database(currency="EUR.USD"):
         
         # Step 1: Get all zones currently in database for this currency
         cursor.execute("""
-        SELECT ZoneStartPrice, ZoneEndPrice, ZoneType, ConfirmationTime 
+        SELECT 
+            ROUND(ZoneStartPrice, 6) as StartPrice, 
+            ROUND(ZoneEndPrice, 6) as EndPrice, 
+            ZoneType, 
+            ConfirmationTime,
+            ID
         FROM FXStrat_AlgorithmZones 
         WHERE Currency = ?
+        AND AlgoInstance = ?
         ORDER BY ConfirmationTime DESC
-        """, currency)
+        """, currency, ALGO_INSTANCE)
         
         db_zones = cursor.fetchall()
-        db_zone_keys = {(round(float(row[0]), 6), round(float(row[1]), 6)) for row in db_zones}
         
-        # Step 2: Get current memory zones keys (rounded for comparison)
-        memory_zone_keys = {(round(float(key[0]), 6), round(float(key[1]), 6)) for key in current_zones.keys()}
+        # Create a mapping of rounded zone keys to database IDs for efficient deletion
+        db_zone_map = {}
+        for row in db_zones:
+            zone_key = (float(row[0]), float(row[1]))  # Already rounded from query
+            if zone_key not in db_zone_map:
+                db_zone_map[zone_key] = []
+            db_zone_map[zone_key].append(row[4])  # Store the ID
+        
+        # Step 2: Get current memory zones keys (ensure they're rounded)
+        memory_zone_keys = set()
+        for key in current_zones.keys():
+            if isinstance(key, tuple) and len(key) == 2:
+                rounded_key = (round(float(key[0]), 6), round(float(key[1]), 6))
+                memory_zone_keys.add(rounded_key)
         
         # Step 3: Find zones to add (in memory but not in DB)
-        zones_to_add = memory_zone_keys - db_zone_keys
+        zones_to_add = memory_zone_keys - set(db_zone_map.keys())
         
         # Step 4: Find zones to remove (in DB but not in memory)
-        zones_to_remove = db_zone_keys - memory_zone_keys
+        zones_to_remove = set(db_zone_map.keys()) - memory_zone_keys
         
         # Step 5: Add new zones to database
         zones_added = 0
@@ -1466,15 +1565,16 @@ def sync_zones_to_database(currency="EUR.USD"):
                     
                     cursor.execute("""
                     INSERT INTO FXStrat_AlgorithmZones 
-                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime, AlgoInstance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, 
                     currency,
                     zone_key[0],  # Already rounded
                     zone_key[1],  # Already rounded
                     round(matching_zone.get('zone_size', abs(zone_key[1] - zone_key[0])), 6),
                     matching_zone.get('zone_type', 'unknown'),
-                    confirmation_time
+                    confirmation_time,
+                    ALGO_INSTANCE
                     )
                     zones_added += 1
                 except Exception as e:
@@ -1485,17 +1585,11 @@ def sync_zones_to_database(currency="EUR.USD"):
         zones_removed = 0
         for zone_key in zones_to_remove:
             try:
-                cursor.execute("""
-                DELETE FROM FXStrat_AlgorithmZones 
-                WHERE Currency = ? 
-                AND ABS(ZoneStartPrice - ?) <= 0.000001  
-                AND ABS(ZoneEndPrice - ?) <= 0.000001
-                """, 
-                currency,
-                zone_key[0],
-                zone_key[1]
-                )
-                zones_removed += cursor.rowcount
+                # Remove ALL zones that match this key (handles duplicates)
+                zone_ids = db_zone_map.get(zone_key, [])
+                for zone_id in zone_ids:
+                    cursor.execute("DELETE FROM FXStrat_AlgorithmZones WHERE ID = ?", zone_id)
+                    zones_removed += cursor.rowcount
             except Exception as e:
                 debug_logger.error(f"Error removing zone {zone_key}: {e}")
                 continue
@@ -1510,7 +1604,7 @@ def sync_zones_to_database(currency="EUR.USD"):
                 f"Added to DB: {zones_added} zones\n"
                 f"Removed from DB: {zones_removed} zones\n"
                 f"Total zones in memory: {len(current_zones)}\n"
-                f"Total zones in DB: {len(db_zone_keys) + zones_added - zones_removed}\n"
+                f"Total zones in DB (estimated): {len(db_zone_map) + zones_added - len(zones_to_remove)}\n"
                 f"{'='*65}\n"
             )
         else:
@@ -1589,8 +1683,8 @@ def store_bar_in_sql(bar_data):
         cursor.execute("""
         INSERT INTO FXStrat_AlgorithmBars 
         (Currency, BarStartTime, BarEndTime, OpenPrice, HighPrice, LowPrice, ClosePrice, 
-         ZonesCount, RSI, MACD_Line, Signal_Line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ZonesCount, RSI, MACD_Line, Signal_Line, AlgoInstance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, 
         bar_data['currency'], 
         bar_data['bar_start_time'], 
@@ -1602,7 +1696,8 @@ def store_bar_in_sql(bar_data):
         zones_count,
         rsi_value,
         macd_value,
-        signal_value
+        signal_value,
+        ALGO_INSTANCE
         )
         
         conn.commit()
@@ -1652,6 +1747,9 @@ def store_zones_in_sql(zones_data):
         
         cursor = conn.cursor()
         
+        zones_inserted = 0
+        zones_skipped = 0
+        
         for zone in zones_data:
             # Validate zone data
             is_valid = True
@@ -1666,26 +1764,26 @@ def store_zones_in_sql(zones_data):
             try:
                 confirmation_time = zone.get('confirmation_time', None)
                 
-                # Format zone prices and size to 6 decimals
+                # Format zone prices and size to 6 decimals for consistency
                 zone_start_price = round(zone['zone_start_price'], 6)
                 zone_end_price = round(zone['zone_end_price'], 6)
                 zone_size = round(zone['zone_size'], 6)
                 
-                # Enhanced duplicate check: Look for similar zones within a small price range
+                # ENHANCED duplicate check: Look for ANY similar zones regardless of time
                 cursor.execute("""
                 SELECT COUNT(*) 
                 FROM FXStrat_AlgorithmZones 
                 WHERE Currency = ? 
                 AND ZoneType = ?
-                AND ABS(ZoneStartPrice - ?) <= 0.0001  -- Allow 1 pip difference
-                AND ABS(ZoneEndPrice - ?) <= 0.0001    -- Allow 1 pip difference
-                AND ABS(DATEDIFF(minute, ConfirmationTime, ?)) <= 15  -- Within 15 minutes
+                AND ABS(ZoneStartPrice - ?) <= 0.0001  -- 1 pip tolerance
+                AND ABS(ZoneEndPrice - ?) <= 0.0001    -- 1 pip tolerance
+                AND AlgoInstance = ?
                 """, 
                 zone['currency'],
                 zone['zone_type'],
                 zone_start_price,
                 zone_end_price,
-                confirmation_time if confirmation_time else datetime.datetime.now()
+                ALGO_INSTANCE
                 )
                 
                 count = cursor.fetchone()[0]
@@ -1693,25 +1791,32 @@ def store_zones_in_sql(zones_data):
                 if count == 0:  # Only insert if no similar zone exists
                     cursor.execute("""
                     INSERT INTO FXStrat_AlgorithmZones 
-                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (Currency, ZoneStartPrice, ZoneEndPrice, ZoneSize, ZoneType, ConfirmationTime, AlgoInstance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, 
                     zone['currency'],
                     zone_start_price,
                     zone_end_price,
                     zone_size,
                     zone['zone_type'],
-                    confirmation_time
+                    confirmation_time,
+                    ALGO_INSTANCE
                     )
-                    debug_logger.info(f"New zone stored: {zone['currency']} {zone['zone_type']} at {zone_start_price}")
+                    zones_inserted += 1
+                    debug_logger.info(f"New zone stored: {zone['currency']} {zone['zone_type']} at {zone_start_price:.6f}-{zone_end_price:.6f}")
                 else:
-                    debug_logger.info(f"Skipped duplicate zone: {zone['currency']} {zone['zone_type']} at {zone_start_price}")
+                    zones_skipped += 1
+                    debug_logger.info(f"Skipped duplicate zone: {zone['currency']} {zone['zone_type']} at {zone_start_price:.6f}-{zone_end_price:.6f}")
                 
             except Exception as e:
                 debug_logger.error(f"Error processing zone: {e}")
                 continue
         
         conn.commit()
+        
+        if zones_inserted > 0 or zones_skipped > 0:
+            debug_logger.warning(f"Zone storage complete: {zones_inserted} inserted, {zones_skipped} skipped as duplicates")
+        
         return True
     
     except Exception as e:
@@ -2198,4 +2303,3 @@ def check_pip_based_loss(current_price, current_time, currency):
             force_closed = True
             
     return force_closed
-

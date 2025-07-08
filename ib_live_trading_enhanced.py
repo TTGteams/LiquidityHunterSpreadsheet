@@ -101,11 +101,16 @@ class EnhancedIBTradingBot:
         self._last_recovery_attempt = datetime.datetime.now() - timedelta(minutes=3)
         self._detailed_check_counter = 0
         
+        # Price throttling - only send at most 2 updates per second per currency
+        self.price_throttle_seconds = 0.5  # 500ms = 2/second
+        self.last_price_send_times = {currency: datetime.datetime.min for currency in self.currency_pairs.keys()}
+        
         # Thread lock
         self.position_lock = threading.Lock()
         
         logger.info(f"[INIT] Enhanced IB Trading Bot initialized for {len(self.currency_pairs)} currencies")
         logger.info(f"[INIT] IB connection will use: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
+        logger.info(f"[INIT] Price throttling: {1/self.price_throttle_seconds:.1f} updates/second per currency (max {3/self.price_throttle_seconds:.1f} total)")
 
     def connect_to_ib(self):
         """Connect to IB with enhanced error handling"""
@@ -274,17 +279,24 @@ class EnhancedIBTradingBot:
                 logger.warning(f"[PRICE] {currency} - Unusual price: {price:.5f}")
                 continue
             
-            # Log price data occasionally (every 20th tick to avoid spam)
-            if not hasattr(self, '_price_log_counter'):
-                self._price_log_counter = {}
-            if currency not in self._price_log_counter:
-                self._price_log_counter[currency] = 0
+            # THROTTLE: Only send price updates at most 2 per second per currency
+            current_time = datetime.datetime.now()
+            time_since_last = (current_time - self.last_price_send_times[currency]).total_seconds()
             
-            self._price_log_counter[currency] += 1
-            if self._price_log_counter[currency] % 20 == 0:
-                logger.info(f"[PRICE] {currency}: {price:.5f} (bid: {ticker.bid}, ask: {ticker.ask})")
-            
-            self.send_to_algorithm_with_retry(currency, price, ticker.time)
+            if time_since_last >= self.price_throttle_seconds:
+                # Log price data occasionally (every 20th send to avoid spam)
+                if not hasattr(self, '_price_log_counter'):
+                    self._price_log_counter = {}
+                if currency not in self._price_log_counter:
+                    self._price_log_counter[currency] = 0
+                
+                self._price_log_counter[currency] += 1
+                if self._price_log_counter[currency] % 20 == 0:
+                    logger.info(f"[PRICE] {currency}: {price:.5f} (bid: {ticker.bid}, ask: {ticker.ask})")
+                
+                # Send to algorithm and update last send time
+                self.send_to_algorithm_with_retry(currency, price, ticker.time)
+                self.last_price_send_times[currency] = current_time
 
     def is_price_reasonable(self, currency: str, price: float) -> bool:
         """Basic price validation"""
@@ -617,6 +629,257 @@ class EnhancedIBTradingBot:
         except Exception as e:
             logger.error(f"[ERROR] Market data recovery failed: {e}")
 
+    def start_command_listener(self):
+        """Start command listener thread for runtime commands"""
+        command_thread = threading.Thread(target=self.command_listener_loop, daemon=True)
+        command_thread.start()
+        logger.info("[OK] Command listener started - available commands:")
+        logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
+        logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+        logger.info("  SKIP_WARMUP - Skip warmup on next restart")
+        logger.info("  RESTART - Restart the server")
+        logger.info("  STATUS - Show current positions and connection status")
+
+    def command_listener_loop(self):
+        """Listen for commands from stdin"""
+        import sys
+        
+        while not self.shutdown_requested:
+            try:
+                # Check if stdin is available (not redirected/closed)
+                if sys.stdin.isatty():
+                    command = input().strip().upper()
+                    
+                    if command.startswith("CLOSE_"):
+                        # Extract currency and convert format (EURUSD -> EUR.USD)
+                        currency_part = command.replace("CLOSE_", "")
+                        currency = None
+                        
+                        # Map command format to internal format
+                        if currency_part == "EURUSD":
+                            currency = "EUR.USD"
+                        elif currency_part == "USDCAD":
+                            currency = "USD.CAD"
+                        elif currency_part == "GBPUSD":
+                            currency = "GBP.USD"
+                        
+                        if currency and currency in self.currency_pairs:
+                            with self.position_lock:
+                                current_position = self.positions.get(currency)
+                                if current_position:
+                                    logger.info(f"[COMMAND] Closing {current_position} position for {currency}")
+                                    # Get current price for logging
+                                    ticker = self.tickers.get(currency)
+                                    current_price = self.get_midpoint_price(ticker) if ticker else 0
+                                    self.handle_signal(currency, "close", current_price)
+                                else:
+                                    logger.info(f"[COMMAND] No position to close for {currency}")
+                        else:
+                            logger.warning(f"[COMMAND] Unknown currency in command: {command}")
+                            
+                    elif command.startswith("TWS_CLOSED_"):
+                        # Mark position as closed (for manual TWS closes)
+                        currency_part = command.replace("TWS_CLOSED_", "")
+                        currency = None
+                        
+                        if currency_part == "EURUSD":
+                            currency = "EUR.USD"
+                        elif currency_part == "USDCAD":
+                            currency = "USD.CAD"
+                        elif currency_part == "GBPUSD":
+                            currency = "GBP.USD"
+                        
+                        if currency and currency in self.currency_pairs:
+                            with self.position_lock:
+                                old_position = self.positions.get(currency)
+                                self.positions[currency] = None
+                                logger.info(f"[COMMAND] Marked {currency} as closed in TWS (was: {old_position})")
+                        else:
+                            logger.warning(f"[COMMAND] Unknown currency in command: {command}")
+                            
+                    elif command == "SKIP_WARMUP":
+                        # Create a flag file for server.py to detect on next restart
+                        try:
+                            with open('skip_warmup.flag', 'w') as f:
+                                f.write('1')
+                            logger.info("[COMMAND] SKIP_WARMUP flag set for next restart")
+                            logger.info("[COMMAND] Delete skip_warmup.flag to re-enable warmup")
+                        except Exception as e:
+                            logger.error(f"[COMMAND] Failed to create skip flag: {e}")
+                            
+                    elif command == "RESTART":
+                        # Create restart flag and shutdown gracefully
+                        logger.info("[COMMAND] RESTART requested - creating restart flag")
+                        try:
+                            with open('restart_requested.flag', 'w') as f:
+                                f.write('1')
+                            logger.info("[COMMAND] Restart flag created - initiating shutdown")
+                            # Signal shutdown
+                            self.shutdown_requested = True
+                            # Disconnect from IB to trigger clean exit
+                            if self.ib.isConnected():
+                                self.ib.disconnect()
+                        except Exception as e:
+                            logger.error(f"[COMMAND] Failed to create restart flag: {e}")
+                            
+                    elif command == "STATUS":
+                        # Show current status
+                        logger.info("[COMMAND] Current Status:")
+                        logger.info(f"  Connected to IB: {self.is_connected}")
+                        logger.info(f"  Positions:")
+                        with self.position_lock:
+                            for currency, position in self.positions.items():
+                                if position:
+                                    logger.info(f"    {currency}: {position}")
+                                else:
+                                    logger.info(f"    {currency}: flat")
+                        logger.info(f"  Pending orders: {len(self.pending_orders)}")
+                        
+                    elif command == "HELP":
+                        logger.info("[COMMAND] Available commands:")
+                        logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position")
+                        logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed") 
+                        logger.info("  SKIP_WARMUP - Skip warmup on next restart")
+                        logger.info("  RESTART - Restart the server")
+                        logger.info("  STATUS - Show positions and connection")
+                        logger.info("  HELP - Show this help")
+                        
+                    elif command:
+                        logger.warning(f"[COMMAND] Unknown command: {command}")
+                        logger.info("[COMMAND] Type HELP for available commands")
+                        
+                else:
+                    # If stdin is not a TTY (e.g., running in background), just sleep
+                    time.sleep(1)
+                    
+            except EOFError:
+                # stdin closed, exit gracefully
+                logger.info("[COMMAND] Command listener: stdin closed")
+                break
+            except KeyboardInterrupt:
+                # Ctrl+C pressed
+                break
+            except Exception as e:
+                logger.error(f"[ERROR] Command processing error: {e}")
+                time.sleep(1)  # Prevent tight loop on errors
+
+    def execute_command(self, command):
+        """Execute a command and return result (for HTTP endpoint)"""
+        try:
+            command = command.strip().upper()
+            
+            if command.startswith("CLOSE_"):
+                # Extract currency and convert format (EURUSD -> EUR.USD)
+                currency_part = command.replace("CLOSE_", "")
+                currency = None
+                
+                # Map command format to internal format
+                if currency_part == "EURUSD":
+                    currency = "EUR.USD"
+                elif currency_part == "USDCAD":
+                    currency = "USD.CAD"
+                elif currency_part == "GBPUSD":
+                    currency = "GBP.USD"
+                
+                if currency and currency in self.currency_pairs:
+                    with self.position_lock:
+                        current_position = self.positions.get(currency)
+                        if current_position:
+                            logger.info(f"[HTTP-COMMAND] Closing {current_position} position for {currency}")
+                            # Get current price for logging
+                            ticker = self.tickers.get(currency)
+                            current_price = self.get_midpoint_price(ticker) if ticker else 0
+                            self.handle_signal(currency, "close", current_price)
+                            return f"Closing {current_position} position for {currency}"
+                        else:
+                            return f"No position to close for {currency}"
+                else:
+                    return f"Unknown currency in command: {command}"
+                    
+            elif command.startswith("TWS_CLOSED_"):
+                # Mark position as closed (for manual TWS closes)
+                currency_part = command.replace("TWS_CLOSED_", "")
+                currency = None
+                
+                if currency_part == "EURUSD":
+                    currency = "EUR.USD"
+                elif currency_part == "USDCAD":
+                    currency = "USD.CAD"
+                elif currency_part == "GBPUSD":
+                    currency = "GBP.USD"
+                
+                if currency and currency in self.currency_pairs:
+                    with self.position_lock:
+                        old_position = self.positions.get(currency)
+                        self.positions[currency] = None
+                        logger.info(f"[HTTP-COMMAND] Marked {currency} as closed in TWS (was: {old_position})")
+                        return f"Marked {currency} as closed in TWS (was: {old_position})"
+                else:
+                    return f"Unknown currency in command: {command}"
+                    
+            elif command == "SKIP_WARMUP":
+                # Create a flag file for server.py to detect on next restart
+                try:
+                    with open('skip_warmup.flag', 'w') as f:
+                        f.write('1')
+                    logger.info("[HTTP-COMMAND] SKIP_WARMUP flag set for next restart")
+                    return "SKIP_WARMUP flag set for next restart"
+                except Exception as e:
+                    logger.error(f"[HTTP-COMMAND] Failed to create skip flag: {e}")
+                    return f"Failed to create skip flag: {e}"
+                    
+            elif command == "RESTART":
+                # Create restart flag and shutdown gracefully
+                logger.info("[HTTP-COMMAND] RESTART requested - creating restart flag")
+                try:
+                    with open('restart_requested.flag', 'w') as f:
+                        f.write('1')
+                    logger.info("[HTTP-COMMAND] Restart flag created - initiating shutdown")
+                    # Signal shutdown
+                    self.shutdown_requested = True
+                    # Disconnect from IB to trigger clean exit
+                    if self.ib.isConnected():
+                        self.ib.disconnect()
+                    return "Restart flag created - initiating shutdown"
+                except Exception as e:
+                    logger.error(f"[HTTP-COMMAND] Failed to create restart flag: {e}")
+                    return f"Failed to create restart flag: {e}"
+                    
+            elif command == "STATUS":
+                # Show current status
+                status_lines = []
+                status_lines.append(f"Connected to IB: {self.is_connected}")
+                status_lines.append("Positions:")
+                with self.position_lock:
+                    for currency, position in self.positions.items():
+                        if position:
+                            status_lines.append(f"  {currency}: {position}")
+                        else:
+                            status_lines.append(f"  {currency}: flat")
+                status_lines.append(f"Pending orders: {len(self.pending_orders)}")
+                
+                status_text = "\n".join(status_lines)
+                logger.info(f"[HTTP-COMMAND] Status requested:\n{status_text}")
+                return status_text
+                
+            elif command == "HELP":
+                help_text = """Available commands:
+  CLOSE_EURUSD/USDCAD/GBPUSD - Close position
+  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed
+  SKIP_WARMUP - Skip warmup on next restart
+  RESTART - Restart the server
+  STATUS - Show positions and connection
+  HELP - Show this help"""
+                logger.info("[HTTP-COMMAND] Help requested")
+                return help_text
+                
+            else:
+                return f"Unknown command: {command}. Type HELP for available commands."
+                
+        except Exception as e:
+            logger.error(f"[ERROR] HTTP command processing error: {e}")
+            return f"Error processing command: {e}"
+
     def run(self):
         """Main run loop"""
         logger.info("[START] Starting Enhanced IB Trading Bot")
@@ -631,6 +894,9 @@ class EnhancedIBTradingBot:
         
         # Start monitoring
         self.start_dual_frequency_monitoring()
+        
+        # Start command listener
+        self.start_command_listener()
         
         logger.info("[OK] Bot running with enhanced monitoring")
         
@@ -705,4 +971,4 @@ if __name__ == "__main__":
         position_size=int(os.environ.get('POSITION_SIZE', '100000'))
     )
     
-    bot.run()
+    bot.run() 
