@@ -627,4 +627,4 @@ if __name__ == '__main__':
     print("Fast restart: SKIP_WARMUP then RESTART")
     print("")
     # Increase worker threads to handle concurrent requests better
-    serve(app, host='0.0.0.0', port=5000, threads=8)  # Default is 4, increase to 8
+    serve(app, host='0.0.0.0', port=5000, threads=16)  # 16 threads for parallel processing of 3 currencies

@@ -101,13 +101,13 @@ def get_db_connection(database_override=None):
         logger.error(f"Database connection error: {e}")
         return None
 
-def fetch_historical_data(currency_pair="EUR.USD", limit=75000):
+def fetch_historical_data(currency_pair="EUR.USD", limit=60000):
     """
     Fetch the most recent historical prices for a specific currency from the database.
     
     Args:
         currency_pair (str): The currency pair to fetch
-        limit (int): Number of records to fetch (reduced to 75k for balance of size vs speed)
+        limit (int): Number of records to fetch (60k for good historical coverage)
         
     Returns:
         DataFrame: Historical price data with Time and Price columns
@@ -646,7 +646,7 @@ def process_single_currency(currency):
         print(f"{'='*60}")
         
         # Fetch historical data for this currency
-        historical_data = fetch_historical_data(currency, limit=75000)
+        historical_data = fetch_historical_data(currency, limit=60000)
         
         if historical_data.empty:
             logger.error(f"No historical data retrieved for {currency}")
@@ -668,12 +668,12 @@ def process_single_currency(currency):
         print("Trade signals will be saved to database as per normal operation")
         print("")
         
-        # PARALLEL OPTIMIZED: Smaller batches to prevent server overload
+        # PARALLEL OPTIMIZED: Optimized batches to prevent server overload
         successful, failed, signals = send_historical_data_to_api(
             historical_data, 
             currency=currency,
-            batch_size=400,  # Smaller batches for parallel processing (3×400=1200 max concurrent)
-            delay_between_batches=0.002  # Slightly higher delay to prevent server overload
+            batch_size=400,  # Original batch size with better delay management
+            delay_between_batches=0.01  # 5x increase from 0.002 to prevent overload
         )
         
         # Currency-specific summary
@@ -711,7 +711,7 @@ def process_single_currency(currency):
 def run_mode_2_historical_test():
     """
     Mode 2: Pull historical data from DB and feed to algorithm for all supported currencies
-    OPTIMIZED: Now processes all currencies in parallel for significantly faster performance
+    OPTIMIZED: Processes all currencies in parallel for significantly faster performance
     """
     print("\n\n")
     print("="*60)
@@ -732,6 +732,7 @@ def run_mode_2_historical_test():
     print(f"Starting parallel processing of {len(SUPPORTED_CURRENCIES)} currencies...")
     
     try:
+        # Using 3 workers to process all currencies truly in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             # Submit all currency processing tasks
             future_to_currency = {
@@ -768,7 +769,6 @@ def run_mode_2_historical_test():
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Stopping parallel processing...")
         logger.warning("Mode 2 interrupted by user")
-        # Return partial results or empty results
         return False
     
     # Aggregate results from all currencies
