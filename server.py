@@ -172,7 +172,6 @@ def execute_command():
         # Handle server-level commands that don't require IB bot
         if command == 'SKIP_WARMUP':
             try:
-                import os
                 # Create skip_warmup.flag file
                 with open('skip_warmup.flag', 'w') as f:
                     f.write('skip')
@@ -191,7 +190,6 @@ def execute_command():
                 
         elif command == 'RESTART':
             try:
-                import os
                 # Create restart_requested.flag file
                 with open('restart_requested.flag', 'w') as f:
                     f.write('restart')
