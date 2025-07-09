@@ -19,9 +19,12 @@ import datetime
 import time
 import threading
 import pytz
+import os
 from collections import defaultdict
 from typing import Dict, Optional
 from datetime import timedelta
+from flask import Flask, request, jsonify
+from waitress import serve
 
 # Configure logging with UTF-8 encoding to handle Unicode characters
 logging.basicConfig(
@@ -108,9 +111,96 @@ class EnhancedIBTradingBot:
         # Thread lock
         self.position_lock = threading.Lock()
         
+        # HTTP API for command handling
+        self.app = Flask(__name__)
+        self.setup_http_api()
+        self.http_port = int(os.environ.get('IB_API_PORT', '5001'))  # Default port 5001
+        
         logger.info(f"[INIT] Enhanced IB Trading Bot initialized for {len(self.currency_pairs)} currencies")
         logger.info(f"[INIT] IB connection will use: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
         logger.info(f"[INIT] Price throttling: {1/self.price_throttle_seconds:.1f} updates/second per currency (max {3/self.price_throttle_seconds:.1f} total)")
+        logger.info(f"[INIT] HTTP API will listen on port {self.http_port}")
+
+    def setup_http_api(self):
+        """Setup HTTP API endpoints for command handling"""
+        
+        @self.app.route('/command', methods=['POST'])
+        def handle_command():
+            try:
+                content = request.json
+                command = content.get('command', '').strip().upper()
+                
+                if not command:
+                    return jsonify({'error': 'No command provided'}), 400
+                
+                # Execute command through the existing execute_command method
+                result = self.execute_command(command)
+                
+                return jsonify({
+                    'command': command,
+                    'result': result,
+                    'status': 'success'
+                }), 200
+                
+            except Exception as e:
+                logger.error(f"[HTTP-API] Error handling command: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/status', methods=['GET'])
+        def get_status():
+            try:
+                status_data = {
+                    'connected': self.is_connected,
+                    'positions': {},
+                    'pending_orders': len(self.pending_orders),
+                    'last_heartbeat': self.last_heartbeat.isoformat() if self.last_heartbeat else None,
+                    'market_data': {}
+                }
+                
+                # Add position information
+                with self.position_lock:
+                    for currency, position in self.positions.items():
+                        status_data['positions'][currency] = position if position else 'flat'
+                
+                # Add market data status
+                for currency, last_tick in self.last_tick_times.items():
+                    if last_tick:
+                        seconds_since = (datetime.datetime.now() - last_tick).total_seconds()
+                        status_data['market_data'][currency] = {
+                            'last_tick': last_tick.isoformat(),
+                            'seconds_ago': seconds_since,
+                            'status': 'active' if seconds_since < 30 else 'stale'
+                        }
+                    else:
+                        status_data['market_data'][currency] = {
+                            'last_tick': None,
+                            'seconds_ago': None,
+                            'status': 'no_data'
+                        }
+                
+                return jsonify(status_data), 200
+                
+            except Exception as e:
+                logger.error(f"[HTTP-API] Error getting status: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/health', methods=['GET'])
+        def health_check():
+            """Simple health check endpoint"""
+            return jsonify({
+                'status': 'running',
+                'connected': self.is_connected
+            }), 200
+
+    def start_http_server(self):
+        """Start the HTTP API server in a separate thread"""
+        def run_server():
+            logger.info(f"[HTTP-API] Starting HTTP API server on port {self.http_port}")
+            serve(self.app, host='0.0.0.0', port=self.http_port, threads=4)
+        
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        logger.info(f"[HTTP-API] HTTP API server started on port {self.http_port}")
 
     def connect_to_ib(self):
         """Connect to IB with enhanced error handling"""
@@ -883,6 +973,9 @@ class EnhancedIBTradingBot:
     def run(self):
         """Main run loop"""
         logger.info("[START] Starting Enhanced IB Trading Bot")
+        
+        # Start HTTP API server first (so it's available even during connection)
+        self.start_http_server()
         
         if not self.connect_to_ib():
             logger.error("[ERROR] Initial connection failed")

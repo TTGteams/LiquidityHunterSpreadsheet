@@ -13,6 +13,7 @@ import sys
 import signal
 import subprocess
 import atexit
+import os
 
 app = Flask(__name__)
 
@@ -20,8 +21,8 @@ app = Flask(__name__)
 SKIP_MODE2 = False
 SKIP_MODE3 = False
 
-# Global variable to store IB bot instance for commands
-ib_bot_instance = None
+# IB bot HTTP API configuration
+IB_API_PORT = os.environ.get('IB_API_PORT', '5001')
 
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
@@ -160,7 +161,7 @@ def trade_signal():
 
 @app.route('/command', methods=['POST'])
 def execute_command():
-    """Execute commands via HTTP endpoint instead of stdin"""
+    """Execute commands via HTTP endpoint"""
     try:
         content = request.json
         command = content.get('command', '').strip().upper()
@@ -207,18 +208,35 @@ def execute_command():
                 debug_logger.error(f"Error creating restart_requested.flag: {e}")
                 return jsonify({'error': f'Failed to initiate restart: {str(e)}'}), 500
         
-        # For all other commands, require IB bot to be running
-        if ib_bot_instance is None:
+        # For all other commands, forward to IB bot via HTTP API
+        try:
+            # Get IB bot API port from environment or use default
+            ib_api_port = os.environ.get('IB_API_PORT', '5001')
+            ib_api_url = f"http://localhost:{ib_api_port}/command"
+            
+            # Forward command to IB bot
+            response = requests.post(ib_api_url, json={'command': command}, timeout=5)
+            
+            if response.status_code == 200:
+                result_data = response.json()
+                return jsonify({
+                    'command': command,
+                    'result': result_data.get('result', 'Command executed'),
+                    'timestamp': datetime.datetime.now().isoformat()
+                }), 200
+            else:
+                # IB bot API returned an error
+                error_data = response.json() if response.headers.get('content-type') == 'application/json' else {}
+                return jsonify({'error': error_data.get('error', f'IB bot returned status {response.status_code}')}), response.status_code
+                
+        except requests.exceptions.ConnectionError:
+            # IB bot is not running or not reachable
             return jsonify({'error': 'IB trading not yet started'}), 503
-        
-        # Execute command through the bot's command handler
-        result = ib_bot_instance.execute_command(command)
-        
-        return jsonify({
-            'command': command,
-            'result': result,
-            'timestamp': datetime.datetime.now().isoformat()
-        }), 200
+        except requests.exceptions.Timeout:
+            return jsonify({'error': 'IB bot command timeout'}), 504
+        except Exception as e:
+            debug_logger.error(f"Error forwarding command to IB bot: {e}")
+            return jsonify({'error': f'Failed to forward command: {str(e)}'}), 500
         
     except Exception as e:
         debug_logger.error(f"Error executing command: {e}", exc_info=True)
@@ -406,7 +424,7 @@ def start_ib_live_trading():
     """
     Start the IB live trading script as a subprocess.
     """
-    global ib_process, ib_bot_instance
+    global ib_process
     
     try:
         import subprocess
@@ -421,6 +439,7 @@ def start_ib_live_trading():
         debug_logger.info(f"IB_HOST from environment: {env.get('IB_HOST', 'NOT SET')}")
         debug_logger.info(f"IB_PORT from environment: {env.get('IB_PORT', 'NOT SET')}")
         debug_logger.info(f"ALGO_INSTANCE from environment: {env.get('ALGO_INSTANCE', '1')}")
+        debug_logger.info(f"IB_API_PORT from environment: {env.get('IB_API_PORT', '5001')}")
         
         # Start the IB trading script with environment
         ib_process = subprocess.Popen(
