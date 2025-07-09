@@ -2303,3 +2303,101 @@ def check_pip_based_loss(current_price, current_time, currency):
             force_closed = True
             
     return force_closed
+
+def load_recent_zones_from_database(limit=10):
+    """
+    Load the most recent zones from the database for all supported currencies.
+    This is used when SKIP_WARMUP is enabled to quickly populate zones without full warmup.
+    
+    Args:
+        limit (int): Number of recent zones to load per currency (default: 10)
+        
+    Returns:
+        dict: Dictionary with currency as key and zones dict as value
+    """
+    conn = None
+    cursor = None
+    loaded_zones = {currency: {} for currency in SUPPORTED_CURRENCIES}
+    
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            debug_logger.error("Failed to load recent zones - no database connection")
+            return loaded_zones
+        
+        cursor = conn.cursor()
+        
+        for currency in SUPPORTED_CURRENCIES:
+            try:
+                # Get the most recent zones for this currency
+                cursor.execute("""
+                SELECT TOP (?)
+                    ROUND(ZoneStartPrice, 6) as StartPrice,
+                    ROUND(ZoneEndPrice, 6) as EndPrice,
+                    ZoneSize,
+                    ZoneType,
+                    ConfirmationTime
+                FROM FXStrat_AlgorithmZones
+                WHERE Currency = ?
+                AND AlgoInstance = ?
+                ORDER BY ConfirmationTime DESC
+                """, limit, currency, ALGO_INSTANCE)
+                
+                zones = cursor.fetchall()
+                zone_count = 0
+                
+                for row in zones:
+                    zone_start = float(row[0])
+                    zone_end = float(row[1])
+                    zone_size = float(row[2])
+                    zone_type = row[3]
+                    confirmation_time = row[4]
+                    
+                    zone_id = (zone_start, zone_end)
+                    
+                    # Create zone object
+                    zone_object = {
+                        'start_price': zone_start,
+                        'end_price': zone_end,
+                        'zone_size': zone_size,
+                        'zone_type': zone_type,
+                        'confirmation_time': confirmation_time,
+                        'start_time': confirmation_time  # Use confirmation time as start time
+                    }
+                    
+                    loaded_zones[currency][zone_id] = zone_object
+                    zone_count += 1
+                
+                if zone_count > 0:
+                    debug_logger.warning(
+                        f"Loaded {zone_count} recent zones from database for {currency}"
+                    )
+                    
+                    # Log the loaded zones
+                    for zone_id, zone_data in loaded_zones[currency].items():
+                        debug_logger.info(
+                            f"  {zone_data['zone_type'].upper()} zone: "
+                            f"{zone_id[0]:.5f}-{zone_id[1]:.5f}, "
+                            f"Size: {zone_data['zone_size']*10000:.1f} pips"
+                        )
+                else:
+                    debug_logger.warning(f"No zones found in database for {currency}")
+                    
+            except Exception as e:
+                debug_logger.error(f"Error loading zones for {currency}: {e}")
+                continue
+        
+        return loaded_zones
+        
+    except Exception as e:
+        debug_logger.error(f"Error loading recent zones from database: {e}", exc_info=True)
+        return loaded_zones
+        
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        # DO NOT close the connection when using connection pooling
+

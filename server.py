@@ -168,7 +168,46 @@ def execute_command():
         if not command:
             return jsonify({'error': 'No command provided'}), 400
         
-        # Check if IB bot is available
+        # Handle server-level commands that don't require IB bot
+        if command == 'SKIP_WARMUP':
+            try:
+                import os
+                # Create skip_warmup.flag file
+                with open('skip_warmup.flag', 'w') as f:
+                    f.write('skip')
+                debug_logger.info("Created skip_warmup.flag file")
+                trade_logger.info("SKIP_WARMUP command received - will skip warmup on next restart")
+                
+                return jsonify({
+                    'command': command,
+                    'result': 'Skip warmup flag set. Will skip warmup on next restart.',
+                    'timestamp': datetime.datetime.now().isoformat()
+                }), 200
+                
+            except Exception as e:
+                debug_logger.error(f"Error creating skip_warmup.flag: {e}")
+                return jsonify({'error': f'Failed to set skip warmup flag: {str(e)}'}), 500
+                
+        elif command == 'RESTART':
+            try:
+                import os
+                # Create restart_requested.flag file
+                with open('restart_requested.flag', 'w') as f:
+                    f.write('restart')
+                debug_logger.info("Created restart_requested.flag file")
+                trade_logger.info("RESTART command received - initiating server restart")
+                
+                return jsonify({
+                    'command': command,
+                    'result': 'Restart initiated. Server will restart momentarily.',
+                    'timestamp': datetime.datetime.now().isoformat()
+                }), 200
+                
+            except Exception as e:
+                debug_logger.error(f"Error creating restart_requested.flag: {e}")
+                return jsonify({'error': f'Failed to initiate restart: {str(e)}'}), 500
+        
+        # For all other commands, require IB bot to be running
         if ib_bot_instance is None:
             return jsonify({'error': 'IB trading not yet started'}), 503
         
@@ -512,6 +551,27 @@ def run_post_startup_warmup():
             # Run warmup_data with skip parameters
             debug_logger.info("Calling warmup_data function...")
             result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
+            
+            # If we skipped warmup modes, load recent zones from database
+            if SKIP_MODE2 and SKIP_MODE3:
+                debug_logger.info("Loading recent zones from database due to SKIP_WARMUP...")
+                try:
+                    # Load the most recent 10 zones per currency from database
+                    recent_zones = algorithm.load_recent_zones_from_database(limit=10)
+                    
+                    # Apply the loaded zones to the algorithm state
+                    for currency, zones in recent_zones.items():
+                        if zones:
+                            algorithm.load_preexisting_zones(zones, currency)
+                            debug_logger.warning(
+                                f"Populated {currency} with {len(zones)} recent zones from database"
+                            )
+                    
+                    trade_logger.info("Quick startup complete - loaded recent zones from database")
+                    
+                except Exception as e:
+                    debug_logger.error(f"Error loading recent zones from database: {e}", exc_info=True)
+                    debug_logger.warning("Continuing without recent zones")
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
