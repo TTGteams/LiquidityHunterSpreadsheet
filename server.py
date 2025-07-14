@@ -212,8 +212,11 @@ def execute_command():
             ib_api_port = os.environ.get('IB_API_PORT', '5001')
             ib_api_url = f"http://localhost:{ib_api_port}/command"
             
+            # Set longer timeout for RECONNECT command (needs time to reconnect and stabilize)
+            timeout = 30 if command == 'RECONNECT' else 5
+            
             # Forward command to IB bot
-            response = requests.post(ib_api_url, json={'command': command}, timeout=5)
+            response = requests.post(ib_api_url, json={'command': command}, timeout=timeout)
             
             if response.status_code == 200:
                 result_data = response.json()
