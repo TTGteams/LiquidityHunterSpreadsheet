@@ -266,7 +266,7 @@ class EnhancedIBTradingBot:
                     self.tickers[api_currency] = ticker
                     
                     logger.info(f"[OK] Market data: {api_currency}")
-                    time.sleep(0.5)
+                    time.sleep(0.2)  # Reduced from 0.5s to speed up setup
                     
                 except Exception as contract_error:
                     logger.error(f"[ERROR] Failed to setup {api_currency}: {contract_error}")
@@ -730,9 +730,9 @@ class EnhancedIBTradingBot:
             # Check current connection state
             if self.ib.isConnected():
                 logger.info("[RECONNECT] Already connected - refreshing market data...")
-                # Just refresh market data
-                self.recover_market_data()
-                time.sleep(3)  # Wait for market data to stabilize
+                # Just refresh market data (fast mode for manual reconnect)
+                self.recover_market_data(fast_mode=True)
+                time.sleep(2)  # Reduced wait for market data to stabilize
             else:
                 logger.info("[RECONNECT] Not connected - attempting full reconnection...")
                 # Attempt full reconnection
@@ -745,7 +745,7 @@ class EnhancedIBTradingBot:
                     return "[RECONNECT] Connected to IB but failed to setup market data."
                 
                 logger.info("[RECONNECT] Connection established, waiting for price data...")
-                time.sleep(5)  # Give time for prices to start flowing
+                time.sleep(3)  # Reduced wait time for manual reconnect
             
             # Check if we're getting data and build status report
             status_lines = []
@@ -805,11 +805,16 @@ class EnhancedIBTradingBot:
             logger.error(error_msg, exc_info=True)
             return error_msg
 
-    def recover_market_data(self):
+    def recover_market_data(self, fast_mode=False):
         """Recover market data subscriptions"""
         logger.info("[RECOVER] Recovering market data...")
         try:
-            time.sleep(5)
+            # Reduce wait times in fast mode (manual RECONNECT)
+            if not fast_mode:
+                time.sleep(5)  # Full wait for automatic recovery
+            else:
+                time.sleep(1)  # Quick wait for manual recovery
+                
             if self.is_connected:
                 for currency, ticker in list(self.tickers.items()):
                     try:
@@ -818,7 +823,11 @@ class EnhancedIBTradingBot:
                         pass
                 
                 self.tickers.clear()
-                time.sleep(2)
+                
+                if not fast_mode:
+                    time.sleep(2)  # Full wait for automatic recovery
+                else:
+                    time.sleep(0.5)  # Quick wait for manual recovery
                 
                 if self.setup_market_data():
                     logger.info("[OK] Market data recovered")
@@ -1186,4 +1195,4 @@ if __name__ == "__main__":
         position_size=int(os.environ.get('POSITION_SIZE', '100000'))
     )
     
-    bot.run() 
+    bot.run()

@@ -12,10 +12,13 @@ import time
 def send_command(command, base_url="http://localhost:5000"):
     """Send a command to the trading system via HTTP"""
     try:
+        # Use longer timeout for RECONNECT command
+        timeout = 20 if command.upper() == "RECONNECT" else 10
+        
         response = requests.post(
             f"{base_url}/command",
             json={"command": command},
-            timeout=10
+            timeout=timeout
         )
         
         if response.status_code == 200:
