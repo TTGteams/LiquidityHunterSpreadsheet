@@ -92,6 +92,9 @@ class EnhancedIBTradingBot:
         self.last_tick_times = {currency: None for currency in self.currency_pairs.keys()}
         self.last_heartbeat = datetime.datetime.now()
         
+        # Recent prices tracking for RECONNECT status
+        self.recent_prices = {currency: [] for currency in self.currency_pairs.keys()}
+        
         # Market context cache (for frequency optimization)
         self.market_context_cache = {
             'timezone_says_open': False,
@@ -309,6 +312,8 @@ class EnhancedIBTradingBot:
         
         if self.reconnection_attempts >= self.max_reconnection_attempts:
             logger.error("[ERROR] Max reconnection attempts reached")
+            logger.error("[ERROR] Automatic reconnection stopped. Use 'RECONNECT' command to manually reconnect.")
+            logger.error("[ERROR] Send command via: python send_command.py RECONNECT")
 
     def on_error(self, reqId, errorCode, errorString, contract):
         """Enhanced error handling"""
@@ -368,6 +373,19 @@ class EnhancedIBTradingBot:
             if not self.is_price_reasonable(currency, price):
                 logger.warning(f"[PRICE] {currency} - Unusual price: {price:.5f}")
                 continue
+            
+            # Store recent price for RECONNECT status
+            if currency not in self.recent_prices:
+                self.recent_prices[currency] = []
+            self.recent_prices[currency].append({
+                'price': price,
+                'time': current_time,
+                'bid': ticker.bid,
+                'ask': ticker.ask
+            })
+            # Keep only last 10 prices
+            if len(self.recent_prices[currency]) > 10:
+                self.recent_prices[currency].pop(0)
             
             # THROTTLE: Only send price updates at most 2 per second per currency
             current_time = datetime.datetime.now()
@@ -697,6 +715,96 @@ class EnhancedIBTradingBot:
         else:
             threading.Thread(target=self.recover_market_data, daemon=True).start()
 
+    def handle_manual_reconnect(self):
+        """Handle manual RECONNECT command with status reporting"""
+        try:
+            logger.info("[RECONNECT] Starting manual reconnection process...")
+            
+            # Reset reconnection attempts counter
+            self.reconnection_attempts = 0
+            
+            # Clear recent prices to ensure we get fresh data
+            for currency in self.recent_prices:
+                self.recent_prices[currency] = []
+            
+            # Check current connection state
+            if self.ib.isConnected():
+                logger.info("[RECONNECT] Already connected - refreshing market data...")
+                # Just refresh market data
+                self.recover_market_data()
+                time.sleep(3)  # Wait for market data to stabilize
+            else:
+                logger.info("[RECONNECT] Not connected - attempting full reconnection...")
+                # Attempt full reconnection
+                if not self.connect_to_ib():
+                    return "[RECONNECT] Failed to connect to IB. Check TWS/Gateway is running."
+                
+                time.sleep(2)
+                
+                if not self.setup_market_data():
+                    return "[RECONNECT] Connected to IB but failed to setup market data."
+                
+                logger.info("[RECONNECT] Connection established, waiting for price data...")
+                time.sleep(5)  # Give time for prices to start flowing
+            
+            # Check if we're getting data and build status report
+            status_lines = []
+            status_lines.append("\n[RECONNECT STATUS REPORT]")
+            status_lines.append("=" * 50)
+            
+            # Connection status
+            if self.is_connected:
+                status_lines.append("✅ Connection Status: CONNECTED")
+            else:
+                status_lines.append("❌ Connection Status: DISCONNECTED")
+                status_lines.append("\nReconnection failed. Check TWS/Gateway connection.")
+                return "\n".join(status_lines)
+            
+            # Check data flow
+            data_flowing = False
+            current_time = datetime.datetime.now()
+            
+            status_lines.append("\n📊 Market Data Status:")
+            for currency in self.currency_pairs.keys():
+                last_tick = self.last_tick_times.get(currency)
+                if last_tick and (current_time - last_tick).total_seconds() < 60:
+                    data_flowing = True
+                    status_lines.append(f"  {currency}: ✅ Active")
+                else:
+                    status_lines.append(f"  {currency}: ⚠️  No recent data")
+            
+            if data_flowing:
+                status_lines.append("\n💰 Latest Prices:")
+                # Show most recent price for each currency
+                for currency in self.currency_pairs.keys():
+                    if self.recent_prices[currency]:
+                        latest = self.recent_prices[currency][-1]
+                        price_time = latest['time'].strftime("%H:%M:%S")
+                        status_lines.append(
+                            f"  {currency}: {latest['price']:.5f} "
+                            f"(Bid: {latest['bid']:.5f}, Ask: {latest['ask']:.5f}) "
+                            f"@ {price_time}"
+                        )
+                    else:
+                        status_lines.append(f"  {currency}: Waiting for data...")
+                
+                status_lines.append("\n✅ Reconnection successful! Algorithm will continue from last state.")
+            else:
+                status_lines.append("\n⚠️  Connected but no market data flowing yet.")
+                status_lines.append("This could mean markets are closed or data subscriptions need time.")
+                status_lines.append("Try again in 30 seconds if markets should be open.")
+            
+            status_lines.append("=" * 50)
+            
+            result = "\n".join(status_lines)
+            logger.info(result)
+            return result
+            
+        except Exception as e:
+            error_msg = f"[RECONNECT] Error during manual reconnection: {e}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+
     def recover_market_data(self):
         """Recover market data subscriptions"""
         logger.info("[RECOVER] Recovering market data...")
@@ -726,6 +834,7 @@ class EnhancedIBTradingBot:
         logger.info("[OK] Command listener started - available commands:")
         logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
         logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+        logger.info("  RECONNECT - Force reconnection to IB")
         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
         logger.info("  RESTART - Restart the server")
         logger.info("  STATUS - Show current positions and connection status")
@@ -787,6 +896,11 @@ class EnhancedIBTradingBot:
                         else:
                             logger.warning(f"[COMMAND] Unknown currency in command: {command}")
                             
+                    elif command == "RECONNECT":
+                        # Manual reconnection attempt
+                        logger.info("[COMMAND] RECONNECT requested - attempting manual reconnection")
+                        self.handle_manual_reconnect()
+                            
                     elif command == "SKIP_WARMUP":
                         # Create a flag file for server.py to detect on next restart
                         try:
@@ -829,6 +943,7 @@ class EnhancedIBTradingBot:
                         logger.info("[COMMAND] Available commands:")
                         logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position")
                         logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed") 
+                        logger.info("  RECONNECT - Force reconnection to IB")
                         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
                         logger.info("  RESTART - Restart the server")
                         logger.info("  STATUS - Show positions and connection")
@@ -907,6 +1022,12 @@ class EnhancedIBTradingBot:
                 else:
                     return f"Unknown currency in command: {command}"
                     
+            elif command == "RECONNECT":
+                # Manual reconnection attempt
+                logger.info("[HTTP-COMMAND] RECONNECT requested - attempting manual reconnection")
+                result = self.handle_manual_reconnect()
+                return result
+                    
             elif command == "SKIP_WARMUP":
                 # Create a flag file for server.py to detect on next restart
                 try:
@@ -956,6 +1077,7 @@ class EnhancedIBTradingBot:
                 help_text = """Available commands:
   CLOSE_EURUSD/USDCAD/GBPUSD - Close position
   TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed
+  RECONNECT - Force reconnection to IB
   SKIP_WARMUP - Skip warmup on next restart
   RESTART - Restart the server
   STATUS - Show positions and connection

@@ -761,6 +761,7 @@ if __name__ == '__main__':
     print("COMMAND LISTENER: After IB Live Trading starts, you can use these commands:")
     print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
     print("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+    print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
     print("  SKIP_WARMUP - Skip warmup on next restart")
     print("  RESTART - Restart the server")
     print("  STATUS - Show current positions")
