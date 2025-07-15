@@ -208,13 +208,20 @@ class EnhancedIBTradingBot:
     def connect_to_ib(self):
         """Connect to IB with enhanced error handling"""
         try:
-            logger.info(f"Connecting to IB at {self.ib_host}:{self.ib_port}")
+            logger.info(f"Connecting to IB at {self.ib_host}:{self.ib_port} with clientId={self.client_id}")
             
             if self.ib.isConnected():
+                logger.info("Already connected, disconnecting first...")
                 self.ib.disconnect()
                 time.sleep(2)
             
-            self.ib.connect(self.ib_host, self.ib_port, clientId=self.client_id)
+            # Add timeout to connection attempt
+            self.ib.connect(self.ib_host, self.ib_port, clientId=self.client_id, timeout=10)
+            
+            # Verify connection
+            if not self.ib.isConnected():
+                logger.error("[ERROR] Connection established but immediately lost")
+                return False
             
             # Set up all event handlers
             self.ib.orderStatusEvent += self.on_order_status
@@ -230,8 +237,14 @@ class EnhancedIBTradingBot:
             logger.info("[OK] Successfully connected to IB")
             return True
             
+        except ConnectionRefusedError as e:
+            logger.error(f"[ERROR] Connection refused - Check if TWS/Gateway is running on {self.ib_host}:{self.ib_port}")
+            logger.error(f"[ERROR] Also check: API connections enabled? Correct port? (7497 for paper, 7496 for live)")
+            self.is_connected = False
+            return False
         except Exception as e:
-            logger.error(f"[ERROR] Connection failed: {e}")
+            logger.error(f"[ERROR] Connection failed: {type(e).__name__}: {e}")
+            logger.error(f"[ERROR] Connection details: host={self.ib_host}, port={self.ib_port}, clientId={self.client_id}")
             self.is_connected = False
             return False
 
@@ -728,16 +741,72 @@ class EnhancedIBTradingBot:
                 self.recent_prices[currency] = []
             
             # Check current connection state
-            if self.ib.isConnected():
-                logger.info("[RECONNECT] Already connected - refreshing market data...")
+            current_state = "unknown"
+            try:
+                current_state = "connected" if self.ib.isConnected() else "disconnected"
+                logger.info(f"[RECONNECT] Current IB state: {current_state}")
+            except Exception as e:
+                logger.error(f"[RECONNECT] Error checking connection state: {e}")
+                current_state = "error"
+            
+            if current_state == "connected" or (current_state == "error" and self.is_connected):
+                logger.info("[RECONNECT] Already connected (or in ambiguous state) - refreshing market data...")
                 # Just refresh market data (fast mode for manual reconnect)
                 self.recover_market_data(fast_mode=True)
                 time.sleep(2)  # Reduced wait for market data to stabilize
             else:
                 logger.info("[RECONNECT] Not connected - attempting full reconnection...")
-                # Attempt full reconnection
-                if not self.connect_to_ib():
-                    return "[RECONNECT] Failed to connect to IB. Check TWS/Gateway is running."
+                
+                # Create a fresh IB instance to avoid state issues
+                try:
+                    logger.info("[RECONNECT] Creating fresh IB instance...")
+                    old_ib = self.ib
+                    self.ib = IB()
+                    
+                    # Try to clean up old instance
+                    try:
+                        if old_ib.isConnected():
+                            old_ib.disconnect()
+                    except:
+                        pass
+                    
+                    time.sleep(1)  # Brief pause before reconnecting
+                    
+                    # Try alternative client IDs if primary fails
+                    self.reconnect_client_id = self.client_id
+                    
+                except Exception as e:
+                    logger.error(f"[RECONNECT] Error creating fresh IB instance: {e}")
+                
+                # Attempt full reconnection with retry on different client IDs
+                connected = False
+                original_client_id = self.client_id
+                client_ids_to_try = [self.client_id, self.client_id + 100, self.client_id + 200, 1]  # Try alternatives
+                
+                for attempt_id in client_ids_to_try:
+                    self.client_id = attempt_id
+                    logger.info(f"[RECONNECT] Attempting connection with clientId={self.client_id}")
+                    
+                    if self.connect_to_ib():
+                        connected = True
+                        logger.info(f"[RECONNECT] Successfully connected with clientId={self.client_id}")
+                        break
+                    else:
+                        logger.warning(f"[RECONNECT] Failed with clientId={self.client_id}")
+                        time.sleep(1)
+                
+                # Restore original ID if all attempts failed
+                if not connected:
+                    self.client_id = original_client_id
+                    # Get more specific error info
+                    error_msg = "[RECONNECT] Failed to connect to IB.\n"
+                    error_msg += "Troubleshooting:\n"
+                    error_msg += f"1. Check TWS/Gateway is running on port {self.ib_port}\n"
+                    error_msg += "2. Verify API connections are enabled in TWS (File > Global Configuration > API > Settings)\n"
+                    error_msg += f"3. Tried client IDs: {client_ids_to_try} - all failed\n"
+                    error_msg += "4. Try restarting TWS/Gateway\n"
+                    error_msg += "Check ib_trading_enhanced.log for detailed error messages."
+                    return error_msg
                 
                 time.sleep(2)
                 
