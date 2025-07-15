@@ -22,7 +22,7 @@ services:
       DB_SERVER: "192.168.50.100"
       DB_DATABASE: "FXStrat"
       DB_USERNAME: "djaime"
-      DB_PASSWORD: "Enrique30072000!2"
+      DB_PASSWORD: "Enrique30072000!3"
       
       # Interactive Brokers configuration
       IB_HOST: "host.docker.internal"  # Special Docker hostname to reach host machine

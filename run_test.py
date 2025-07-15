@@ -39,7 +39,7 @@ DB_CONFIG = {
     'server': '192.168.50.100',
     'database': 'FXStrat',  # Changed from 'TTG' to 'FXStrat'
     'username': 'djaime',
-    'password': 'Enrique30072000!2',
+    'password': 'Enrique30072000!3',
     'driver': 'ODBC Driver 17 for SQL Server'
 }
 
