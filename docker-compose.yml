@@ -127,6 +127,24 @@ services:
   #   networks:
   #     - trading_network
   #   restart: unless-stopped
+  #   
+  #   # Resource limits to prevent container from consuming too much memory
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 4G
+  #         cpus: '4.0'
+  #       reservations:
+  #         memory: 1G
+  #         cpus: '2.0'
+  #   
+  #   # Health check configuration
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
+  #     interval: 60s
+  #     timeout: 15s
+  #     start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
+  #     retries: 3
 
   # Example configuration for Instance 3 (Paper trading only)
   # trading_system_instance3:
@@ -168,6 +186,24 @@ services:
   #   networks:
   #     - trading_network
   #   restart: unless-stopped
+  #   
+  #   # Resource limits to prevent container from consuming too much memory
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 4G
+  #         cpus: '4.0'
+  #       reservations:
+  #         memory: 1G
+  #         cpus: '2.0'
+  #   
+  #   # Health check configuration
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
+  #     interval: 60s
+  #     timeout: 15s
+  #     start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
+  #     retries: 3
 
 
 networks:
