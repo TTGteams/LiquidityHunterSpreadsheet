@@ -73,7 +73,7 @@ def show_help():
     print("")
     print("System Management:")
     print("  SKIP_WARMUP       - Skip warmup on next restart")
-    print("  RESTART           - Smart restart (skip warmup, load recent zones)")
+    print("  RESTART           - Smart restart (auto-saves positions, skip warmup, load recent zones)")
     print("  FULL_RESTART      - Full restart (complete warmup sequence)")
     print("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
     print("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")

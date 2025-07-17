@@ -1143,7 +1143,7 @@ class EnhancedIBTradingBot:
         logger.info("  SET_ORDER_SIZE <amount> - Set position size")
         logger.info("  RECONNECT - Force reconnection to IB")
         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-        logger.info("  RESTART - Smart restart (skip warmup, load recent zones)")
+        logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
         logger.info("  STATUS - Show current positions and connection status")
         logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
@@ -1284,6 +1284,10 @@ class EnhancedIBTradingBot:
                         # Create smart restart flag and shutdown gracefully
                         logger.info("[COMMAND] RESTART requested - creating smart restart flag")
                         try:
+                            # Automatically remember positions before restarting
+                            remember_result = self.remember_positions()
+                            logger.info(f"[COMMAND] Auto-saving positions before restart: {remember_result}")
+                            
                             with open('restart_requested.flag', 'w') as f:
                                 f.write('smart')
                             logger.info("[COMMAND] Smart restart flag created - will skip warmup and load recent zones")
@@ -1341,7 +1345,7 @@ class EnhancedIBTradingBot:
                         logger.info("  SET_ORDER_SIZE <amount> - Set position size")
                         logger.info("  RECONNECT - Force reconnection to IB")
                         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-                        logger.info("  RESTART - Smart restart (skip warmup, load recent zones)")
+                        logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
                         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
                         logger.info("  STATUS - Show positions and connection")
                         logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
@@ -1499,6 +1503,10 @@ class EnhancedIBTradingBot:
                 # Create smart restart flag and shutdown gracefully
                 logger.info("[HTTP-COMMAND] RESTART requested - creating smart restart flag")
                 try:
+                    # Automatically remember positions before restarting
+                    remember_result = self.remember_positions()
+                    logger.info(f"[HTTP-COMMAND] Auto-saving positions before restart: {remember_result}")
+                    
                     with open('restart_requested.flag', 'w') as f:
                         f.write('smart')
                     logger.info("[HTTP-COMMAND] Smart restart flag created - will skip warmup and load recent zones")
@@ -1507,7 +1515,7 @@ class EnhancedIBTradingBot:
                     # Disconnect from IB to trigger clean exit
                     if self.ib.isConnected():
                         self.ib.disconnect()
-                    return "Smart restart initiated - will skip warmup and load recent zones from database"
+                    return f"Smart restart initiated - positions saved and will be restored after restart. {remember_result}"
                 except Exception as e:
                     logger.error(f"[HTTP-COMMAND] Failed to create restart flag: {e}")
                     return f"Failed to create restart flag: {e}"
@@ -1569,7 +1577,7 @@ class EnhancedIBTradingBot:
   SET_ORDER_SIZE <amount> - Set position size
   RECONNECT - Force reconnection to IB
   SKIP_WARMUP - Skip warmup on next restart
-  RESTART - Smart restart (skip warmup, load recent zones)
+  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)
   FULL_RESTART - Full restart (complete warmup sequence)
   STATUS - Show positions and connection
   REMEMBER_POSITIONS - Save current positions to remembered_positions.json
