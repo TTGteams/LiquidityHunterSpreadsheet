@@ -29,13 +29,24 @@ from waitress import serve
 import json
 
 # Configure logging with UTF-8 encoding to handle Unicode characters
+# Create handlers with explicit flushing
+file_handler = logging.FileHandler('ib_trading_enhanced.log', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# Create custom stream handler that flushes immediately
+class FlushStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+stream_handler = FlushStreamHandler()
+stream_handler.setLevel(logging.INFO)
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,  # Back to INFO level - no more debug spam
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ib_trading_enhanced.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -102,6 +113,10 @@ class EnhancedIBTradingBot:
         
         # Recent prices tracking for RECONNECT status
         self.recent_prices = {currency: [] for currency in self.currency_pairs.keys()}
+        
+        # Tick counter for debugging
+        self.total_ticks_received = 0
+        self.ticks_per_currency = {currency: 0 for currency in self.currency_pairs.keys()}
         
         # Market context cache (for frequency optimization)
         self.market_context_cache = {
@@ -380,18 +395,21 @@ class EnhancedIBTradingBot:
 
     def setup_market_data(self):
         """Set up market data with error handling"""
+        logger.info("[MARKET_DATA] Starting market data setup...")
         try:
             if not self.is_connected:
                 logger.error("[ERROR] Cannot setup market data - not connected to IB")
                 return False
             
             # Verify connection is actually working before setting up market data
+            logger.info("[MARKET_DATA] Verifying connection before market data setup...")
             try:
                 server_time = self.ib.reqCurrentTime()
                 if not server_time:
                     logger.error("[ERROR] Connection appears broken - cannot get server time")
                     self.is_connected = False
                     return False
+                logger.info(f"[MARKET_DATA] Connection verified, server time: {server_time}")
             except Exception as e:
                 logger.error(f"[ERROR] Connection test failed during market data setup: {e}")
                 self.is_connected = False
@@ -449,13 +467,31 @@ class EnhancedIBTradingBot:
                     return False
             
             # Final wait to let all subscriptions stabilize
+            logger.info("[MARKET_DATA] Final stabilization wait...")
             time.sleep(1)
             
-            logger.info("[OK] Market data setup complete")
-            return True
+            logger.info("[OK] Market data setup complete - ready to receive prices")
+            logger.info(f"[OK] Subscribed to {len(self.tickers)} currency pairs")
+            
+            # Force process some pending tickers to test event handling
+            logger.info("[MARKET_DATA] Testing event handler...")
+            try:
+                self.ib.sleep(0.1)  # Let IB process events
+                if hasattr(self.ib, 'pendingTickers') and self.ib.pendingTickers:
+                    logger.info(f"[MARKET_DATA] Found {len(self.ib.pendingTickers)} pending tickers")
+                    # Manually call the handler to test
+                    self.on_pending_tickers(self.ib.pendingTickers)
+                else:
+                    logger.warning("[MARKET_DATA] No pending tickers found - event handler may not be working")
+            except Exception as e:
+                logger.error(f"[MARKET_DATA] Error testing event handler: {e}")
+                
+                return True
             
         except Exception as e:
             logger.error(f"[ERROR] Market data setup failed: {e}")
+            import traceback
+            logger.error(f"[ERROR] Traceback: {traceback.format_exc()}")
             return False
 
     def on_disconnected(self):
@@ -580,6 +616,20 @@ class EnhancedIBTradingBot:
 
     def on_pending_tickers(self, tickers):
         """Handle market data with heartbeat tracking"""
+        # Log first time this is called
+        if not hasattr(self, '_first_tick_logged'):
+            self._first_tick_logged = True
+            logger.info(f"[MARKET_DATA] First ticker event received! Processing {len(tickers)} tickers")
+        
+        # Debug log every 100 ticks to confirm handler is being called
+        if self.total_ticks_received % 100 == 0:
+            logger.info(f"[TICK_DEBUG] Ticker event handler called - total ticks: {self.total_ticks_received}")
+        
+        # Check if we're getting empty ticker events
+        if not tickers:
+            logger.warning("[MARKET_DATA] on_pending_tickers called with empty tickers list!")
+            return
+        
         current_time = datetime.datetime.now()
         self.last_heartbeat = current_time
         
@@ -594,6 +644,8 @@ class EnhancedIBTradingBot:
                 continue
             
             self.last_tick_times[currency] = current_time
+            self.total_ticks_received += 1
+            self.ticks_per_currency[currency] += 1
             
             price = self.get_midpoint_price(ticker)
             if price is None:
@@ -630,6 +682,9 @@ class EnhancedIBTradingBot:
                 self._price_log_counter[currency] += 1
                 if self._price_log_counter[currency] % 20 == 0:
                     logger.info(f"[PRICE] {currency}: {price:.5f} (bid: {ticker.bid}, ask: {ticker.ask})")
+                elif self._price_log_counter[currency] == 1:
+                    # Always log the first price for each currency
+                    logger.info(f"[PRICE] FIRST TICK - {currency}: {price:.5f} (bid: {ticker.bid}, ask: {ticker.ask})")
                 
                 # Send to algorithm and update last send time
                 self.send_to_algorithm_with_retry(currency, price, ticker.time)
@@ -806,6 +861,10 @@ class EnhancedIBTradingBot:
         slow_thread = threading.Thread(target=self.slow_context_updates, daemon=True)
         slow_thread.start()
         
+        # Ticker polling thread (backup for when event loop is broken)
+        ticker_thread = threading.Thread(target=self.ticker_polling_backup, daemon=True)
+        ticker_thread.start()
+        
         logger.info("[OK] Started dual-frequency monitoring")
 
     def fast_data_monitoring(self):
@@ -857,6 +916,40 @@ class EnhancedIBTradingBot:
             except Exception as e:
                 logger.error(f"[ERROR] Context update error: {e}")
                 time.sleep(300)
+
+    def ticker_polling_backup(self):
+        """Backup ticker polling when event loop is not working properly"""
+        logger.info("[TICKER_BACKUP] Starting backup ticker polling thread")
+        last_log_time = time.time()
+        
+        while not self.shutdown_requested:
+            try:
+                time.sleep(1)  # Poll every second
+                
+                # Check if we have tickers but no recent events
+                if self.tickers and self.is_connected:
+                    current_time = datetime.datetime.now()
+                    
+                    # Check if event handler is working by looking at tick counts
+                    if self.total_ticks_received == 0 or (current_time - self.last_heartbeat).total_seconds() > 30:
+                        # Event handler not working, manually process tickers
+                        if time.time() - last_log_time > 10:  # Log every 10 seconds
+                            logger.warning("[TICKER_BACKUP] Event handler not working, using backup polling")
+                            last_log_time = time.time()
+                        
+                        # Manually check each ticker
+                        pending_tickers = []
+                        for currency, ticker in self.tickers.items():
+                            if ticker and ticker.bid and ticker.ask:
+                                pending_tickers.append(ticker)
+                        
+                        if pending_tickers:
+                            # Manually call the handler
+                            self.on_pending_tickers(pending_tickers)
+                
+            except Exception as e:
+                logger.error(f"[TICKER_BACKUP] Error in backup polling: {e}")
+                time.sleep(5)
 
     def quick_data_check(self):
         """FAST: Check if any currency has recent data"""
@@ -1128,6 +1221,14 @@ class EnhancedIBTradingBot:
                     for currency in self.currency_pairs.keys():
                         self.last_tick_times[currency] = None
                     
+                    # Reset first tick flag so we can see when ticks start flowing
+                    if hasattr(self, '_first_tick_logged'):
+                        delattr(self, '_first_tick_logged')
+                    
+                    # Reset tick counters
+                    self.total_ticks_received = 0
+                    self.ticks_per_currency = {currency: 0 for currency in self.currency_pairs.keys()}
+                    
                     time.sleep(1)  # Brief pause before reconnecting
                     
                     # Try alternative client IDs if primary fails
@@ -1382,6 +1483,7 @@ class EnhancedIBTradingBot:
         logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
         logger.info("  STATUS - Show current positions and connection status")
+        logger.info("  SHOW_PRICES - Show live prices and recent history")
         logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
         logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
 
@@ -1585,6 +1687,7 @@ class EnhancedIBTradingBot:
                         logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
                         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
                         logger.info("  STATUS - Show positions and connection")
+                        logger.info("  SHOW_PRICES - Show live prices and recent history")
                         logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
                         logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
                         logger.info("  HELP - Show this help")
@@ -1775,7 +1878,7 @@ class EnhancedIBTradingBot:
                     return f"Failed to create restart flag: {e}"
                     
             elif command == "STATUS":
-                # Show current status with enhanced detail
+                # Show current status with enhanced detail (non-blocking)
                 status_lines = []
                 status_lines.append("=" * 50)
                 status_lines.append(f"Instance: {self.algo_instance}")
@@ -1786,21 +1889,13 @@ class EnhancedIBTradingBot:
                 status_lines.append(f"IB Port: {self.ib_port}")
                 status_lines.append(f"Client ID: {self.client_id}")
                 
-                # Connection status with verification
+                # Connection status WITHOUT blocking verification
                 connection_status = "UNKNOWN"
                 if self.is_connected:
                     try:
-                        # Double-check connection
+                        # Just check if connected, don't do blocking server time request
                         if self.ib.isConnected():
-                            # Try to get server time to verify
-                            try:
-                                server_time = self.ib.reqCurrentTime()
-                                if server_time:
-                                    connection_status = "CONNECTED (verified)"
-                                else:
-                                    connection_status = "ZOMBIE (no response)"
-                            except:
-                                connection_status = "ZOMBIE (error)"
+                            connection_status = "CONNECTED"
                         else:
                             connection_status = "DISCONNECTED"
                             self.is_connected = False
@@ -1853,6 +1948,13 @@ class EnhancedIBTradingBot:
                 if self.reconnection_attempts > 0:
                     status_lines.append(f"Reconnection attempts: {self.reconnection_attempts}/{self.max_reconnection_attempts}")
                 
+                # Tick statistics
+                status_lines.append(f"\nTotal ticks received: {self.total_ticks_received}")
+                if self.total_ticks_received > 0:
+                    status_lines.append("Ticks per currency:")
+                    for currency, count in self.ticks_per_currency.items():
+                        status_lines.append(f"  {currency}: {count}")
+                
                 status_lines.append("=" * 50)
                 
                 status_text = "\n".join(status_lines)
@@ -1871,6 +1973,58 @@ class EnhancedIBTradingBot:
                 # Force disconnect all zombie client connections
                 result = self.force_disconnect_all_clients()
                 return result
+            
+            elif command == "SHOW_PRICES":
+                # Show most recent live prices
+                result_lines = []
+                result_lines.append("💰 Live Price Data")
+                result_lines.append("=" * 50)
+                
+                current_time = datetime.datetime.now()
+                has_any_data = False
+                
+                for currency in self.currency_pairs.keys():
+                    # Check ticker data
+                    ticker = self.tickers.get(currency)
+                    if ticker and ticker.bid and ticker.ask and not util.isNan(ticker.bid) and not util.isNan(ticker.ask):
+                        spread = ticker.ask - ticker.bid
+                        result_lines.append(f"\n{currency}:")
+                        result_lines.append(f"  Bid: {ticker.bid:.5f}")
+                        result_lines.append(f"  Ask: {ticker.ask:.5f}")
+                        result_lines.append(f"  Mid: {(ticker.bid + ticker.ask) / 2:.5f}")
+                        result_lines.append(f"  Spread: {spread:.5f} ({spread * 10000:.1f} pips)")
+                        
+                        # Add last update time
+                        last_tick_time = self.last_tick_times.get(currency)
+                        if last_tick_time:
+                            seconds_ago = (current_time - last_tick_time).total_seconds()
+                            result_lines.append(f"  Last Update: {seconds_ago:.1f}s ago")
+                        
+                        has_any_data = True
+                    else:
+                        result_lines.append(f"\n{currency}: No data available")
+                
+                # Add recent price history if available
+                result_lines.append("\n" + "=" * 50)
+                result_lines.append("Recent Price History (last 5 ticks):")
+                
+                for currency in self.currency_pairs.keys():
+                    if currency in self.recent_prices and self.recent_prices[currency]:
+                        result_lines.append(f"\n{currency}:")
+                        # Show last 5 prices
+                        for price_data in self.recent_prices[currency][-5:]:
+                            time_str = price_data['time'].strftime("%H:%M:%S")
+                            result_lines.append(f"  {time_str}: {price_data['price']:.5f}")
+                
+                if not has_any_data:
+                    result_lines.append("\n⚠️ No live price data available")
+                    result_lines.append("Check connection status with STATUS command")
+                
+                result_lines.append("=" * 50)
+                
+                result = "\n".join(result_lines)
+                logger.info(f"[HTTP-COMMAND] Show prices requested:\n{result}")
+                return result
 
             elif command == "HELP":
                 help_text = """Available commands:
@@ -1885,9 +2039,9 @@ class EnhancedIBTradingBot:
   RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)
   FULL_RESTART - Full restart (complete warmup sequence)
   STATUS - Show positions and connection
+  SHOW_PRICES - Show live prices and recent history
   REMEMBER_POSITIONS - Save current positions to remembered_positions.json
   CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json
-  FORCE_DISCONNECT - Force disconnect all zombie IB connections
   HELP - Show this help"""
                 logger.info("[HTTP-COMMAND] Help requested")
                 return help_text
@@ -1910,9 +2064,36 @@ class EnhancedIBTradingBot:
             logger.error("[ERROR] Initial connection failed")
             return
         
+        # Add a delay after connection to ensure everything is stable
+        logger.info("[START] Waiting 3 seconds after connection for stability...")
+        time.sleep(3)
+        
+        logger.info("[START] Now setting up market data...")
         if not self.setup_market_data():
             logger.error("[ERROR] Market data setup failed")
+            # Log more details about why it failed
+            logger.error(f"[ERROR] Connected: {self.is_connected}, IB Connected: {self.ib.isConnected() if hasattr(self, 'ib') else 'No IB object'}")
             return
+        
+        logger.info("[START] Market data setup completed successfully")
+        
+        # Wait a moment for market data to start flowing
+        logger.info("[START] Waiting for market data to stabilize...")
+        time.sleep(2)
+        
+        # Log initial market data status
+        logger.info("[START] Checking initial market data flow...")
+        has_data = False
+        for currency in self.currency_pairs.keys():
+            ticker = self.tickers.get(currency)
+            if ticker and ticker.bid and ticker.ask:
+                logger.info(f"[START] {currency} has data - bid: {ticker.bid:.5f}, ask: {ticker.ask:.5f}")
+                has_data = True
+            else:
+                logger.warning(f"[START] {currency} - no data yet")
+        
+        if not has_data:
+            logger.warning("[START] No market data flowing yet - continuing anyway")
         
         # Start monitoring
         self.start_dual_frequency_monitoring()
@@ -1921,6 +2102,18 @@ class EnhancedIBTradingBot:
         self.start_command_listener()
         
         logger.info("[OK] Bot running with enhanced monitoring")
+        
+        # Test event loop after 5 seconds
+        def test_event_loop():
+            time.sleep(5)
+            logger.info("[TEST] Testing if event loop is processing events...")
+            if self.total_ticks_received == 0:
+                logger.warning("[TEST] No ticks received after 5 seconds - event loop may not be working")
+                logger.warning("[TEST] Backup polling should kick in after 30 seconds")
+            else:
+                logger.info(f"[TEST] Event loop working! Received {self.total_ticks_received} ticks")
+        
+        threading.Thread(target=test_event_loop, daemon=True).start()
         
         try:
             # Status logging
@@ -1940,6 +2133,19 @@ class EnhancedIBTradingBot:
                         last_positions = current_positions
             
             threading.Thread(target=status_logger, daemon=True).start()
+            
+            logger.info("[OK] Starting IB event loop - bot is now fully operational")
+            logger.info(f"[OK] Event handlers registered: pendingTickers={len(self.ib._pendingTickersEvent) if hasattr(self.ib, '_pendingTickersEvent') else 'unknown'}")
+            
+            # Force flush all output before starting event loop
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
+            # Add a small delay before starting event loop
+            time.sleep(1)
+            
+            logger.info("[OK] Now starting ib.run() - this will block...")
             self.ib.run()
             
         except KeyboardInterrupt:
@@ -1970,9 +2176,13 @@ class EnhancedIBTradingBot:
 
 if __name__ == "__main__":
     import os
+    import traceback
     
     # Log environment variables for debugging
     logger = logging.getLogger(__name__)
+    logger.info("=" * 80)
+    logger.info("IB TRADING BOT STARTING")
+    logger.info("=" * 80)
     logger.info(f"ALGO_INSTANCE environment variable: {os.environ.get('ALGO_INSTANCE', '1')}")
     logger.info(f"TRADING_MODE environment variable: {os.environ.get('TRADING_MODE', 'NOT SET')}")
     logger.info(f"IB_HOST environment variable: {os.environ.get('IB_HOST', 'NOT SET')}")
@@ -1981,8 +2191,20 @@ if __name__ == "__main__":
     logger.info(f"ACCOUNT_ID environment variable: {os.environ.get('ACCOUNT_ID', 'NOT SET')}")
     logger.info(f"Running in Docker: {'Yes' if os.environ.get('IB_HOST') == 'host.docker.internal' else 'No'}")
     
-    # Create bot with instance-specific configuration
-    logger.info("Creating bot with instance-specific configuration...")
-    bot = EnhancedIBTradingBot.create_with_instance_config()
-    
-    bot.run() 
+    try:
+        # Create bot with instance-specific configuration
+        logger.info("Creating bot with instance-specific configuration...")
+        bot = EnhancedIBTradingBot.create_with_instance_config()
+        
+        logger.info("Starting bot.run()...")
+        bot.run()
+        
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error("FATAL ERROR DURING STARTUP")
+        logger.error("=" * 80)
+        logger.error(f"Exception: {type(e).__name__}: {e}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        logger.error("=" * 80)
+        # Re-raise to ensure proper exit
+        raise 

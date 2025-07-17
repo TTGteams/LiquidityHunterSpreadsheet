@@ -468,14 +468,17 @@ def start_ib_live_trading():
         debug_logger.info(f"ALGO_INSTANCE from environment: {env.get('ALGO_INSTANCE', '1')}")
         debug_logger.info(f"IB_API_PORT from environment: {env.get('IB_API_PORT', '5001')}")
         
+        # Force unbuffered output for better subprocess behavior
+        env['PYTHONUNBUFFERED'] = '1'
+        
         # Start the IB trading script with environment
         ib_process = subprocess.Popen(
-            [sys.executable, 'ib_live_trading_enhanced.py'],
+            [sys.executable, '-u', 'ib_live_trading_enhanced.py'],  # -u for unbuffered
             cwd=os.getcwd(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
-            bufsize=1,
+            bufsize=1,  # Line buffered
             env=env  # Pass the environment variables
         )
         
@@ -527,11 +530,15 @@ def monitor_ib_process():
                 if line:
                     line_stripped = line.strip()
                     # Log important messages to trade logger too
-                    if any(keyword in line_stripped for keyword in ['[ERROR]', '[OK]', '[RECONNECT]', 'Connected', 'Disconnected']):
+                    if any(keyword in line_stripped for keyword in ['[ERROR]', '[OK]', '[RECONNECT]', '[START]', '[MARKET_DATA]', 'Connected', 'Disconnected']):
                         trade_logger.info(f"IB: {line_stripped}")
                     debug_logger.info(f"IB: {line_stripped}")
-            except:
-                pass
+                    
+                    # Force flush to ensure logs are visible
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+            except Exception as e:
+                debug_logger.error(f"Error reading IB output: {e}")
             
             time.sleep(0.5)  # Reduce sleep for more responsive monitoring
             
@@ -870,6 +877,7 @@ if __name__ == '__main__':
     print("  RESTART - Smart restart (skip warmup, load recent zones)")
     print("  FULL_RESTART - Full restart (complete warmup sequence)")
     print("  STATUS - Show current positions")
+    print("  SHOW_PRICES - Show live prices and recent history")
     print("  HELP - Show all commands")
     print("")
     print("Fast restart: RESTART (smart restart with recent zones)")
