@@ -1,88 +1,127 @@
 #!/usr/bin/env python3
 """
-Python script to send commands to the forex trading system via HTTP.
-Replaces send_command.sh with a cleaner Python-native approach.
+Command sender script for the Enhanced IB Trading System
+Sends commands via HTTP API to both server and IB bot
 """
 
 import requests
-import json
 import sys
+import json
 import time
 
-def send_command(command, base_url="http://localhost:5000"):
-    """Send a command to the trading system via HTTP"""
+def send_command(command, host='localhost', port=5000):
+    """Send a command to the trading system"""
     try:
-        # Use longer timeout for RECONNECT command
-        timeout = 20 if command.upper() == "RECONNECT" else 10
+        url = f"http://{host}:{port}/command"
+        payload = {"command": command}
         
-        response = requests.post(
-            f"{base_url}/command",
-            json={"command": command},
-            timeout=timeout
-        )
+        print(f"Sending command: {command}")
+        print(f"Target: {url}")
+        print("-" * 50)
+        
+        # Set longer timeout for RECONNECT, SWITCH, and RESTART commands
+        timeout = 30 if command in ['RECONNECT', 'SWITCH_LIVE', 'SWITCH_PAPER', 'RESTART', 'FULL_RESTART'] else 10
+        
+        response = requests.post(url, json=payload, timeout=timeout)
         
         if response.status_code == 200:
             result = response.json()
-            print(f"Command: {result['command']}")
-            print(f"Result: {result['result']}")
-            print(f"Timestamp: {result['timestamp']}")
-            return True
+            print("✅ Success!")
+            print(f"Command: {result.get('command', command)}")
+            print(f"Result: {result.get('result', 'No result')}")
+            if 'timestamp' in result:
+                print(f"Timestamp: {result['timestamp']}")
         else:
-            print(f"Error: HTTP {response.status_code}")
+            print(f"❌ Error: HTTP {response.status_code}")
             try:
                 error_data = response.json()
-                print(f"Details: {error_data.get('error', 'Unknown error')}")
+                print(f"Error: {error_data.get('error', 'Unknown error')}")
             except:
-                print(f"Response: {response.text}")
-            return False
-            
+                print(f"Error: {response.text}")
+        
     except requests.exceptions.ConnectionError:
-        print("Error: Could not connect to trading system")
-        print("Make sure the container is running and accessible on port 5000")
-        return False
+        print("❌ Connection Error: Trading system is not running or not reachable")
+        print(f"Make sure the server is running on {host}:{port}")
     except requests.exceptions.Timeout:
-        print("Error: Request timed out")
-        return False
+        print("❌ Timeout Error: Command took too long to execute")
+        print("This can happen with RECONNECT or SWITCH commands - check logs")
     except Exception as e:
-        print(f"Error: {e}")
-        return False
+        print(f"❌ Error: {e}")
+
+def show_help():
+    """Show available commands"""
+    print("Enhanced IB Trading System - Command Sender")
+    print("=" * 50)
+    print("Available commands:")
+    print("")
+    print("Position Management:")
+    print("  CLOSE_EURUSD      - Close EURUSD position")
+    print("  CLOSE_USDCAD      - Close USDCAD position")
+    print("  CLOSE_GBPUSD      - Close GBPUSD position")
+    print("  TWS_CLOSED_EURUSD - Mark EURUSD as closed in TWS")
+    print("  TWS_CLOSED_USDCAD - Mark USDCAD as closed in TWS")
+    print("  TWS_CLOSED_GBPUSD - Mark GBPUSD as closed in TWS")
+    print("")
+    print("Trading Configuration:")
+    print("  SWITCH_LIVE       - Switch to live trading (instance 1 only)")
+    print("  SWITCH_PAPER      - Switch to paper trading")
+    print("  SET_ORDER_SIZE 50000 - Set position size (example: 50,000)")
+    print("")
+    print("Connection Management:")
+    print("  RECONNECT         - Force reconnection to IB")
+    print("  STATUS            - Show current status")
+    print("")
+    print("System Management:")
+    print("  SKIP_WARMUP       - Skip warmup on next restart")
+    print("  RESTART           - Smart restart (skip warmup, load recent zones)")
+    print("  FULL_RESTART      - Full restart (complete warmup sequence)")
+    print("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
+    print("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
+    print("  HELP              - Show this help")
+    print("")
+    print("Usage:")
+    print("  python send_command.py <command>")
+    print("  python send_command.py STATUS")
+    print("  python send_command.py SWITCH_LIVE")
+    print("  python send_command.py SET_ORDER_SIZE 75000")
+    print("  python send_command.py RESTART")
+    print("  python send_command.py REMEMBER_POSITIONS")
+    print("  python send_command.py CLEAR_REMEMBERED_POSITIONS")
+    print("")
+    print("Examples:")
+    print("  python send_command.py STATUS")
+    print("  python send_command.py SWITCH_LIVE")
+    print("  python send_command.py SET_ORDER_SIZE 25000")
+    print("  python send_command.py CLOSE_EURUSD")
+    print("  python send_command.py RESTART")
+    print("  python send_command.py FULL_RESTART")
+    print("  python send_command.py REMEMBER_POSITIONS")
+    print("  python send_command.py CLEAR_REMEMBERED_POSITIONS")
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python send_command.py <command>")
-        print("")
-        print("Available commands:")
-        print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
-        print("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
-        print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
-        print("  SKIP_WARMUP - Skip warmup on next restart")
-        print("  RESTART - Restart the server")
-        print("  STATUS - Show current positions")
-        print("  HELP - Show all commands")
-        print("")
-        print("Examples:")
-        print("  python send_command.py STATUS")
-        print("  python send_command.py CLOSE_EURUSD")
-        print("  python send_command.py RECONNECT")
-        print("  python send_command.py SKIP_WARMUP")
-        print("  python send_command.py RESTART")
-        sys.exit(1)
+        show_help()
+        return
     
-    command = sys.argv[1]
+    command = " ".join(sys.argv[1:]).upper()
     
-    # Check if we're running in Docker and need to use container IP
-    base_url = "http://localhost:5000"
-    if len(sys.argv) > 2 and sys.argv[2] == "--docker":
-        base_url = "http://192.168.50.100:5000"  # Adjust IP as needed
+    if command == "HELP" or command == "--HELP":
+        show_help()
+        return
     
-    print(f"Sending command: {command}")
-    print(f"Target: {base_url}")
-    print("-" * 50)
+    # Show what we're about to do
+    print(f"Enhanced IB Trading System - Command: {command}")
+    print("=" * 50)
     
-    success = send_command(command, base_url)
+    # Send the command
+    send_command(command)
     
-    if not success:
-        sys.exit(1)
+    # Show quick status for certain commands
+    if command in ['SWITCH_LIVE', 'SWITCH_PAPER', 'RECONNECT', 'RESTART', 'FULL_RESTART']:
+        print("\n" + "=" * 50)
+        print("Getting updated status...")
+        time.sleep(2)  # Give it a moment to process
+        send_command('STATUS')
 
 if __name__ == "__main__":
     main() 

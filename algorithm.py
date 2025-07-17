@@ -2401,3 +2401,119 @@ def load_recent_zones_from_database(limit=10):
                 pass
         # DO NOT close the connection when using connection pooling
 
+def load_recent_bars_with_indicators_from_database(limit=100):
+    """
+    Load the most recent bars with indicators from the database for all supported currencies.
+    This is used for smart restart to quickly populate bars with calculated indicators.
+    
+    Args:
+        limit (int): Number of recent bars to load per currency (default: 100)
+        
+    Returns:
+        dict: Dictionary with currency as key and DataFrame as value
+    """
+    conn = None
+    cursor = None
+    loaded_bars = {currency: pd.DataFrame() for currency in SUPPORTED_CURRENCIES}
+    
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            debug_logger.error("Failed to load recent bars - no database connection")
+            return loaded_bars
+        
+        cursor = conn.cursor()
+        
+        for currency in SUPPORTED_CURRENCIES:
+            try:
+                # Get the most recent bars for this currency
+                cursor.execute("""
+                SELECT TOP (?)
+                    BarStartTime,
+                    OpenPrice,
+                    HighPrice,
+                    LowPrice,
+                    ClosePrice,
+                    RSI,
+                    MACD_Line,
+                    Signal_Line
+                FROM FXStrat_AlgorithmBars
+                WHERE Currency = ?
+                AND AlgoInstance = ?
+                ORDER BY BarStartTime DESC
+                """, limit, currency, ALGO_INSTANCE)
+                
+                bars_data = cursor.fetchall()
+                
+                if bars_data:
+                    # Convert to DataFrame
+                    df_data = []
+                    for row in bars_data:
+                        bar_time = row[0]
+                        open_price = float(row[1])
+                        high_price = float(row[2])
+                        low_price = float(row[3])
+                        close_price = float(row[4])
+                        rsi = float(row[5]) if row[5] is not None else np.nan
+                        macd_line = float(row[6]) if row[6] is not None else np.nan
+                        signal_line = float(row[7]) if row[7] is not None else np.nan
+                        
+                        df_data.append({
+                            'open': open_price,
+                            'high': high_price,
+                            'low': low_price,
+                            'close': close_price,
+                            'RSI': rsi,
+                            'MACD_Line': macd_line,
+                            'Signal_Line': signal_line
+                        })
+                    
+                    # Create DataFrame with proper index (reverse to get chronological order)
+                    df = pd.DataFrame(df_data[::-1])  # Reverse to get chronological order
+                    df.index = pd.to_datetime([row[0] for row in bars_data[::-1]])
+                    
+                    loaded_bars[currency] = df
+                    
+                    # Log indicator status
+                    valid_rsi = df['RSI'].notna().sum()
+                    valid_macd = df['MACD_Line'].notna().sum()
+                    valid_signal = df['Signal_Line'].notna().sum()
+                    
+                    debug_logger.warning(
+                        f"Loaded {len(df)} bars with indicators for {currency}: "
+                        f"RSI={valid_rsi}, MACD={valid_macd}, Signal={valid_signal}"
+                    )
+                    
+                    if len(df) > 0:
+                        debug_logger.info(
+                            f"  {currency} bars range: {df.index[0]} to {df.index[-1]}"
+                        )
+                        
+                        # Log latest indicator values
+                        latest_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else "N/A"
+                        latest_macd = df['MACD_Line'].iloc[-1] if not pd.isna(df['MACD_Line'].iloc[-1]) else "N/A"
+                        latest_signal = df['Signal_Line'].iloc[-1] if not pd.isna(df['Signal_Line'].iloc[-1]) else "N/A"
+                        
+                        debug_logger.info(
+                            f"  Latest indicators: RSI={latest_rsi}, MACD={latest_macd}, Signal={latest_signal}"
+                        )
+                else:
+                    debug_logger.warning(f"No bars found in database for {currency}")
+                    
+            except Exception as e:
+                debug_logger.error(f"Error loading bars for {currency}: {e}")
+                continue
+        
+        return loaded_bars
+        
+    except Exception as e:
+        debug_logger.error(f"Error loading recent bars from database: {e}", exc_info=True)
+        return loaded_bars
+        
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        # DO NOT close the connection when using connection pooling

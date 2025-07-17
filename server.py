@@ -190,21 +190,39 @@ def execute_command():
                 
         elif command == 'RESTART':
             try:
-                # Create restart_requested.flag file
+                # Create smart restart flag - skips warmup and loads recent zones
                 with open('restart_requested.flag', 'w') as f:
-                    f.write('restart')
-                debug_logger.info("Created restart_requested.flag file")
-                trade_logger.info("RESTART command received - initiating server restart")
+                    f.write('smart')
+                debug_logger.info("Created smart restart flag")
+                trade_logger.info("RESTART command received - initiating smart restart (skip warmup, load recent zones)")
                 
                 return jsonify({
                     'command': command,
-                    'result': 'Restart initiated. Server will restart momentarily.',
+                    'result': 'Smart restart initiated - will skip warmup and load recent zones from database.',
                     'timestamp': datetime.datetime.now().isoformat()
                 }), 200
                 
             except Exception as e:
                 debug_logger.error(f"Error creating restart_requested.flag: {e}")
                 return jsonify({'error': f'Failed to initiate restart: {str(e)}'}), 500
+        
+        elif command == 'FULL_RESTART':
+            try:
+                # Create full restart flag - performs complete warmup
+                with open('restart_requested.flag', 'w') as f:
+                    f.write('full')
+                debug_logger.info("Created full restart flag")
+                trade_logger.info("FULL_RESTART command received - initiating full restart with complete warmup")
+                
+                return jsonify({
+                    'command': command,
+                    'result': 'Full restart initiated - will perform complete warmup sequence.',
+                    'timestamp': datetime.datetime.now().isoformat()
+                }), 200
+                
+            except Exception as e:
+                debug_logger.error(f"Error creating restart_requested.flag: {e}")
+                return jsonify({'error': f'Failed to initiate full restart: {str(e)}'}), 500
         
         # For all other commands, forward to IB bot via HTTP API
         try:
@@ -242,6 +260,14 @@ def execute_command():
     except Exception as e:
         debug_logger.error(f"Error executing command: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint"""
+    return jsonify({
+        'status': 'running',
+        'timestamp': datetime.datetime.now().isoformat()
+    }), 200
 
 @app.route('/algorithm_state', methods=['GET'])
 def get_algorithm_state():
@@ -572,26 +598,44 @@ def run_post_startup_warmup():
             debug_logger.info("Calling warmup_data function...")
             result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
             
-            # If we skipped warmup modes, load recent zones from database
+            # If we skipped warmup modes, load recent zones AND bars with indicators from database
             if SKIP_MODE2 and SKIP_MODE3:
-                debug_logger.info("Loading recent zones from database due to SKIP_WARMUP...")
+                debug_logger.info("Loading recent zones and bars with indicators from database (HYBRID APPROACH)...")
                 try:
                     # Load the most recent 10 zones per currency from database
                     recent_zones = algorithm.load_recent_zones_from_database(limit=10)
                     
+                    # Load the most recent 100 bars with indicators per currency from database
+                    recent_bars = algorithm.load_recent_bars_with_indicators_from_database(limit=100)
+                    
                     # Apply the loaded zones to the algorithm state
-                    for currency, zones in recent_zones.items():
-                        if zones:
-                            algorithm.load_preexisting_zones(zones, currency)
+                    zones_loaded = 0
+                    bars_loaded = 0
+                    
+                    for currency in algorithm.SUPPORTED_CURRENCIES:
+                        # Load zones
+                        if currency in recent_zones and recent_zones[currency]:
+                            algorithm.load_preexisting_zones(recent_zones[currency], currency)
+                            zones_loaded += len(recent_zones[currency])
                             debug_logger.warning(
-                                f"Populated {currency} with {len(zones)} recent zones from database"
+                                f"Populated {currency} with {len(recent_zones[currency])} recent zones from database"
+                            )
+                        
+                        # Load bars with indicators
+                        if currency in recent_bars and not recent_bars[currency].empty:
+                            algorithm.load_preexisting_bars_and_indicators(recent_bars[currency], currency)
+                            bars_loaded += len(recent_bars[currency])
+                            debug_logger.warning(
+                                f"Populated {currency} with {len(recent_bars[currency])} recent bars with indicators from database"
                             )
                     
-                    trade_logger.info("Quick startup complete - loaded recent zones from database")
+                    trade_logger.info(
+                        f"HYBRID SMART RESTART complete - loaded {zones_loaded} zones and {bars_loaded} bars with indicators from database"
+                    )
                     
                 except Exception as e:
-                    debug_logger.error(f"Error loading recent zones from database: {e}", exc_info=True)
-                    debug_logger.warning("Continuing without recent zones")
+                    debug_logger.error(f"Error loading recent data from database: {e}", exc_info=True)
+                    debug_logger.warning("Continuing without recent zones and bars")
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
@@ -660,8 +704,22 @@ def check_restart_flag():
     while True:
         try:
             if os.path.exists('restart_requested.flag'):
-                debug_logger.info("Restart flag detected - initiating graceful shutdown")
-                trade_logger.info("RESTART command received - shutting down for restart")
+                # Read the restart type from the flag file
+                restart_type = 'smart'  # default
+                try:
+                    with open('restart_requested.flag', 'r') as f:
+                        restart_type = f.read().strip()
+                except:
+                    pass
+                
+                debug_logger.info(f"Restart flag detected - type: {restart_type}")
+                
+                if restart_type == 'smart':
+                    trade_logger.info("RESTART command received - smart restart (skip warmup, load recent zones)")
+                elif restart_type == 'full':
+                    trade_logger.info("FULL_RESTART command received - full restart with complete warmup")
+                else:
+                    trade_logger.info("RESTART command received - shutting down for restart")
                 
                 # Stop IB trading first
                 stop_ib_live_trading()
@@ -675,10 +733,18 @@ def check_restart_flag():
                 except:
                     pass
                 
-                # Restart the current process with same arguments
-                debug_logger.info("Executing restart...")
+                # Restart the current process with restart type argument
+                debug_logger.info(f"Executing {restart_type} restart...")
                 python = sys.executable
-                os.execl(python, python, *sys.argv)
+                
+                # Build new arguments list
+                new_args = [python] + sys.argv
+                if restart_type == 'smart':
+                    new_args.append('smart_restart')
+                elif restart_type == 'full':
+                    new_args.append('full_restart')
+                
+                os.execl(python, *new_args)
                 
             time.sleep(1)  # Check every second
             
@@ -694,21 +760,35 @@ signal.signal(signal.SIGINT, signal_handler)
 atexit.register(stop_ib_live_trading)
 
 if __name__ == '__main__':
-    # Parse command line arguments for skip options
+    # Parse command line arguments for skip options and restart types
     if len(sys.argv) > 1:
-        if sys.argv[1].lower() == "skip":
+        arg = sys.argv[1].lower()
+        
+        if arg == "skip":
             SKIP_MODE2 = True
             SKIP_MODE3 = True
             print("Server started with SKIP mode - will skip Modes 2 and 3 during startup")
-        elif sys.argv[1].lower() == "help" or sys.argv[1].lower() == "--help":
-            print("Usage: python server.py [skip]")
+        elif arg == "smart_restart":
+            SKIP_MODE2 = True
+            SKIP_MODE3 = True
+            print("Server started with SMART RESTART - will skip warmup and load recent zones from database")
+        elif arg == "full_restart":
+            SKIP_MODE2 = False
+            SKIP_MODE3 = False
+            print("Server started with FULL RESTART - will perform complete warmup sequence")
+        elif arg == "help" or arg == "--help":
+            print("Usage: python server.py [option]")
             print("  skip: Skip Modes 2 and 3 during startup warmup (faster startup)")
+            print("  smart_restart: Skip warmup and load recent zones (used by RESTART command)")
+            print("  full_restart: Perform complete warmup (used by FULL_RESTART command)")
             print("  (no argument): Run all modes during startup (normal operation)")
             sys.exit(0)
         else:
-            print(f"Unknown argument: {sys.argv[1]}")
-            print("Usage: python server.py [skip]")
+            print(f"Unknown argument: {arg}")
+            print("Usage: python server.py [option]")
             print("  skip: Skip Modes 2 and 3 during startup warmup")
+            print("  smart_restart: Skip warmup and load recent zones")
+            print("  full_restart: Perform complete warmup")
             print("  (no argument): Run all modes during startup")
             sys.exit(1)
     
@@ -764,13 +844,19 @@ if __name__ == '__main__':
     print("COMMAND LISTENER: After IB Live Trading starts, you can use these commands:")
     print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
     print("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+    print("  SWITCH_LIVE - Switch to live trading (instance 1 only)")
+    print("  SWITCH_PAPER - Switch to paper trading")
+    print("  SET_ORDER_SIZE <amount> - Set position size (e.g., SET_ORDER_SIZE 50000)")
     print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
     print("  SKIP_WARMUP - Skip warmup on next restart")
-    print("  RESTART - Restart the server")
+    print("  RESTART - Smart restart (skip warmup, load recent zones)")
+    print("  FULL_RESTART - Full restart (complete warmup sequence)")
     print("  STATUS - Show current positions")
     print("  HELP - Show all commands")
     print("")
-    print("Fast restart: SKIP_WARMUP then RESTART")
+    print("Fast restart: RESTART (smart restart with recent zones)")
+    print("Live trading: SWITCH_LIVE (instance 1 only)")
+    print("Paper trading: SWITCH_PAPER")
     print("")
     # Increase worker threads to handle concurrent requests better
     serve(app, host='0.0.0.0', port=5000, threads=32)  # 32 threads - high capacity without lock contention risk

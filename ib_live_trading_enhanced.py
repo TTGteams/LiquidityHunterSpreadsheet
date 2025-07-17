@@ -6,6 +6,7 @@ Consolidated version with all optimizations:
 - Hybrid market detection (data flow + timezone backup)
 - Frequency-optimized monitoring (30s data checks, 5min context updates)
 - Enhanced error handling and position management
+- Instance-specific configuration with live/paper trading support
 """
 
 from ib_insync import *
@@ -25,6 +26,7 @@ from typing import Dict, Optional
 from datetime import timedelta
 from flask import Flask, request, jsonify
 from waitress import serve
+import json
 
 # Configure logging with UTF-8 encoding to handle Unicode characters
 logging.basicConfig(
@@ -50,11 +52,14 @@ except Exception:
 class EnhancedIBTradingBot:
     def __init__(self, 
                  ib_host='127.0.0.1', 
-                 ib_port=7497,  # TWS paper trading port
+                 ib_port=7497,  # Default paper trading port
                  client_id=1,
                  api_url='http://localhost:5000/trade_signal',
-                 position_size=30000):
-        """Initialize Enhanced IB Trading Bot with all optimizations"""
+                 position_size=100000,
+                 trading_mode='paper',
+                 account_id=None,
+                 algo_instance=1):
+        """Initialize Enhanced IB Trading Bot with instance-specific configuration"""
         
         self.ib = IB()
         self.ib_host = ib_host
@@ -62,6 +67,9 @@ class EnhancedIBTradingBot:
         self.client_id = client_id
         self.api_url = api_url
         self.position_size = position_size
+        self.trading_mode = trading_mode  # 'live' or 'paper'
+        self.account_id = account_id
+        self.algo_instance = algo_instance
         
         # Currency pairs - using standard IB format without dots
         self.currency_pairs = {
@@ -119,10 +127,82 @@ class EnhancedIBTradingBot:
         self.setup_http_api()
         self.http_port = int(os.environ.get('IB_API_PORT', '5001'))  # Default port 5001
         
-        logger.info(f"[INIT] Enhanced IB Trading Bot initialized for {len(self.currency_pairs)} currencies")
-        logger.info(f"[INIT] IB connection will use: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
-        logger.info(f"[INIT] Price throttling: {1/self.price_throttle_seconds:.1f} updates/second per currency (max {3/self.price_throttle_seconds:.1f} total)")
+        # Configuration status
+        trading_mode_display = f"{self.trading_mode.upper()}"
+        if self.trading_mode == 'live' and self.account_id:
+            trading_mode_display += f" (Sub-Account: {self.account_id})"
+        
+        logger.info(f"[INIT] Enhanced IB Trading Bot - Instance #{self.algo_instance}")
+        logger.info(f"[INIT] Trading Mode: {trading_mode_display}")
+        logger.info(f"[INIT] Position Size: {self.position_size:,}")
+        logger.info(f"[INIT] IB connection: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
         logger.info(f"[INIT] HTTP API will listen on port {self.http_port}")
+
+        # Load remembered positions if present
+        self.load_remembered_positions()
+
+    @staticmethod
+    def get_instance_specific_config():
+        """Static method to get configuration based on algo instance"""
+        algo_instance = int(os.environ.get('ALGO_INSTANCE', '1'))
+        
+        # Default configurations per instance
+        if algo_instance == 1:
+            # Instance 1: Live trading capable with sub-account
+            default_mode = 'live'
+            default_port = 7496  # Live trading port
+            default_position_size = 10000  # 10k for live
+            default_account = 'U12923979'  # Sub-account ID
+        else:
+            # Instance 2, 3, etc.: Paper trading only
+            default_mode = 'paper'
+            default_port = 7497  # Paper trading port
+            default_position_size = 100000  # 100k for paper
+            default_account = None
+        
+        # Allow environment variable overrides
+        trading_mode = os.environ.get('TRADING_MODE', default_mode)
+        ib_port = int(os.environ.get('IB_PORT', str(default_port)))
+        position_size = int(os.environ.get('POSITION_SIZE', str(default_position_size)))
+        account_id = os.environ.get('ACCOUNT_ID', default_account)
+        
+        # Validate live trading requirements
+        if trading_mode == 'live' and algo_instance != 1:
+            logger.warning(f"[CONFIG] Live trading requested for instance {algo_instance}, but only instance 1 supports live trading. Switching to paper mode.")
+            trading_mode = 'paper'
+            ib_port = 7497
+            account_id = None
+        
+        return {
+            'trading_mode': trading_mode,
+            'ib_port': ib_port,
+            'position_size': position_size,
+            'account_id': account_id,
+            'algo_instance': algo_instance
+        }
+
+    @classmethod
+    def create_with_instance_config(cls, **kwargs):
+        """Factory method to create bot with instance-specific configuration"""
+        # Get instance-specific config
+        instance_config = cls.get_instance_specific_config()
+        
+        # Override with any provided kwargs
+        config = {
+            'ib_host': os.environ.get('IB_HOST', '127.0.0.1'),
+            'ib_port': instance_config['ib_port'],
+            'client_id': int(os.environ.get('IB_CLIENT_ID', '6969')),
+            'api_url': os.environ.get('API_URL', 'http://localhost:5000/trade_signal'),
+            'position_size': instance_config['position_size'],
+            'trading_mode': instance_config['trading_mode'],
+            'account_id': instance_config['account_id'],
+            'algo_instance': instance_config['algo_instance']
+        }
+        
+        # Apply any explicit overrides
+        config.update(kwargs)
+        
+        return cls(**config)
 
     def setup_http_api(self):
         """Setup HTTP API endpoints for command handling"""
@@ -206,7 +286,7 @@ class EnhancedIBTradingBot:
         logger.info(f"[HTTP-API] HTTP API server started on port {self.http_port}")
 
     def connect_to_ib(self):
-        """Connect to IB with enhanced error handling"""
+        """Connect to IB with enhanced error handling and account support"""
         try:
             logger.info(f"Connecting to IB at {self.ib_host}:{self.ib_port} with clientId={self.client_id}")
             
@@ -222,6 +302,43 @@ class EnhancedIBTradingBot:
             if not self.ib.isConnected():
                 logger.error("[ERROR] Connection established but immediately lost")
                 return False
+            
+            # Double-check connection is actually working
+            try:
+                # Try to get server time as a connection test
+                server_time = self.ib.reqCurrentTime()
+                if server_time:
+                    logger.info(f"[OK] Connection verified - server time: {datetime.datetime.fromtimestamp(server_time)}")
+                else:
+                    logger.warning("[WARNING] Connected but cannot get server time")
+            except Exception as e:
+                logger.error(f"[ERROR] Connection test failed: {e}")
+                logger.error("[ERROR] Connection appears to be zombie state")
+                return False
+            
+            # Handle sub-account specification for live trading
+            if self.trading_mode == 'live' and self.account_id:
+                try:
+                    # Get all managed accounts (including sub-accounts)
+                    accounts = self.ib.managedAccounts()
+                    logger.info(f"[SUB-ACCOUNT] Available accounts: {accounts}")
+                    
+                    if self.account_id in accounts:
+                        logger.info(f"[SUB-ACCOUNT] ✅ Sub-account {self.account_id} found and accessible")
+                        logger.info(f"[SUB-ACCOUNT] All orders will be placed using sub-account: {self.account_id}")
+                        # Note: Sub-account will be specified on each order
+                    else:
+                        logger.error(f"[SUB-ACCOUNT] ❌ Sub-account {self.account_id} not found in available accounts: {accounts}")
+                        logger.error(f"[SUB-ACCOUNT] This may indicate:")
+                        logger.error(f"[SUB-ACCOUNT] 1. Sub-account {self.account_id} doesn't exist")
+                        logger.error(f"[SUB-ACCOUNT] 2. No permissions for sub-account {self.account_id}")
+                        logger.error(f"[SUB-ACCOUNT] 3. TWS not logged into the correct master account")
+                        logger.warning(f"[SUB-ACCOUNT] Will attempt to use default account - verify manually!")
+                        
+                except Exception as e:
+                    logger.error(f"[SUB-ACCOUNT] Error during sub-account validation: {e}")
+                    logger.error(f"[SUB-ACCOUNT] Continuing without sub-account specification")
+                    # Continue without account specification
             
             # Set up all event handlers
             self.ib.orderStatusEvent += self.on_order_status
@@ -239,7 +356,7 @@ class EnhancedIBTradingBot:
             
         except ConnectionRefusedError as e:
             logger.error(f"[ERROR] Connection refused - Check if TWS/Gateway is running on {self.ib_host}:{self.ib_port}")
-            logger.error(f"[ERROR] Also check: API connections enabled? Correct port? (7497 for paper, 7496 for live)")
+            logger.error(f"[ERROR] Also check: API connections enabled? Correct port? (7496 for live, 7497 for paper)")
             self.is_connected = False
             return False
         except Exception as e:
@@ -253,6 +370,18 @@ class EnhancedIBTradingBot:
         try:
             if not self.is_connected:
                 logger.error("[ERROR] Cannot setup market data - not connected to IB")
+                return False
+            
+            # Verify connection is actually working before setting up market data
+            try:
+                server_time = self.ib.reqCurrentTime()
+                if not server_time:
+                    logger.error("[ERROR] Connection appears broken - cannot get server time")
+                    self.is_connected = False
+                    return False
+            except Exception as e:
+                logger.error(f"[ERROR] Connection test failed during market data setup: {e}")
+                self.is_connected = False
                 return False
             
             self.contracts.clear()
@@ -499,7 +628,7 @@ class EnhancedIBTradingBot:
                 logger.error(f"[ERROR] Signal handling error: {e}")
 
     def place_order_with_retry(self, currency: str, action: str, intended_price: float, max_retries=3):
-        """Place order with retry logic"""
+        """Place order with retry logic and account specification"""
         for attempt in range(max_retries):
             try:
                 if not self.is_connected:
@@ -511,7 +640,14 @@ class EnhancedIBTradingBot:
                     logger.error(f"[ERROR] No contract for {currency}")
                     return
                 
+                # Create order with sub-account specification if needed
                 order = MarketOrder(action, self.position_size)
+                
+                # Set sub-account for live trading
+                if self.trading_mode == 'live' and self.account_id:
+                    order.account = self.account_id
+                    logger.info(f"[ORDER] Using sub-account: {self.account_id}")
+                
                 trade = self.ib.placeOrder(contract, order)
                 
                 self.pending_orders[trade.order.orderId] = {
@@ -519,10 +655,11 @@ class EnhancedIBTradingBot:
                     'action': action,
                     'intended_price': intended_price,
                     'quantity': self.position_size,
-                    'timestamp': datetime.datetime.now()
+                    'timestamp': datetime.datetime.now(),
+                    'sub_account': self.account_id if self.trading_mode == 'live' else 'paper'
                 }
                 
-                logger.info(f"[ORDER] Order placed: {action} {currency} at {intended_price}")
+                logger.info(f"[ORDER] Order placed: {action} {currency} at {intended_price} (Size: {self.position_size:,})")
                 return
                 
             except Exception as e:
@@ -740,35 +877,62 @@ class EnhancedIBTradingBot:
             for currency in self.recent_prices:
                 self.recent_prices[currency] = []
             
-            # Check current connection state
+            # Check current connection state AND data flow
             current_state = "unknown"
+            has_recent_data = False
+            
             try:
+                # Check connection state
                 current_state = "connected" if self.ib.isConnected() else "disconnected"
                 logger.info(f"[RECONNECT] Current IB state: {current_state}")
+                
+                # Check if we have recent data (within last 60 seconds)
+                current_time = datetime.datetime.now()
+                for currency, last_tick in self.last_tick_times.items():
+                    if last_tick and (current_time - last_tick).total_seconds() < 60:
+                        has_recent_data = True
+                        break
+                
+                logger.info(f"[RECONNECT] Recent data flowing: {has_recent_data}")
+                
             except Exception as e:
                 logger.error(f"[RECONNECT] Error checking connection state: {e}")
                 current_state = "error"
             
-            if current_state == "connected" or (current_state == "error" and self.is_connected):
-                logger.info("[RECONNECT] Already connected (or in ambiguous state) - refreshing market data...")
+            # Only trust "connected" state if we also have recent data
+            if current_state == "connected" and has_recent_data:
+                logger.info("[RECONNECT] Already connected with active data flow - refreshing market data...")
                 # Just refresh market data (fast mode for manual reconnect)
                 self.recover_market_data(fast_mode=True)
                 time.sleep(2)  # Reduced wait for market data to stabilize
             else:
-                logger.info("[RECONNECT] Not connected - attempting full reconnection...")
+                # Either disconnected OR zombie connection (connected but no data)
+                if current_state == "connected" and not has_recent_data:
+                    logger.warning("[RECONNECT] ZOMBIE CONNECTION DETECTED - Connected but no data flow!")
+                    logger.info("[RECONNECT] Forcing full reconnection with fresh IB instance...")
+                else:
+                    logger.info("[RECONNECT] Not connected - attempting full reconnection...")
                 
                 # Create a fresh IB instance to avoid state issues
                 try:
                     logger.info("[RECONNECT] Creating fresh IB instance...")
                     old_ib = self.ib
-                    self.ib = IB()
                     
-                    # Try to clean up old instance
+                    # Force disconnect and cleanup old instance
                     try:
-                        if old_ib.isConnected():
-                            old_ib.disconnect()
-                    except:
-                        pass
+                        logger.info("[RECONNECT] Forcing disconnect of old instance...")
+                        old_ib.disconnect()
+                        time.sleep(1)
+                    except Exception as e:
+                        logger.warning(f"[RECONNECT] Error disconnecting old instance: {e}")
+                    
+                    # Create new IB instance
+                    self.ib = IB()
+                    self.is_connected = False  # Reset connection flag
+                    
+                    # Clear all tickers and contracts
+                    self.tickers.clear()
+                    self.contracts.clear()
                     
                     time.sleep(1)  # Brief pause before reconnecting
                     
@@ -821,15 +985,33 @@ class EnhancedIBTradingBot:
             status_lines.append("\n[RECONNECT STATUS REPORT]")
             status_lines.append("=" * 50)
             
-            # Connection status
+            # Connection status with verification
+            connection_verified = False
             if self.is_connected:
-                status_lines.append("✅ Connection Status: CONNECTED")
+                # Double-check connection is real
+                try:
+                    server_time = self.ib.reqCurrentTime()
+                    if server_time:
+                        connection_verified = True
+                        status_lines.append("✅ Connection Status: CONNECTED (verified)")
+                    else:
+                        status_lines.append("⚠️ Connection Status: ZOMBIE (appears connected but not responding)")
+                except:
+                    status_lines.append("⚠️ Connection Status: ZOMBIE (connection test failed)")
             else:
                 status_lines.append("❌ Connection Status: DISCONNECTED")
+            
+            if not connection_verified and self.is_connected:
+                status_lines.append("\n⚠️ WARNING: Connection appears broken. Try RECONNECT again.")
+                status_lines.append("If problem persists, restart TWS/Gateway.")
+                status_lines.append("=" * 50)
+                return "\n".join(status_lines)
+            elif not self.is_connected:
                 status_lines.append("\nReconnection failed. Check TWS/Gateway connection.")
+                status_lines.append("=" * 50)
                 return "\n".join(status_lines)
             
-            # Check data flow
+            # Check data flow (only if connection verified)
             data_flowing = False
             current_time = datetime.datetime.now()
             
@@ -905,6 +1087,50 @@ class EnhancedIBTradingBot:
         except Exception as e:
             logger.error(f"[ERROR] Market data recovery failed: {e}")
 
+    def remember_positions(self):
+        """Save current positions to disk for restoration after restart."""
+        try:
+            data = {
+                'positions': self.positions,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            with open('remembered_positions.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info("[REMEMBER_POSITIONS] Positions saved to remembered_positions.json")
+            return "Positions remembered successfully."
+        except Exception as e:
+            logger.error(f"[REMEMBER_POSITIONS] Failed to save positions: {e}")
+            return f"Failed to remember positions: {e}"
+
+    def load_remembered_positions(self):
+        """Load positions from disk if present."""
+        try:
+            if os.path.exists('remembered_positions.json'):
+                with open('remembered_positions.json', 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                loaded = data.get('positions', {})
+                if isinstance(loaded, dict):
+                    for currency in self.positions:
+                        val = loaded.get(currency)
+                        if val in (None, 'long', 'short'):
+                            self.positions[currency] = val
+                    logger.info("[REMEMBER_POSITIONS] Positions loaded from remembered_positions.json: " + str(self.positions))
+                else:
+                    logger.warning("[REMEMBER_POSITIONS] Invalid format in remembered_positions.json")
+            else:
+                logger.info("[REMEMBER_POSITIONS] No remembered_positions.json found; starting fresh.")
+        except Exception as e:
+            logger.error(f"[REMEMBER_POSITIONS] Failed to load positions: {e}")
+
+    def clear_remembered_positions(self):
+        """Delete the remembered positions file after successful restart/close if desired."""
+        try:
+            if os.path.exists('remembered_positions.json'):
+                os.remove('remembered_positions.json')
+                logger.info("[REMEMBER_POSITIONS] remembered_positions.json deleted.")
+        except Exception as e:
+            logger.error(f"[REMEMBER_POSITIONS] Failed to delete remembered_positions.json: {e}")
+
     def start_command_listener(self):
         """Start command listener thread for runtime commands"""
         command_thread = threading.Thread(target=self.command_listener_loop, daemon=True)
@@ -912,10 +1138,16 @@ class EnhancedIBTradingBot:
         logger.info("[OK] Command listener started - available commands:")
         logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
         logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
+        logger.info("  SWITCH_LIVE - Switch to live trading (instance 1 only)")
+        logger.info("  SWITCH_PAPER - Switch to paper trading")
+        logger.info("  SET_ORDER_SIZE <amount> - Set position size")
         logger.info("  RECONNECT - Force reconnection to IB")
         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-        logger.info("  RESTART - Restart the server")
+        logger.info("  RESTART - Smart restart (skip warmup, load recent zones)")
+        logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
         logger.info("  STATUS - Show current positions and connection status")
+        logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
+        logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
 
     def command_listener_loop(self):
         """Listen for commands from stdin"""
@@ -974,6 +1206,65 @@ class EnhancedIBTradingBot:
                         else:
                             logger.warning(f"[COMMAND] Unknown currency in command: {command}")
                             
+                    elif command == "SWITCH_LIVE":
+                        # Switch to live trading mode
+                        if self.algo_instance != 1:
+                            logger.warning(f"[COMMAND] Live trading only supported on instance 1. Current instance: {self.algo_instance}")
+                        else:
+                            if self.trading_mode == 'live':
+                                logger.info(f"[COMMAND] Already in live trading mode (Sub-Account: {self.account_id})")
+                            else:
+                                # Update configuration
+                                self.trading_mode = 'live'
+                                self.ib_port = 7496  # Live trading port
+                                self.position_size = 10000  # 10k for live
+                                self.account_id = 'U12923979'
+                                
+                                logger.info(f"[COMMAND] Switching to LIVE trading mode (Sub-Account: {self.account_id})")
+                                logger.info(f"[COMMAND] New config: Port={self.ib_port}, Size={self.position_size:,}, Sub-Account={self.account_id}")
+                                
+                                # Reconnect with new settings
+                                result = self.handle_manual_reconnect()
+                                logger.info(f"[COMMAND] Switched to LIVE trading mode (Sub-Account: {self.account_id})\n{result}")
+                                logger.info("[COMMAND] Reconnection initiated for new settings.")
+
+                    elif command == "SWITCH_PAPER":
+                        # Switch to paper trading mode
+                        if self.trading_mode == 'paper':
+                            logger.info("[COMMAND] Already in paper trading mode")
+                        else:
+                            # Update configuration
+                            self.trading_mode = 'paper'
+                            self.ib_port = 7497  # Paper trading port
+                            self.position_size = 100000  # 100k for paper
+                            self.account_id = None
+                            
+                            logger.info(f"[COMMAND] Switching to PAPER trading mode (Size: {self.position_size:})")
+                            logger.info(f"[COMMAND] New config: Port={self.ib_port}, Size={self.position_size:,}")
+                            
+                            # Reconnect with new settings
+                            result = self.handle_manual_reconnect()
+                            logger.info(f"[COMMAND] Switched to PAPER trading mode\n{result}")
+                            logger.info("[COMMAND] Reconnection initiated for new settings.")
+
+                    elif command.startswith("SET_ORDER_SIZE "):
+                        # Set position size
+                        try:
+                            size_str = command.replace("SET_ORDER_SIZE ", "")
+                            new_size = int(size_str)
+                            
+                            if new_size <= 0:
+                                logger.warning(f"[COMMAND] Position size must be positive. Current: {self.position_size:,}")
+                            else:
+                                old_size = self.position_size
+                                self.position_size = new_size
+                                
+                                logger.info(f"[COMMAND] Position size changed from {old_size:,} to {new_size:,}")
+                                logger.info(f"[COMMAND] New position size: {self.position_size:,}")
+
+                        except ValueError:
+                            logger.warning(f"[COMMAND] Invalid position size format. Current: {self.position_size:,}")
+                            
                     elif command == "RECONNECT":
                         # Manual reconnection attempt
                         logger.info("[COMMAND] RECONNECT requested - attempting manual reconnection")
@@ -990,12 +1281,27 @@ class EnhancedIBTradingBot:
                             logger.error(f"[COMMAND] Failed to create skip flag: {e}")
                             
                     elif command == "RESTART":
-                        # Create restart flag and shutdown gracefully
-                        logger.info("[COMMAND] RESTART requested - creating restart flag")
+                        # Create smart restart flag and shutdown gracefully
+                        logger.info("[COMMAND] RESTART requested - creating smart restart flag")
                         try:
                             with open('restart_requested.flag', 'w') as f:
-                                f.write('1')
-                            logger.info("[COMMAND] Restart flag created - initiating shutdown")
+                                f.write('smart')
+                            logger.info("[COMMAND] Smart restart flag created - will skip warmup and load recent zones")
+                            # Signal shutdown
+                            self.shutdown_requested = True
+                            # Disconnect from IB to trigger clean exit
+                            if self.ib.isConnected():
+                                self.ib.disconnect()
+                        except Exception as e:
+                            logger.error(f"[COMMAND] Failed to create restart flag: {e}")
+                            
+                    elif command == "FULL_RESTART":
+                        # Create full restart flag and shutdown gracefully
+                        logger.info("[COMMAND] FULL_RESTART requested - creating full restart flag")
+                        try:
+                            with open('restart_requested.flag', 'w') as f:
+                                f.write('full')
+                            logger.info("[COMMAND] Full restart flag created - will perform complete warmup")
                             # Signal shutdown
                             self.shutdown_requested = True
                             # Disconnect from IB to trigger clean exit
@@ -1017,14 +1323,29 @@ class EnhancedIBTradingBot:
                                     logger.info(f"    {currency}: flat")
                         logger.info(f"  Pending orders: {len(self.pending_orders)}")
                         
+                    elif command == "REMEMBER_POSITIONS":
+                        # Save current positions to disk
+                        result = self.remember_positions()
+                        logger.info(f"[COMMAND] {result}")
+
+                    elif command == "CLEAR_REMEMBERED_POSITIONS":
+                        self.clear_remembered_positions()
+                        logger.info("[COMMAND] remembered_positions.json deleted.")
+
                     elif command == "HELP":
                         logger.info("[COMMAND] Available commands:")
                         logger.info("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position")
                         logger.info("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed") 
+                        logger.info("  SWITCH_LIVE - Switch to live trading (instance 1 only)")
+                        logger.info("  SWITCH_PAPER - Switch to paper trading")
+                        logger.info("  SET_ORDER_SIZE <amount> - Set position size")
                         logger.info("  RECONNECT - Force reconnection to IB")
                         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-                        logger.info("  RESTART - Restart the server")
+                        logger.info("  RESTART - Smart restart (skip warmup, load recent zones)")
+                        logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
                         logger.info("  STATUS - Show positions and connection")
+                        logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
+                        logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
                         logger.info("  HELP - Show this help")
                         
                     elif command:
@@ -1100,6 +1421,63 @@ class EnhancedIBTradingBot:
                 else:
                     return f"Unknown currency in command: {command}"
                     
+            elif command == "SWITCH_LIVE":
+                # Switch to live trading mode
+                if self.algo_instance != 1:
+                    return f"Live trading only supported on instance 1. Current instance: {self.algo_instance}"
+                
+                if self.trading_mode == 'live':
+                    return f"Already in live trading mode (Sub-Account: {self.account_id})"
+                
+                # Update configuration
+                self.trading_mode = 'live'
+                self.ib_port = 7496  # Live trading port
+                self.position_size = 10000  # 10k for live
+                self.account_id = 'U12923979'
+                
+                logger.info("[HTTP-COMMAND] Switching to LIVE trading mode")
+                logger.info(f"[HTTP-COMMAND] New config: Port={self.ib_port}, Size={self.position_size:,}, Account={self.account_id}")
+                
+                # Reconnect with new settings
+                result = self.handle_manual_reconnect()
+                return f"Switched to LIVE trading mode (Sub-Account: {self.account_id})\n{result}"
+                
+            elif command == "SWITCH_PAPER":
+                # Switch to paper trading mode
+                if self.trading_mode == 'paper':
+                    return "Already in paper trading mode"
+                
+                # Update configuration
+                self.trading_mode = 'paper'
+                self.ib_port = 7497  # Paper trading port
+                self.position_size = 100000  # 100k for paper
+                self.account_id = None
+                
+                logger.info("[HTTP-COMMAND] Switching to PAPER trading mode")
+                logger.info(f"[HTTP-COMMAND] New config: Port={self.ib_port}, Size={self.position_size:,}")
+                
+                # Reconnect with new settings
+                result = self.handle_manual_reconnect()
+                return f"Switched to PAPER trading mode\n{result}"
+                
+            elif command.startswith("SET_ORDER_SIZE "):
+                # Set position size
+                try:
+                    size_str = command.replace("SET_ORDER_SIZE ", "")
+                    new_size = int(size_str)
+                    
+                    if new_size <= 0:
+                        return "Position size must be positive"
+                    
+                    old_size = self.position_size
+                    self.position_size = new_size
+                    
+                    logger.info(f"[HTTP-COMMAND] Position size changed from {old_size:,} to {new_size:,}")
+                    return f"Position size changed from {old_size:,} to {new_size:,}"
+                    
+                except ValueError:
+                    return "Invalid position size format. Use: SET_ORDER_SIZE <number>"
+                    
             elif command == "RECONNECT":
                 # Manual reconnection attempt
                 logger.info("[HTTP-COMMAND] RECONNECT requested - attempting manual reconnection")
@@ -1118,18 +1496,35 @@ class EnhancedIBTradingBot:
                     return f"Failed to create skip flag: {e}"
                     
             elif command == "RESTART":
-                # Create restart flag and shutdown gracefully
-                logger.info("[HTTP-COMMAND] RESTART requested - creating restart flag")
+                # Create smart restart flag and shutdown gracefully
+                logger.info("[HTTP-COMMAND] RESTART requested - creating smart restart flag")
                 try:
                     with open('restart_requested.flag', 'w') as f:
-                        f.write('1')
-                    logger.info("[HTTP-COMMAND] Restart flag created - initiating shutdown")
+                        f.write('smart')
+                    logger.info("[HTTP-COMMAND] Smart restart flag created - will skip warmup and load recent zones")
                     # Signal shutdown
                     self.shutdown_requested = True
                     # Disconnect from IB to trigger clean exit
                     if self.ib.isConnected():
                         self.ib.disconnect()
-                    return "Restart flag created - initiating shutdown"
+                    return "Smart restart initiated - will skip warmup and load recent zones from database"
+                except Exception as e:
+                    logger.error(f"[HTTP-COMMAND] Failed to create restart flag: {e}")
+                    return f"Failed to create restart flag: {e}"
+                    
+            elif command == "FULL_RESTART":
+                # Create full restart flag and shutdown gracefully
+                logger.info("[HTTP-COMMAND] FULL_RESTART requested - creating full restart flag")
+                try:
+                    with open('restart_requested.flag', 'w') as f:
+                        f.write('full')
+                    logger.info("[HTTP-COMMAND] Full restart flag created - will perform complete warmup")
+                    # Signal shutdown
+                    self.shutdown_requested = True
+                    # Disconnect from IB to trigger clean exit
+                    if self.ib.isConnected():
+                        self.ib.disconnect()
+                    return "Full restart initiated - will perform complete warmup sequence"
                 except Exception as e:
                     logger.error(f"[HTTP-COMMAND] Failed to create restart flag: {e}")
                     return f"Failed to create restart flag: {e}"
@@ -1137,7 +1532,13 @@ class EnhancedIBTradingBot:
             elif command == "STATUS":
                 # Show current status
                 status_lines = []
+                status_lines.append(f"Instance: {self.algo_instance}")
+                status_lines.append(f"Trading Mode: {self.trading_mode.upper()}")
+                if self.trading_mode == 'live' and self.account_id:
+                    status_lines.append(f"Sub-Account: {self.account_id}")
+                status_lines.append(f"Position Size: {self.position_size:,}")
                 status_lines.append(f"Connected to IB: {self.is_connected}")
+                status_lines.append(f"IB Port: {self.ib_port}")
                 status_lines.append("Positions:")
                 with self.position_lock:
                     for currency, position in self.positions.items():
@@ -1151,14 +1552,28 @@ class EnhancedIBTradingBot:
                 logger.info(f"[HTTP-COMMAND] Status requested:\n{status_text}")
                 return status_text
                 
+            elif command == "REMEMBER_POSITIONS":
+                result = self.remember_positions()
+                return result
+
+            elif command == "CLEAR_REMEMBERED_POSITIONS":
+                self.clear_remembered_positions()
+                return "remembered_positions.json deleted."
+
             elif command == "HELP":
                 help_text = """Available commands:
   CLOSE_EURUSD/USDCAD/GBPUSD - Close position
   TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark as closed
+  SWITCH_LIVE - Switch to live trading (instance 1 only)
+  SWITCH_PAPER - Switch to paper trading
+  SET_ORDER_SIZE <amount> - Set position size
   RECONNECT - Force reconnection to IB
   SKIP_WARMUP - Skip warmup on next restart
-  RESTART - Restart the server
+  RESTART - Smart restart (skip warmup, load recent zones)
+  FULL_RESTART - Full restart (complete warmup sequence)
   STATUS - Show positions and connection
+  REMEMBER_POSITIONS - Save current positions to remembered_positions.json
+  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json
   HELP - Show this help"""
                 logger.info("[HTTP-COMMAND] Help requested")
                 return help_text
@@ -1244,24 +1659,16 @@ if __name__ == "__main__":
     
     # Log environment variables for debugging
     logger = logging.getLogger(__name__)
+    logger.info(f"ALGO_INSTANCE environment variable: {os.environ.get('ALGO_INSTANCE', '1')}")
+    logger.info(f"TRADING_MODE environment variable: {os.environ.get('TRADING_MODE', 'NOT SET')}")
     logger.info(f"IB_HOST environment variable: {os.environ.get('IB_HOST', 'NOT SET')}")
     logger.info(f"IB_PORT environment variable: {os.environ.get('IB_PORT', 'NOT SET')}")
+    logger.info(f"POSITION_SIZE environment variable: {os.environ.get('POSITION_SIZE', 'NOT SET')}")
+    logger.info(f"ACCOUNT_ID environment variable: {os.environ.get('ACCOUNT_ID', 'NOT SET')}")
     logger.info(f"Running in Docker: {'Yes' if os.environ.get('IB_HOST') == 'host.docker.internal' else 'No'}")
     
-    # Read configuration from environment variables (for Docker)
-    # Falls back to defaults if not in Docker
-    ib_host = os.environ.get('IB_HOST', '127.0.0.1')
-    ib_port = int(os.environ.get('IB_PORT', '7497'))
-    client_id = int(os.environ.get('IB_CLIENT_ID', '6969'))
+    # Create bot with instance-specific configuration
+    logger.info("Creating bot with instance-specific configuration...")
+    bot = EnhancedIBTradingBot.create_with_instance_config()
     
-    logger.info(f"Creating bot with host={ib_host}, port={ib_port}, clientId={client_id}")
-    
-    bot = EnhancedIBTradingBot(
-        ib_host=ib_host,
-        ib_port=ib_port,
-        client_id=client_id,
-        api_url=os.environ.get('API_URL', 'http://localhost:5000/trade_signal'),
-        position_size=int(os.environ.get('POSITION_SIZE', '100000'))
-    )
-    
-    bot.run()
+    bot.run() 
