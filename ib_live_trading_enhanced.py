@@ -119,6 +119,10 @@ class EnhancedIBTradingBot:
         self.price_throttle_seconds = 0.5  # 500ms = 2/second
         self.last_price_send_times = {currency: datetime.datetime.min for currency in self.currency_pairs.keys()}
         
+        # Market data subscription timing
+        self.market_data_subscribe_delay = 1.0  # Delay between subscribing to each currency
+        self.market_data_verify_timeout = 3.0   # How long to wait for data verification
+        
         # Thread lock
         self.position_lock = threading.Lock()
         
@@ -303,6 +307,15 @@ class EnhancedIBTradingBot:
                 logger.error("[ERROR] Connection established but immediately lost")
                 return False
             
+            # Wait for API to be ready
+            start_time = time.time()
+            while time.time() - start_time < 5:
+                if hasattr(self.ib, 'client') and self.ib.client and self.ib.client.isReady():
+                    break
+                time.sleep(0.1)
+            else:
+                logger.warning("[WARNING] API not ready after 5 seconds")
+            
             # Double-check connection is actually working
             try:
                 # Try to get server time as a connection test
@@ -387,6 +400,9 @@ class EnhancedIBTradingBot:
             self.contracts.clear()
             self.tickers.clear()
             
+            # Wait a bit after clearing to ensure clean state
+            time.sleep(0.5)
+            
             for api_currency, ib_currency in self.currency_pairs.items():
                 try:
                     # Try standard symbol format first, fallback to base/quote
@@ -404,15 +420,36 @@ class EnhancedIBTradingBot:
                             raise Exception(f"Unknown currency pair: {ib_currency}")
                     
                     self.contracts[api_currency] = contract
+                    
+                    logger.info(f"[MARKET_DATA] Subscribing to {api_currency}...")
                     ticker = self.ib.reqMktData(contract, '', False, False)
                     self.tickers[api_currency] = ticker
                     
-                    logger.info(f"[OK] Market data: {api_currency}")
-                    time.sleep(0.2)  # Reduced from 0.5s to speed up setup
+                    # Wait longer between subscriptions to avoid overwhelming TWS
+                    logger.info(f"[MARKET_DATA] Waiting {self.market_data_subscribe_delay}s for {api_currency} subscription to stabilize...")
+                    time.sleep(self.market_data_subscribe_delay)
+                    
+                    # Verify the ticker is actually receiving data
+                    verify_start = time.time()
+                    data_received = False
+                    while time.time() - verify_start < self.market_data_verify_timeout:
+                        self.ib.sleep(0.1)
+                        if ticker.bid and ticker.ask and not util.isNan(ticker.bid) and not util.isNan(ticker.ask):
+                            spread = ticker.ask - ticker.bid
+                            logger.info(f"[OK] Market data verified: {api_currency} (bid: {ticker.bid:.5f}, ask: {ticker.ask:.5f}, spread: {spread:.5f})")
+                            data_received = True
+                            break
+                    
+                    if not data_received:
+                        logger.warning(f"[WARNING] No immediate data for {api_currency} after {self.market_data_verify_timeout} seconds, continuing anyway")
+                        logger.warning(f"[WARNING] This might indicate market closed or data subscription issue")
                     
                 except Exception as contract_error:
                     logger.error(f"[ERROR] Failed to setup {api_currency}: {contract_error}")
                     return False
+            
+            # Final wait to let all subscriptions stabilize
+            time.sleep(1)
             
             logger.info("[OK] Market data setup complete")
             return True
@@ -423,17 +460,40 @@ class EnhancedIBTradingBot:
 
     def on_disconnected(self):
         """Handle disconnection with automatic reconnection"""
-        logger.warning("[RECONNECT] IB disconnected - starting reconnection")
+        logger.warning("[DISCONNECT] IB disconnected")
         self.is_connected = False
         
+        # Don't start automatic reconnection immediately - wait to see if manual reconnect is requested
         if not self.shutdown_requested:
-            threading.Thread(target=self.handle_reconnection, daemon=True).start()
+            def delayed_reconnect():
+                time.sleep(5)  # Wait 5 seconds before starting automatic reconnection
+                if not self.shutdown_requested and not self.is_connected:
+                    logger.info("[RECONNECT] Starting automatic reconnection after disconnect")
+                    self.handle_reconnection()
+            
+            threading.Thread(target=delayed_reconnect, daemon=True).start()
 
     def handle_reconnection(self):
         """Automatic reconnection with exponential backoff"""
-        while (not self.is_connected and 
-               not self.shutdown_requested and 
+        while (not self.shutdown_requested and 
                self.reconnection_attempts < self.max_reconnection_attempts):
+            
+            # Check if we're actually connected AND receiving data
+            if self.is_connected:
+                # Verify we're receiving data
+                current_time = datetime.datetime.now()
+                has_recent_data = False
+                for currency, last_tick in self.last_tick_times.items():
+                    if last_tick and (current_time - last_tick).total_seconds() < 60:
+                        has_recent_data = True
+                        break
+                
+                if has_recent_data:
+                    logger.info("[RECONNECT] Connection restored and data flowing")
+                    return
+                else:
+                    logger.warning("[RECONNECT] Connected but no data - treating as disconnected")
+                    self.is_connected = False
             
             self.reconnection_attempts += 1
             wait_time = min(5 * (2 ** (self.reconnection_attempts - 1)), 300)
@@ -441,14 +501,41 @@ class EnhancedIBTradingBot:
             logger.info(f"[RECONNECT] Attempt {self.reconnection_attempts}/{self.max_reconnection_attempts} in {wait_time}s")
             time.sleep(wait_time)
             
+            if self.shutdown_requested:
+                logger.info("[RECONNECT] Shutdown requested, stopping reconnection")
+                return
+            
             try:
+                # Try with incremented client ID to avoid conflicts
+                temp_client_id = self.client_id
+                self.client_id = self.client_id + self.reconnection_attempts * 10
+                
                 if self.connect_to_ib():
                     time.sleep(2)
                     if self.setup_market_data():
                         logger.info("[OK] Reconnection successful!")
-                        return
+                        # Wait to verify data is actually flowing
+                        time.sleep(3)
+                        current_time = datetime.datetime.now()
+                        has_data = False
+                        for currency, last_tick in self.last_tick_times.items():
+                            if last_tick and (current_time - last_tick).total_seconds() < 5:
+                                has_data = True
+                                break
+                        
+                        if has_data:
+                            logger.info("[OK] Data flow confirmed after reconnection")
+                            return
+                        else:
+                            logger.error("[ERROR] No data flow after reconnection - zombie connection")
+                            self.is_connected = False
+                            self.ib.disconnect()
                     else:
                         self.is_connected = False
+                        
+                # Restore original client ID if failed
+                self.client_id = temp_client_id
+                
             except Exception as e:
                 logger.error(f"[ERROR] Reconnection failed: {e}")
         
@@ -865,10 +952,101 @@ class EnhancedIBTradingBot:
         else:
             threading.Thread(target=self.recover_market_data, daemon=True).start()
 
+    def force_disconnect_all_clients(self):
+        """Force disconnect all IB client connections to resolve conflicts"""
+        try:
+            logger.info("[FORCE_DISCONNECT] Starting force disconnect of all IB clients...")
+            result_lines = []
+            result_lines.append("Force Disconnecting All IB Client Connections")
+            result_lines.append("=" * 50)
+            
+            # Common client IDs that might be in use
+            client_ids_to_try = [
+                self.client_id,  # Current client ID
+                6969,  # Default
+                7069, 7169, 7269,  # Common incremented versions
+                1, 2, 3,  # Low numbers
+            ]
+            
+            # Add time-based IDs that might have been generated
+            base_time = int(time.time()) % 1000
+            for offset in range(0, 100, 10):
+                client_ids_to_try.append(6969 + base_time + offset)
+                client_ids_to_try.append(self.client_id + offset)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_ids = []
+            for id in client_ids_to_try:
+                if id not in seen and id > 0 and id < 32767:
+                    seen.add(id)
+                    unique_ids.append(id)
+            client_ids_to_try = unique_ids[:20]  # Limit to 20 attempts
+            
+            disconnected_count = 0
+            current_ib = self.ib  # Save current IB instance
+            
+            for client_id in client_ids_to_try:
+                try:
+                    # Skip if it's our current active connection
+                    if client_id == self.client_id and self.is_connected and self.ib.isConnected():
+                        result_lines.append(f"ClientId {client_id}: Skipped (current active connection)")
+                        continue
+                    
+                    # Create temporary IB instance for this attempt
+                    temp_ib = IB()
+                    
+                    # Try to connect with short timeout
+                    logger.info(f"[FORCE_DISCONNECT] Attempting to clear clientId {client_id}...")
+                    temp_ib.connect(self.ib_host, self.ib_port, clientId=client_id, timeout=2)
+                    
+                    if temp_ib.isConnected():
+                        result_lines.append(f"ClientId {client_id}: Connected! Disconnecting...")
+                        temp_ib.disconnect()
+                        disconnected_count += 1
+                        time.sleep(0.5)
+                    else:
+                        result_lines.append(f"ClientId {client_id}: Not in use")
+                        
+                except Exception as e:
+                    error_str = str(e)
+                    if "already in use" in error_str:
+                        result_lines.append(f"ClientId {client_id}: In use by another process")
+                    elif "timeout" in error_str.lower():
+                        pass  # Silently skip timeouts, they're expected
+                    else:
+                        logger.debug(f"[FORCE_DISCONNECT] Error with clientId {client_id}: {e}")
+            
+            result_lines.append("=" * 50)
+            result_lines.append(f"Disconnected {disconnected_count} zombie connections")
+            
+            if disconnected_count > 0:
+                result_lines.append("\n✅ Success! Wait 5 seconds before reconnecting.")
+                result_lines.append("This gives TWS time to fully release the connections.")
+            else:
+                result_lines.append("\n✅ No zombie connections found.")
+                result_lines.append("If you still have issues, try:")
+                result_lines.append("1. In TWS: File → Global Configuration → API → Disconnect All")
+                result_lines.append("2. Restart TWS")
+            
+            result = "\n".join(result_lines)
+            logger.info(f"[FORCE_DISCONNECT] {result}")
+            return result
+            
+        except Exception as e:
+            error_msg = f"[FORCE_DISCONNECT] Error during force disconnect: {e}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+
     def handle_manual_reconnect(self):
         """Handle manual RECONNECT command with status reporting"""
         try:
             logger.info("[RECONNECT] Starting manual reconnection process...")
+            
+            # Stop any ongoing automatic reconnection
+            self.shutdown_requested = True
+            time.sleep(0.5)
+            self.shutdown_requested = False
             
             # Reset reconnection attempts counter
             self.reconnection_attempts = 0
@@ -930,9 +1108,25 @@ class EnhancedIBTradingBot:
                     self.ib = IB()
                     self.is_connected = False  # Reset connection flag
                     
-                    # Clear all tickers and contracts
+                    # Clear all market data references
+                    # Cancel any existing market data subscriptions first
+                    for currency, ticker in list(self.tickers.items()):
+                        try:
+                            if hasattr(ticker, 'contract'):
+                                logger.info(f"[RECONNECT] Cancelling old market data for {currency}")
+                                # Don't use self.ib here as we just created a new instance
+                                # The old subscriptions are orphaned anyway
+                        except Exception as e:
+                            logger.warning(f"[RECONNECT] Error cancelling old ticker for {currency}: {e}")
+                    
+                    # Now clear all references
                     self.tickers.clear()
                     self.contracts.clear()
+                    self.last_tick_times.clear()
+                    
+                    # Reset last tick times
+                    for currency in self.currency_pairs.keys():
+                        self.last_tick_times[currency] = None
                     
                     time.sleep(1)  # Brief pause before reconnecting
                     
@@ -945,11 +1139,36 @@ class EnhancedIBTradingBot:
                 # Attempt full reconnection with retry on different client IDs
                 connected = False
                 original_client_id = self.client_id
-                client_ids_to_try = [self.client_id, self.client_id + 100, self.client_id + 200, 1]  # Try alternatives
                 
-                for attempt_id in client_ids_to_try:
+                # Generate unique client IDs based on current time to avoid conflicts
+                base_id = self.client_id
+                timestamp_offset = int(time.time()) % 1000  # Use last 3 digits of timestamp
+                client_ids_to_try = [
+                    base_id,
+                    base_id + timestamp_offset,
+                    base_id + 100 + (timestamp_offset % 100),
+                    6969 + (int(time.time()) % 30)  # Fallback with time-based offset
+                ]
+                
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_ids = []
+                for id in client_ids_to_try:
+                    if id not in seen and id > 0 and id < 32767:  # Valid client ID range
+                        seen.add(id)
+                        unique_ids.append(id)
+                client_ids_to_try = unique_ids
+                
+                logger.info(f"[RECONNECT] Will try client IDs: {client_ids_to_try}")
+                
+                for attempt_num, attempt_id in enumerate(client_ids_to_try):
                     self.client_id = attempt_id
-                    logger.info(f"[RECONNECT] Attempting connection with clientId={self.client_id}")
+                    logger.info(f"[RECONNECT] Attempt {attempt_num + 1}/{len(client_ids_to_try)} with clientId={self.client_id}")
+                    
+                    # Extra wait between attempts to let TWS release the client ID
+                    if attempt_num > 0:
+                        logger.info("[RECONNECT] Waiting 3 seconds for TWS to release previous client ID...")
+                        time.sleep(3)
                     
                     if self.connect_to_ib():
                         connected = True
@@ -957,20 +1176,36 @@ class EnhancedIBTradingBot:
                         break
                     else:
                         logger.warning(f"[RECONNECT] Failed with clientId={self.client_id}")
-                        time.sleep(1)
                 
                 # Restore original ID if all attempts failed
                 if not connected:
                     self.client_id = original_client_id
-                    # Get more specific error info
-                    error_msg = "[RECONNECT] Failed to connect to IB.\n"
-                    error_msg += "Troubleshooting:\n"
-                    error_msg += f"1. Check TWS/Gateway is running on port {self.ib_port}\n"
-                    error_msg += "2. Verify API connections are enabled in TWS (File > Global Configuration > API > Settings)\n"
-                    error_msg += f"3. Tried client IDs: {client_ids_to_try} - all failed\n"
-                    error_msg += "4. Try restarting TWS/Gateway\n"
-                    error_msg += "Check ib_trading_enhanced.log for detailed error messages."
-                    return error_msg
+                    
+                    # Check if it's likely a client ID conflict issue
+                    logger.info("[RECONNECT] All client ID attempts failed - checking for zombie connections...")
+                    force_disconnect_result = self.force_disconnect_all_clients()
+                    
+                    if "Disconnected" in force_disconnect_result and "zombie connections" in force_disconnect_result:
+                        # We found and cleared some zombie connections, try one more time
+                        logger.info("[RECONNECT] Cleared zombie connections, waiting 5 seconds and trying again...")
+                        time.sleep(5)
+                        
+                        # Try once more with the original client ID
+                        self.client_id = original_client_id
+                        if self.connect_to_ib():
+                            connected = True
+                            logger.info(f"[RECONNECT] Successfully connected after clearing zombies with clientId={self.client_id}")
+                    
+                    if not connected:
+                        # Get more specific error info
+                        error_msg = "[RECONNECT] Failed to connect to IB.\n"
+                        error_msg += "Troubleshooting:\n"
+                        error_msg += f"1. Check TWS/Gateway is running on port {self.ib_port}\n"
+                        error_msg += "2. Verify API connections are enabled in TWS (File > Global Configuration > API > Settings)\n"
+                        error_msg += f"3. Tried client IDs: {client_ids_to_try} - all failed\n"
+                        error_msg += "4. Try restarting TWS/Gateway\n"
+                        error_msg += "Check ib_trading_enhanced.log for detailed error messages."
+                        return error_msg
                 
                 time.sleep(2)
                 
@@ -1142,6 +1377,7 @@ class EnhancedIBTradingBot:
         logger.info("  SWITCH_PAPER - Switch to paper trading")
         logger.info("  SET_ORDER_SIZE <amount> - Set position size")
         logger.info("  RECONNECT - Force reconnection to IB")
+        logger.info("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
         logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
@@ -1344,6 +1580,7 @@ class EnhancedIBTradingBot:
                         logger.info("  SWITCH_PAPER - Switch to paper trading")
                         logger.info("  SET_ORDER_SIZE <amount> - Set position size")
                         logger.info("  RECONNECT - Force reconnection to IB")
+                        logger.info("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
                         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
                         logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
                         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
@@ -1538,23 +1775,85 @@ class EnhancedIBTradingBot:
                     return f"Failed to create restart flag: {e}"
                     
             elif command == "STATUS":
-                # Show current status
+                # Show current status with enhanced detail
                 status_lines = []
+                status_lines.append("=" * 50)
                 status_lines.append(f"Instance: {self.algo_instance}")
                 status_lines.append(f"Trading Mode: {self.trading_mode.upper()}")
                 if self.trading_mode == 'live' and self.account_id:
                     status_lines.append(f"Sub-Account: {self.account_id}")
                 status_lines.append(f"Position Size: {self.position_size:,}")
-                status_lines.append(f"Connected to IB: {self.is_connected}")
                 status_lines.append(f"IB Port: {self.ib_port}")
-                status_lines.append("Positions:")
+                status_lines.append(f"Client ID: {self.client_id}")
+                
+                # Connection status with verification
+                connection_status = "UNKNOWN"
+                if self.is_connected:
+                    try:
+                        # Double-check connection
+                        if self.ib.isConnected():
+                            # Try to get server time to verify
+                            try:
+                                server_time = self.ib.reqCurrentTime()
+                                if server_time:
+                                    connection_status = "CONNECTED (verified)"
+                                else:
+                                    connection_status = "ZOMBIE (no response)"
+                            except:
+                                connection_status = "ZOMBIE (error)"
+                        else:
+                            connection_status = "DISCONNECTED"
+                            self.is_connected = False
+                    except:
+                        connection_status = "ERROR"
+                else:
+                    connection_status = "DISCONNECTED"
+                
+                status_lines.append(f"Connection: {connection_status}")
+                
+                # Data flow status
+                status_lines.append("\nMarket Data Flow:")
+                current_time = datetime.datetime.now()
+                data_flowing = False
+                
+                for currency in self.currency_pairs.keys():
+                    last_tick = self.last_tick_times.get(currency)
+                    if last_tick:
+                        seconds_ago = (current_time - last_tick).total_seconds()
+                        if seconds_ago < 60:
+                            status_lines.append(f"  {currency}: ✅ Active ({seconds_ago:.0f}s ago)")
+                            data_flowing = True
+                        elif seconds_ago < 300:
+                            status_lines.append(f"  {currency}: ⚠️  Stale ({seconds_ago:.0f}s ago)")
+                        else:
+                            status_lines.append(f"  {currency}: ❌ Dead ({seconds_ago:.0f}s ago)")
+                    else:
+                        status_lines.append(f"  {currency}: ❌ Never received")
+                
+                # Overall health
+                if connection_status == "CONNECTED (verified)" and data_flowing:
+                    status_lines.append("\nOverall Status: ✅ HEALTHY")
+                elif connection_status == "CONNECTED (verified)" and not data_flowing:
+                    status_lines.append("\nOverall Status: ⚠️  ZOMBIE CONNECTION")
+                else:
+                    status_lines.append("\nOverall Status: ❌ NOT CONNECTED")
+                
+                # Positions
+                status_lines.append("\nPositions:")
                 with self.position_lock:
                     for currency, position in self.positions.items():
                         if position:
                             status_lines.append(f"  {currency}: {position}")
                         else:
                             status_lines.append(f"  {currency}: flat")
-                status_lines.append(f"Pending orders: {len(self.pending_orders)}")
+                
+                status_lines.append(f"\nPending orders: {len(self.pending_orders)}")
+                
+                # Reconnection status
+                if self.reconnection_attempts > 0:
+                    status_lines.append(f"Reconnection attempts: {self.reconnection_attempts}/{self.max_reconnection_attempts}")
+                
+                status_lines.append("=" * 50)
                 
                 status_text = "\n".join(status_lines)
                 logger.info(f"[HTTP-COMMAND] Status requested:\n{status_text}")
@@ -1567,6 +1866,11 @@ class EnhancedIBTradingBot:
             elif command == "CLEAR_REMEMBERED_POSITIONS":
                 self.clear_remembered_positions()
                 return "remembered_positions.json deleted."
+                
+            elif command == "FORCE_DISCONNECT":
+                # Force disconnect all zombie client connections
+                result = self.force_disconnect_all_clients()
+                return result
 
             elif command == "HELP":
                 help_text = """Available commands:
@@ -1576,12 +1880,14 @@ class EnhancedIBTradingBot:
   SWITCH_PAPER - Switch to paper trading
   SET_ORDER_SIZE <amount> - Set position size
   RECONNECT - Force reconnection to IB
+  FORCE_DISCONNECT - Force disconnect all zombie IB connections
   SKIP_WARMUP - Skip warmup on next restart
   RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)
   FULL_RESTART - Full restart (complete warmup sequence)
   STATUS - Show positions and connection
   REMEMBER_POSITIONS - Save current positions to remembered_positions.json
   CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json
+  FORCE_DISCONNECT - Force disconnect all zombie IB connections
   HELP - Show this help"""
                 logger.info("[HTTP-COMMAND] Help requested")
                 return help_text

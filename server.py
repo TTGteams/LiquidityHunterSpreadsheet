@@ -495,16 +495,29 @@ def monitor_ib_process():
     """
     global ib_process
     
+    restart_count = 0
+    max_restarts = 5
+    
     while ib_process is not None:
         try:
             # Check if process is still running
             if ib_process.poll() is not None:
-                debug_logger.warning("IB Live Trading process has stopped")
+                exit_code = ib_process.returncode
+                debug_logger.warning(f"IB Live Trading process has stopped with exit code: {exit_code}")
                 
-                # Wait a moment before restarting
-                time.sleep(5)
+                restart_count += 1
+                if restart_count > max_restarts:
+                    debug_logger.error(f"IB process crashed {max_restarts} times, giving up")
+                    trade_logger.error("IB Live Trading failed to start after multiple attempts")
+                    ib_process = None
+                    break
                 
-                debug_logger.info("Restarting IB Live Trading...")
+                # Wait longer between restart attempts
+                wait_time = min(5 * restart_count, 30)
+                debug_logger.info(f"Waiting {wait_time} seconds before restart attempt {restart_count}/{max_restarts}...")
+                time.sleep(wait_time)
+                
+                debug_logger.info(f"Restarting IB Live Trading (attempt {restart_count}/{max_restarts})...")
                 start_ib_live_trading()
                 break
             
@@ -512,11 +525,15 @@ def monitor_ib_process():
             try:
                 line = ib_process.stdout.readline()
                 if line:
-                    debug_logger.info(f"IB: {line.strip()}")
+                    line_stripped = line.strip()
+                    # Log important messages to trade logger too
+                    if any(keyword in line_stripped for keyword in ['[ERROR]', '[OK]', '[RECONNECT]', 'Connected', 'Disconnected']):
+                        trade_logger.info(f"IB: {line_stripped}")
+                    debug_logger.info(f"IB: {line_stripped}")
             except:
                 pass
             
-            time.sleep(1)
+            time.sleep(0.5)  # Reduce sleep for more responsive monitoring
             
         except Exception as e:
             debug_logger.error(f"Error monitoring IB process: {e}")
@@ -848,6 +865,7 @@ if __name__ == '__main__':
     print("  SWITCH_PAPER - Switch to paper trading")
     print("  SET_ORDER_SIZE <amount> - Set position size (e.g., SET_ORDER_SIZE 50000)")
     print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
+    print("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
     print("  SKIP_WARMUP - Skip warmup on next restart")
     print("  RESTART - Smart restart (skip warmup, load recent zones)")
     print("  FULL_RESTART - Full restart (complete warmup sequence)")
