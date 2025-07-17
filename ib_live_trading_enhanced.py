@@ -308,7 +308,7 @@ class EnhancedIBTradingBot:
                 # Try to get server time as a connection test
                 server_time = self.ib.reqCurrentTime()
                 if server_time:
-                    logger.info(f"[OK] Connection verified - server time: {datetime.datetime.fromtimestamp(server_time)}")
+                    logger.info(f"[OK] Connection verified - server time: {server_time}")
                 else:
                     logger.warning("[WARNING] Connected but cannot get server time")
             except Exception as e:
