@@ -177,6 +177,10 @@ def load_preexisting_bars_and_indicators(precomputed_bars_df, currency="EUR.USD"
         bars[currency] = pd.DataFrame(columns=["open", "high", "low", "close"])
         
     bars[currency] = precomputed_bars_df.copy()
+    
+    # Clean any duplicate timestamps after loading
+    bars[currency] = clean_duplicate_bars(bars[currency], currency)
+    
     debug_logger.info(f"Loaded {len(bars[currency])} bars for {currency}")
 
 # --------------------------------------------------------------------------
@@ -324,6 +328,24 @@ def log_zone_status(location="", currency="EUR.USD", force_detailed=False):
 # --------------------------------------------------------------------------
 # INCREMENTAL BAR UPDATING
 # --------------------------------------------------------------------------
+def clean_duplicate_bars(bars_df, currency="EUR.USD"):
+    """
+    Remove duplicate timestamps from bars DataFrame, keeping the most recent one.
+    This prevents the 'cannot reindex on an axis with duplicate labels' error.
+    """
+    if bars_df.empty or not bars_df.index.duplicated().any():
+        return bars_df
+    
+    # Count duplicates before cleaning
+    duplicate_count = bars_df.index.duplicated().sum()
+    debug_logger.warning(f"Found {duplicate_count} duplicate bar timestamps for {currency}. Cleaning...")
+    
+    # Keep last occurrence of each timestamp (most recent data)
+    cleaned_df = bars_df[~bars_df.index.duplicated(keep='last')]
+    
+    debug_logger.info(f"Removed {duplicate_count} duplicate bars for {currency}")
+    return cleaned_df
+
 def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
     """
     Updates bar data with a new price tick. If the tick is in a new 15-min period,
@@ -380,6 +402,11 @@ def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
         if not isinstance(bars[currency].index, pd.DatetimeIndex):
             bars[currency].index = pd.to_datetime(bars[currency].index)
 
+        # Remove any existing bar at this timestamp to prevent duplicates
+        if current_bar_start[currency] in bars[currency].index:
+            debug_logger.warning(f"Duplicate bar timestamp detected for {currency} at {current_bar_start[currency]}. Replacing with new bar data.")
+            bars[currency] = bars[currency].drop(current_bar_start[currency])
+
         bars[currency].loc[current_bar_start[currency]] = current_bar_data[currency]
         
         bar_count = len(bars[currency])
@@ -389,6 +416,9 @@ def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
 
         # If we have at least 35 bars, calculate indicators
         if bar_count >= 35:
+            # Clean any duplicate timestamps before calculating indicators
+            bars[currency] = clean_duplicate_bars(bars[currency], currency)
+            
             rolling_window_data = bars[currency].tail(384).copy()
             close_series = rolling_window_data["close"].dropna()
             if len(close_series) >= 35:
