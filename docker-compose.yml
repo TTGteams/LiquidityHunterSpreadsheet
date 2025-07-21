@@ -27,7 +27,7 @@ services:
       # Sub-account configuration (for live trading)
       # Only used when TRADING_MODE=live and ALGO_INSTANCE=1
       # This connects to sub-account U12923979 within the live trading account
-      ACCOUNT_ID: "U12923979"
+      ACCOUNT_ID: "U11134039"
       
       # Position size configuration
       # Default: 10k for live trading, 100k for paper trading
