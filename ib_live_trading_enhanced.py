@@ -172,7 +172,7 @@ class EnhancedIBTradingBot:
             # Instance 1: Live trading capable with sub-account
             default_mode = 'live'
             default_port = 7496  # Live trading port
-            default_position_size = 10000  # 10k for live
+            default_position_size = 1000  # 10k for live
             default_account = 'U11134039'  # Sub-account ID
         else:
             # Instance 2, 3, etc.: Paper trading only

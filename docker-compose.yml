@@ -32,7 +32,7 @@ services:
       # Position size configuration
       # Default: 10k for live trading, 100k for paper trading
       # Can be overridden with SET_ORDER_SIZE command
-      POSITION_SIZE: "10000"  # Set to 10k for live, 100k for paper
+      POSITION_SIZE: "1000"  # Set to 1k for live, 100k for paper
       #########################################
       
       # Database configuration (can be overridden via env file)
