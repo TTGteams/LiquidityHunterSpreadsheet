@@ -26,6 +26,7 @@ import pyodbc
 import sys
 import concurrent.futures
 import threading
+import os # Added for os.environ
 
 # Test configuration - Define early so logging can reference these
 API_URL = "http://localhost:5000/trade_signal"
@@ -120,6 +121,16 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=50000):
         if conn is None:
             return pd.DataFrame()
         
+        # Log connection details for debugging
+        instance = os.environ.get('ALGO_INSTANCE', 'UNKNOWN')
+        logger.info(f"[INSTANCE {instance}] Connection established to TTG database")
+        
+        # Get server info to verify we're connected to the same server
+        cursor = conn.cursor()
+        cursor.execute("SELECT @@SERVERNAME AS ServerName, @@VERSION AS Version")
+        server_info = cursor.fetchone()
+        logger.info(f"[INSTANCE {instance}] Connected to server: {server_info.ServerName if server_info else 'UNKNOWN'}")
+        
         # Query to get the most recent prices in chronological order
         query = f"""
         SELECT [BarDateTime], [Close]
@@ -132,7 +143,8 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=50000):
         ORDER BY [BarDateTime] ASC
         """
         
-        logger.info(f"Fetching {limit:,} most recent {currency_pair} prices from TTG database...")
+        logger.info(f"[INSTANCE {instance}] Fetching {limit:,} most recent {currency_pair} prices from TTG database...")
+        logger.info(f"[INSTANCE {instance}] Query: {query}")
         
         # Execute query and load into DataFrame
         df = pd.read_sql(query, conn)
@@ -143,11 +155,15 @@ def fetch_historical_data(currency_pair="EUR.USD", limit=50000):
         # Convert Time column to datetime
         df['Time'] = pd.to_datetime(df['Time'])
         
-        logger.info(f"Successfully fetched {len(df):,} price records for {currency_pair}")
+        logger.info(f"[INSTANCE {instance}] Successfully fetched {len(df):,} price records for {currency_pair}")
         
         if not df.empty:
-            logger.info(f"Date range: {df['Time'].min()} to {df['Time'].max()}")
-            logger.info(f"Price range: {df['Price'].min():.5f} to {df['Price'].max():.5f}")
+            logger.info(f"[INSTANCE {instance}] Date range: {df['Time'].min()} to {df['Time'].max()}")
+            logger.info(f"[INSTANCE {instance}] Price range: {df['Price'].min():.5f} to {df['Price'].max():.5f}")
+            
+            # Log first and last few records for comparison
+            logger.info(f"[INSTANCE {instance}] First record: {df.iloc[0]['Time']} - {df.iloc[0]['Price']:.5f}")
+            logger.info(f"[INSTANCE {instance}] Last record: {df.iloc[-1]['Time']} - {df.iloc[-1]['Price']:.5f}")
         
         return df
         
