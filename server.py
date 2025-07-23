@@ -190,6 +190,10 @@ def execute_command():
                 
         elif command == 'RESTART':
             try:
+                # Enable live trading mode and save current signal state before restart
+                algorithm.is_live_trading_mode = True
+                algorithm.save_algorithm_signal_state()
+                
                 # Create smart restart flag - skips warmup and loads recent zones
                 with open('restart_requested.flag', 'w') as f:
                     f.write('smart')
@@ -208,6 +212,10 @@ def execute_command():
         
         elif command == 'FULL_RESTART':
             try:
+                # Enable live trading mode and save current signal state before restart
+                algorithm.is_live_trading_mode = True
+                algorithm.save_algorithm_signal_state()
+                
                 # Create full restart flag - performs complete warmup
                 with open('restart_requested.flag', 'w') as f:
                     f.write('full')
@@ -663,6 +671,11 @@ def run_post_startup_warmup():
             
             debug_logger.info("Post-startup warmup completed successfully")
             trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
+            
+            # Reset trading state to start fresh for live trading
+            # This ensures no backtest trades affect live trading
+            debug_logger.info("Resetting trading state for fresh live trading start...")
+            algorithm.reset_trading_state_for_live_trading()
             
             # Now start IB live trading
             start_ib_live_trading()

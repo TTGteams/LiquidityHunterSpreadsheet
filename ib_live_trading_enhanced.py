@@ -172,7 +172,7 @@ class EnhancedIBTradingBot:
             # Instance 1: Live trading capable with sub-account
             default_mode = 'live'
             default_port = 7496  # Live trading port
-            default_position_size = 1000  # 10k for live
+            default_position_size = 10000  # 10k for live
             default_account = 'U11134039'  # Sub-account ID
         else:
             # Instance 2, 3, etc.: Paper trading only
@@ -933,15 +933,23 @@ class EnhancedIBTradingBot:
                     
                     # Log signal comparison for debugging restart issues
                     previous_signal = self.last_signals.get(returned_currency, "hold")
+                    
+                    # Always log signal processing for debugging
+                    logger.debug(f"[SIGNAL_DEBUG] {returned_currency}: Algorithm={signal}, Previous={previous_signal}, Price={price:.5f}")
+                    
                     if signal != previous_signal:
                         logger.info(f"[SIGNAL_CHANGE] {returned_currency}: {previous_signal} -> {signal} at price {price:.5f}")
                     
-                    if signal != "hold" and signal != self.last_signals.get(returned_currency, "hold"):
+                    # Check if we should execute a trade
+                    should_trade = signal != "hold" and signal != previous_signal
+                    
+                    if should_trade:
                         logger.info(f"[SIGNAL] {signal} for {returned_currency} at {price}")
                         self.handle_signal(returned_currency, signal, price)
-                        self.last_signals[returned_currency] = signal
-                    elif signal == "hold":
-                        self.last_signals[returned_currency] = "hold"
+                    
+                    # ALWAYS update last_signals to keep it in sync
+                    self.last_signals[returned_currency] = signal
+                    
                     return
                 else:
                     logger.error(f"[ERROR] API error {response.status_code}")
@@ -1601,6 +1609,12 @@ class EnhancedIBTradingBot:
                     logger.info("[REMEMBER_POSITIONS] Loaded from remembered_positions.json:")
                     logger.info(f"[REMEMBER_POSITIONS]   Positions: {self.positions}")
                     logger.info(f"[REMEMBER_POSITIONS]   Last signals: {self.last_signals}")
+                    
+                    # Debug: Log each currency's state individually
+                    for currency in self.currency_pairs.keys():
+                        pos = self.positions.get(currency, 'None')
+                        sig = self.last_signals.get(currency, 'hold')
+                        logger.info(f"[REMEMBER_POSITIONS]   {currency}: Position={pos}, Signal={sig}")
                     
                     # Set restart time to prevent immediate trading
                     self._restart_time = datetime.datetime.now()

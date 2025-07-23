@@ -6,6 +6,8 @@ import pandas_ta as ta
 import logging
 import pyodbc
 import datetime
+import json
+import os
 
 # Use the named trade_logger and debug_logger created in app.py
 trade_logger = logging.getLogger("trade_logger")
@@ -39,6 +41,13 @@ DB_CONFIG = {
 
 # Algorithm instance ID (set by server.py)
 ALGO_INSTANCE = 1  # Default to 1, will be overridden by server.py
+
+# Signal state tracking to prevent duplicate signals after restart
+last_signals = {currency: 'hold' for currency in SUPPORTED_CURRENCIES}
+signal_state_file = 'algorithm_signals.json'
+
+# Live trading mode flag - only save signal state when in live mode
+is_live_trading_mode = False
 
 # Initialize global variables as dictionaries with currency keys
 # Raw tick-by-tick data (trimmed to 12 hours)
@@ -1312,6 +1321,13 @@ def initialize_database():
         debug_logger.error("Database initialization failed - could not create required tables")
         return False
     
+    # Only load signal state if we're in live trading mode (i.e., after a RESTART)
+    # During initial startup, we want fresh signal state
+    if is_live_trading_mode:
+        load_algorithm_signal_state()
+    else:
+        debug_logger.info("[SIGNAL_STATE] Skipping signal state load - not in live trading mode yet")
+    
     debug_logger.info("Database initialization completed successfully")
     return True
 
@@ -2131,21 +2147,42 @@ def process_market_data(new_data_point, currency="EUR.USD"):
             # Already had a 'buy' or 'sell' before, so return hold
             raw_signal = 'hold'
 
-        # 15) Update the last_non_hold_signal if we have a real signal
-        if raw_signal not in ['hold']:
-            last_non_hold_signal[currency] = raw_signal
+        # 15) Check against previous signal to prevent duplicates after restart
+        previous_signal = last_signals.get(currency, 'hold')
+        
+        # Only process if signal actually changed
+        if raw_signal != previous_signal:
+            # Update the signal state
+            last_signals[currency] = raw_signal
             
-            # SAVE NON-HOLD SIGNAL TO DATABASE
-            save_signal_to_database(raw_signal, tick_price, tick_time, currency)
+            # Save signal state to disk for restart persistence (only in live trading mode)
+            if is_live_trading_mode:
+                save_algorithm_signal_state()
+            
+            # Update the last_non_hold_signal if we have a real signal
+            if raw_signal not in ['hold']:
+                last_non_hold_signal[currency] = raw_signal
+                
+                # SAVE NON-HOLD SIGNAL TO DATABASE
+                save_signal_to_database(raw_signal, tick_price, tick_time, currency)
 
-            # Enhanced signal logging - but less verbose
-            debug_logger.warning(
-                f"{currency} TRADE SIGNAL: {raw_signal.upper()} at {tick_price:.5f}, Time: {tick_time}"
-            )
+                # Enhanced signal logging - but less verbose
+                debug_logger.warning(
+                    f"{currency} TRADE SIGNAL: {raw_signal.upper()} at {tick_price:.5f}, Time: {tick_time}"
+                )
 
-        # 16) Log only non-hold signals
-        if raw_signal not in ['hold']:
-            trade_logger.info(f"{currency} signal determined: {raw_signal}")
+            # 16) Log only non-hold signals that actually changed
+            if raw_signal not in ['hold']:
+                if is_live_trading_mode:
+                    trade_logger.info(f"{currency} signal determined: {raw_signal}")
+                else:
+                    debug_logger.debug(f"[BACKTEST] {currency} signal determined: {raw_signal}")
+        else:
+            # Signal hasn't changed, don't generate duplicate
+            if is_live_trading_mode:
+                debug_logger.debug(f"[SIGNAL_STATE] {currency} signal unchanged: {raw_signal}")
+            # Still update last_signals to ensure it's current (in case of restart)
+            last_signals[currency] = raw_signal
 
         return (raw_signal, currency)
 
@@ -2433,40 +2470,28 @@ def load_recent_zones_from_database(limit=10):
 
 def load_recent_bars_with_indicators_from_database(limit=100):
     """
-    Load the most recent bars with indicators from the database for all supported currencies.
+    Load recent bars with pre-calculated indicators from database.
     This is used for smart restart to quickly populate bars with calculated indicators.
-    
-    Args:
-        limit (int): Number of recent bars to load per currency (default: 100)
-        
-    Returns:
-        dict: Dictionary with currency as key and DataFrame as value
     """
-    conn = None
-    cursor = None
-    loaded_bars = {currency: pd.DataFrame() for currency in SUPPORTED_CURRENCIES}
+    global bars_data_with_indicators
     
     try:
         conn = get_db_connection()
-        if conn is None:
-            debug_logger.error("Failed to load recent bars - no database connection")
-            return loaded_bars
+        if not conn:
+            debug_logger.error("Could not connect to database to load recent bars")
+            return 0
         
         cursor = conn.cursor()
+        total_loaded = 0
         
         for currency in SUPPORTED_CURRENCIES:
             try:
-                # Get the most recent bars for this currency
+                # Query to get recent bars with indicators
                 cursor.execute("""
-                SELECT TOP (?)
-                    BarStartTime,
-                    OpenPrice,
-                    HighPrice,
-                    LowPrice,
-                    ClosePrice,
-                    RSI,
-                    MACD_Line,
-                    Signal_Line
+                SELECT TOP (?) 
+                    BarStartTime, [Open], High, Low, [Close], Volume,
+                    SMA_20, EMA_12, EMA_26, MACD_Line, MACD_Signal, MACD_Histogram,
+                    RSI_14, BollingerUpper, BollingerLower, ATR_14
                 FROM FXStrat_AlgorithmBars
                 WHERE Currency = ?
                 AND AlgoInstance = ?
@@ -2479,71 +2504,136 @@ def load_recent_bars_with_indicators_from_database(limit=100):
                     # Convert to DataFrame
                     df_data = []
                     for row in bars_data:
-                        bar_time = row[0]
-                        open_price = float(row[1])
-                        high_price = float(row[2])
-                        low_price = float(row[3])
-                        close_price = float(row[4])
-                        rsi = float(row[5]) if row[5] is not None else np.nan
-                        macd_line = float(row[6]) if row[6] is not None else np.nan
-                        signal_line = float(row[7]) if row[7] is not None else np.nan
-                        
                         df_data.append({
-                            'open': open_price,
-                            'high': high_price,
-                            'low': low_price,
-                            'close': close_price,
-                            'RSI': rsi,
-                            'MACD_Line': macd_line,
-                            'Signal_Line': signal_line
+                            'Time': row[0],
+                            'Open': float(row[1]),
+                            'High': float(row[2]),
+                            'Low': float(row[3]),
+                            'Close': float(row[4]),
+                            'Volume': int(row[5]) if row[5] else 0,
+                            'SMA_20': float(row[6]) if row[6] else None,
+                            'EMA_12': float(row[7]) if row[7] else None,
+                            'EMA_26': float(row[8]) if row[8] else None,
+                            'MACD_Line': float(row[9]) if row[9] else None,
+                            'MACD_Signal': float(row[10]) if row[10] else None,
+                            'MACD_Histogram': float(row[11]) if row[11] else None,
+                            'RSI_14': float(row[12]) if row[12] else None,
+                            'BollingerUpper': float(row[13]) if row[13] else None,
+                            'BollingerLower': float(row[14]) if row[14] else None,
+                            'ATR_14': float(row[15]) if row[15] else None
                         })
                     
-                    # Create DataFrame with proper index (reverse to get chronological order)
-                    df = pd.DataFrame(df_data[::-1])  # Reverse to get chronological order
-                    df.index = pd.to_datetime([row[0] for row in bars_data[::-1]])
+                    # Create DataFrame and reverse order (oldest first)
+                    df = pd.DataFrame(df_data)
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    df['Time'] = pd.to_datetime(df['Time'])
+                    df.set_index('Time', inplace=True)
                     
-                    loaded_bars[currency] = df
+                    # Store in global variable
+                    bars_data_with_indicators[currency] = df
+                    total_loaded += len(df)
                     
-                    # Log indicator status
-                    valid_rsi = df['RSI'].notna().sum()
-                    valid_macd = df['MACD_Line'].notna().sum()
-                    valid_signal = df['Signal_Line'].notna().sum()
-                    
-                    debug_logger.warning(
-                        f"Loaded {len(df)} bars with indicators for {currency}: "
-                        f"RSI={valid_rsi}, MACD={valid_macd}, Signal={valid_signal}"
-                    )
-                    
-                    if len(df) > 0:
-                        debug_logger.info(
-                            f"  {currency} bars range: {df.index[0]} to {df.index[-1]}"
-                        )
-                        
-                        # Log latest indicator values
-                        latest_rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else "N/A"
-                        latest_macd = df['MACD_Line'].iloc[-1] if not pd.isna(df['MACD_Line'].iloc[-1]) else "N/A"
-                        latest_signal = df['Signal_Line'].iloc[-1] if not pd.isna(df['Signal_Line'].iloc[-1]) else "N/A"
-                        
-                        debug_logger.info(
-                            f"  Latest indicators: RSI={latest_rsi}, MACD={latest_macd}, Signal={latest_signal}"
-                        )
-                else:
-                    debug_logger.warning(f"No bars found in database for {currency}")
+                    debug_logger.info(f"Loaded {len(df)} bars with indicators for {currency}")
                     
             except Exception as e:
                 debug_logger.error(f"Error loading bars for {currency}: {e}")
                 continue
         
-        return loaded_bars
+        conn.close()
+        debug_logger.info(f"Successfully loaded {total_loaded} total bars with indicators from database")
+        return total_loaded
         
     except Exception as e:
-        debug_logger.error(f"Error loading recent bars from database: {e}", exc_info=True)
-        return loaded_bars
+        debug_logger.error(f"Error in load_recent_bars_with_indicators_from_database: {e}")
+        return 0
+
+def save_algorithm_signal_state():
+    """Save current signal state to disk for restoration after restart"""
+    try:
+        global last_signals
+        data = {
+            'last_signals': last_signals,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'algo_instance': ALGO_INSTANCE
+        }
+        with open(signal_state_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        debug_logger.info(f"[SIGNAL_STATE] Saved signal state: {last_signals}")
+        return True
+    except Exception as e:
+        debug_logger.error(f"[SIGNAL_STATE] Failed to save signal state: {e}")
+        return False
+
+def load_algorithm_signal_state():
+    """Load signal state from disk if present"""
+    try:
+        global last_signals
+        if os.path.exists(signal_state_file):
+            with open(signal_state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Verify this is for the same instance
+            if data.get('algo_instance') == ALGO_INSTANCE:
+                loaded_signals = data.get('last_signals', {})
+                if isinstance(loaded_signals, dict):
+                    for currency in SUPPORTED_CURRENCIES:
+                        signal = loaded_signals.get(currency, 'hold')
+                        if signal in ('buy', 'sell', 'close', 'hold'):
+                            last_signals[currency] = signal
+                        else:
+                            last_signals[currency] = 'hold'
+                    
+                    saved_time = data.get('timestamp')
+                    debug_logger.info(f"[SIGNAL_STATE] Loaded signal state: {last_signals}")
+                    if saved_time:
+                        debug_logger.info(f"[SIGNAL_STATE] State was saved at: {saved_time}")
+                    return True
+                else:
+                    debug_logger.warning("[SIGNAL_STATE] Invalid format in signal state file")
+            else:
+                debug_logger.info(f"[SIGNAL_STATE] Signal state file is for different instance ({data.get('algo_instance')} vs {ALGO_INSTANCE})")
+        else:
+            debug_logger.info("[SIGNAL_STATE] No signal state file found; starting with fresh signals")
+        return False
+    except Exception as e:
+        debug_logger.error(f"[SIGNAL_STATE] Failed to load signal state: {e}")
+        return False
+
+def reset_trading_state_for_live_trading():
+    """
+    Reset all trading-related state to start fresh for live trading.
+    This is called after backtest/warmup to ensure no backtest trades affect live trading.
+    
+    KEEPS: Zones, indicators, bars, market analysis state
+    RESETS: Signal state, trade history, position tracking
+    """
+    global last_signals, last_non_hold_signal, is_live_trading_mode
+    
+    try:
+        # Reset signal state to fresh 'hold' for all currencies
+        last_signals = {currency: 'hold' for currency in SUPPORTED_CURRENCIES}
         
-    finally:
-        if cursor:
-            try:
-                cursor.close()
-            except:
-                pass
-        # DO NOT close the connection when using connection pooling
+        # Reset last non-hold signal tracking
+        last_non_hold_signal = {currency: 'hold' for currency in SUPPORTED_CURRENCIES}
+        
+        # Enable live trading mode - now signal state will be saved
+        is_live_trading_mode = True
+        
+        # Clear any existing signal state file (we want fresh start)
+        if os.path.exists(signal_state_file):
+            os.remove(signal_state_file)
+            debug_logger.info("[TRADING_RESET] Removed old signal state file")
+        
+        # Save fresh signal state
+        save_algorithm_signal_state()
+        
+        debug_logger.info("[TRADING_RESET] Trading state reset for live trading - all signals set to 'hold'")
+        debug_logger.info("[TRADING_RESET] Live trading mode ENABLED - signal state will now be saved")
+        debug_logger.info("[TRADING_RESET] Zones and indicators preserved from backtest")
+        debug_logger.info(f"[TRADING_RESET] Fresh signal state: {last_signals}")
+        
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"[TRADING_RESET] Error resetting trading state: {e}")
+        return False
