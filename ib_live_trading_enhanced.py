@@ -65,7 +65,7 @@ class EnhancedIBTradingBot:
                  ib_host='127.0.0.1', 
                  ib_port=7497,  # Default paper trading port
                  client_id=1,
-                 api_url='http://localhost:5000/trade_signal',
+                 api_url='http://localhost:6000/trade_signal',
                  position_size=100000,
                  trading_mode='paper',
                  account_id=None,
@@ -150,7 +150,7 @@ class EnhancedIBTradingBot:
         # HTTP API for command handling
         self.app = Flask(__name__)
         self.setup_http_api()
-        self.http_port = int(os.environ.get('IB_API_PORT', '5001'))  # Default port 5001
+        self.http_port = int(os.environ.get('IB_API_PORT', '6001'))  # Default port 6001
         
         # Configuration status
         trading_mode_display = f"{self.trading_mode.upper()}"
@@ -259,7 +259,7 @@ class EnhancedIBTradingBot:
             'ib_host': os.environ.get('IB_HOST', '127.0.0.1'),
             'ib_port': instance_config['ib_port'],
             'client_id': int(os.environ.get('IB_CLIENT_ID', '6969')),
-            'api_url': os.environ.get('API_URL', 'http://localhost:5000/trade_signal'),
+            'api_url': os.environ.get('API_URL', 'http://localhost:6000/trade_signal'),
             'position_size': instance_config['position_size'],
             'trading_mode': instance_config['trading_mode'],
             'account_id': instance_config['account_id'],

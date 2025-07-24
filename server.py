@@ -22,7 +22,7 @@ SKIP_MODE2 = False
 SKIP_MODE3 = False
 
 # IB bot HTTP API configuration
-IB_API_PORT = os.environ.get('IB_API_PORT', '5001')
+IB_API_PORT = os.environ.get('IB_API_PORT', '6001')
 
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
@@ -213,7 +213,7 @@ def execute_command():
         # For all other commands (including RESTART), forward to IB bot via HTTP API
         try:
             # Get IB bot API port from environment or use default
-            ib_api_port = os.environ.get('IB_API_PORT', '5001')
+            ib_api_port = os.environ.get('IB_API_PORT', '6001')
             ib_api_url = f"http://localhost:{ib_api_port}/command"
             
             # Set longer timeout for RECONNECT and RESTART commands (need time to reconnect and stabilize)
@@ -486,7 +486,7 @@ def start_ib_live_trading():
         debug_logger.info(f"IB_HOST from environment: {env.get('IB_HOST', 'NOT SET')}")
         debug_logger.info(f"IB_PORT from environment: {env.get('IB_PORT', 'NOT SET')}")
         debug_logger.info(f"ALGO_INSTANCE from environment: {env.get('ALGO_INSTANCE', '1')}")
-        debug_logger.info(f"IB_API_PORT from environment: {env.get('IB_API_PORT', '5001')}")
+        debug_logger.info(f"IB_API_PORT from environment: {env.get('IB_API_PORT', '6001')}")
         
         # Force unbuffered output for better subprocess behavior
         env['PYTHONUNBUFFERED'] = '1'
@@ -861,7 +861,7 @@ if __name__ == '__main__':
     debug_logger.info(f"Initializing algorithm database connections for instance {ALGO_INSTANCE}...")
     algorithm.initialize_database()
     
-    print("Starting Flask server on port 5000...")
+    print("Starting Flask server on port 6000...")
     debug_logger.info("Starting server...")
     
     # Start the warmup sequence in a background thread AFTER server starts
@@ -882,13 +882,13 @@ if __name__ == '__main__':
     debug_logger.info("Restart monitor started")
     
     # Start the server (this will block and keep the server running)
-    debug_logger.info("Server starting on http://0.0.0.0:5000")
+    debug_logger.info("Server starting on http://0.0.0.0:6000")
     print("Server is now running and accepting requests!")
     if SKIP_MODE2 and SKIP_MODE3:
         print("Warmup process running in background (SKIP MODE - faster)...")
     else:
         print("Warmup process running in background...")
-    print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
+    print("API available at: http://0.0.0.0:6000 (accessible from any IP)")
     print("")
     print("COMMAND LISTENER: After IB Live Trading starts, you can use these commands:")
     print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")

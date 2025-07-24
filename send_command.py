@@ -9,7 +9,7 @@ import sys
 import json
 import time
 
-def send_command(command, host='localhost', port=5000):
+def send_command(command, host='localhost', port=6000):
     """Send a command to the trading system"""
     try:
         url = f"http://{host}:{port}/command"

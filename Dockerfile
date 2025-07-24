@@ -42,12 +42,12 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
 # Expose the port that Flask will run on
-EXPOSE 5000
+EXPOSE 6000
 
 # Add health check for the complete system
 # The health check waits longer during startup to allow for warmup (35 min + buffer)
 HEALTHCHECK --interval=60s --timeout=15s --start-period=2400s --retries=3 \
-    CMD curl -f http://localhost:5000/trade_signal -X POST \
+    CMD curl -f http://localhost:6000/trade_signal -X POST \
     -H "Content-Type: application/json" \
     -d '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}' \
     || exit 1
