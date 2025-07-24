@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: forex_trading_system
     ports:
-      - "5000:5000"  # Flask server
-      - "5001:5001"  # IB bot HTTP API
+      - "6000:6000"  # Flask server
+      - "6001:6001"  # IB bot HTTP API
     environment:
       # Flask configuration
       FLASK_ENV: production
@@ -45,10 +45,10 @@ services:
       IB_HOST: "host.docker.internal"  # Special Docker hostname to reach host machine
       IB_PORT: "7496"  # 7496 for live, 7497 for paper (auto-configured by instance)
       IB_CLIENT_ID: "6969"
-      IB_API_PORT: "5001"  # HTTP API port for IB bot
+      IB_API_PORT: "6001"  # HTTP API port for IB bot
       
       # API configuration
-      API_URL: "http://localhost:5000/trade_signal"
+      API_URL: "http://localhost:6000/trade_signal"
       
       # Accept EULA for SQL Server components
       ACCEPT_EULA: Y
@@ -81,129 +81,13 @@ services:
     
     # Health check configuration
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
+      test: ["CMD", "curl", "-f", "http://localhost:6000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
       interval: 60s
       timeout: 15s
       start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
       retries: 3
 
-  # Example configuration for Instance 2 (Paper trading only)
-  # trading_system_instance2:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: forex_trading_system_instance2
-  #   ports:
-  #     - "5002:5000"  # Flask server
-  #     - "5003:5001"  # IB bot HTTP API
-  #   environment:
-  #     FLASK_ENV: production
-  #     PYTHONUNBUFFERED: 1
-  #     PYTHONPATH: /app
-  #     
-  #     # Instance 2 configuration (paper trading only)
-  #     ALGO_INSTANCE: "2"
-  #     TRADING_MODE: "paper"
-  #     POSITION_SIZE: "100000"  # 100k for paper
-  #     
-  #     # Database configuration
-  #     DB_SERVER: "192.168.50.100"
-  #     DB_DATABASE: "FXStrat"
-  #     DB_USERNAME: "djaime"
-  #     DB_PASSWORD: "Enrique30072000!3"
-  #     
-  #     # IB configuration (paper trading)
-  #     IB_HOST: "host.docker.internal"
-  #     IB_PORT: "7497"  # Paper trading port
-  #     IB_CLIENT_ID: "6970"  # Different client ID
-  #     IB_API_PORT: "5001"
-  #     
-  #     API_URL: "http://localhost:5000/trade_signal"
-  #     ACCEPT_EULA: Y
-  #   volumes:
-  #     - ./logs:/app/logs
-  #     - .:/app
-  #     - trading_data:/app/data
-  #   networks:
-  #     - trading_network
-  #   restart: unless-stopped
-  #   
-  #   # Resource limits to prevent container from consuming too much memory
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 4G
-  #         cpus: '4.0'
-  #       reservations:
-  #         memory: 1G
-  #         cpus: '2.0'
-  #   
-  #   # Health check configuration
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
-  #     interval: 60s
-  #     timeout: 15s
-  #     start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
-  #     retries: 3
-
-  # Example configuration for Instance 3 (Paper trading only)
-  # trading_system_instance3:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: forex_trading_system_instance3
-  #   ports:
-  #     - "5004:5000"  # Flask server
-  #     - "5005:5001"  # IB bot HTTP API
-  #   environment:
-  #     FLASK_ENV: production
-  #     PYTHONUNBUFFERED: 1
-  #     PYTHONPATH: /app
-  #     
-  #     # Instance 3 configuration (paper trading only)
-  #     ALGO_INSTANCE: "3"
-  #     TRADING_MODE: "paper"
-  #     POSITION_SIZE: "100000"  # 100k for paper
-  #     
-  #     # Database configuration
-  #     DB_SERVER: "192.168.50.100"
-  #     DB_DATABASE: "FXStrat"
-  #     DB_USERNAME: "djaime"
-  #     DB_PASSWORD: "Enrique30072000!3"
-  #     
-  #     # IB configuration (paper trading)
-  #     IB_HOST: "host.docker.internal"
-  #     IB_PORT: "7497"  # Paper trading port
-  #     IB_CLIENT_ID: "6971"  # Different client ID
-  #     IB_API_PORT: "5001"
-  #     
-  #     API_URL: "http://localhost:5000/trade_signal"
-  #     ACCEPT_EULA: Y
-  #   volumes:
-  #     - ./logs:/app/logs
-  #     - .:/app
-  #     - trading_data:/app/data
-  #   networks:
-  #     - trading_network
-  #   restart: unless-stopped
-  #   
-  #   # Resource limits to prevent container from consuming too much memory
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 4G
-  #         cpus: '4.0'
-  #       reservations:
-  #         memory: 1G
-  #         cpus: '2.0'
-  #   
-  #   # Health check configuration
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:5000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
-  #     interval: 60s
-  #     timeout: 15s
-  #     start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
-  #     retries: 3
+  
 
 
 networks:
