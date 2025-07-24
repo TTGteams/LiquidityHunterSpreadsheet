@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: forex_trading_system
     ports:
-      - "5000:5000"  # Flask server
-      - "5001:5001"  # IB bot HTTP API
+      - "6000:6000"  # Flask server
+      - "6001:6001"  # IB bot HTTP API
     environment:
       # Flask configuration
       FLASK_ENV: production
