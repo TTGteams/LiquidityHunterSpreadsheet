@@ -29,7 +29,7 @@ import threading
 import os # Added for os.environ
 
 # Test configuration - Define early so logging can reference these
-API_URL = "http://localhost:5000/trade_signal"
+API_URL = "http://localhost:6000/trade_signal"
 TEST_PRICE = 1.000
 TEST_CURRENCY = "EUR.USD"
 SIGNAL_DELAY = 0.5  # 0.5 seconds between signals
@@ -67,7 +67,7 @@ logger.info("="*80)
 logger.info("RUN_TEST SCRIPT STARTUP - API ENDPOINT CONFIGURATION")
 logger.info("="*80)
 logger.info(f"Primary API Endpoint: {API_URL}")
-logger.info(f"Batch API Endpoint: http://localhost:5000/trade_signal_batch")
+logger.info(f"Batch API Endpoint: http://localhost:6000/trade_signal_batch")
 # Updated to reflect that forwarding has been disabled
 logger.info("Signal Flow: Batch Processing -> Algorithm (forwarding disabled for performance)")
 logger.info("Note: Signal forwarding to /trade_signal has been disabled to prevent connection exhaustion")
@@ -200,7 +200,7 @@ def send_historical_data_to_api(df, currency="EUR.USD", batch_size=300, delay_be
     total_batches = (total_records + batch_size - 1) // batch_size
     
     # Use the batch endpoint
-    batch_api_url = "http://localhost:5000/trade_signal_batch"
+    batch_api_url = "http://localhost:6000/trade_signal_batch"
     
     logger.info(f"Sending {total_records:,} records in {total_batches} batches of {batch_size}")
     print(f"Sending {total_records:,} records in {total_batches} batches of {batch_size}")
@@ -669,7 +669,7 @@ def run_mode_3_warmup():
     
     # Get algorithm state from API instead of database
     try:
-        response = requests.get("http://localhost:5000/algorithm_state", timeout=10)
+        response = requests.get("http://localhost:6000/algorithm_state", timeout=10)
         
         if response.status_code != 200:
             logger.error(f"Failed to get algorithm state: HTTP {response.status_code}")
