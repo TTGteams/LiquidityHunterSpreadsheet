@@ -187,28 +187,6 @@ def execute_command():
             except Exception as e:
                 debug_logger.error(f"Error creating skip_warmup.flag: {e}")
                 return jsonify({'error': f'Failed to set skip warmup flag: {str(e)}'}), 500
-                
-        elif command == 'RESTART':
-            try:
-                # Enable live trading mode and save current signal state before restart
-                algorithm.is_live_trading_mode = True
-                algorithm.save_algorithm_signal_state()
-                
-                # Create smart restart flag - skips warmup and loads recent zones
-                with open('restart_requested.flag', 'w') as f:
-                    f.write('smart')
-                debug_logger.info("Created smart restart flag")
-                trade_logger.info("RESTART command received - initiating smart restart (skip warmup, load recent zones)")
-                
-                return jsonify({
-                    'command': command,
-                    'result': 'Smart restart initiated - will skip warmup and load recent zones from database.',
-                    'timestamp': datetime.datetime.now().isoformat()
-                }), 200
-                
-            except Exception as e:
-                debug_logger.error(f"Error creating restart_requested.flag: {e}")
-                return jsonify({'error': f'Failed to initiate restart: {str(e)}'}), 500
         
         elif command == 'FULL_RESTART':
             try:
@@ -232,14 +210,14 @@ def execute_command():
                 debug_logger.error(f"Error creating restart_requested.flag: {e}")
                 return jsonify({'error': f'Failed to initiate full restart: {str(e)}'}), 500
         
-        # For all other commands, forward to IB bot via HTTP API
+        # For all other commands (including RESTART), forward to IB bot via HTTP API
         try:
             # Get IB bot API port from environment or use default
             ib_api_port = os.environ.get('IB_API_PORT', '5001')
             ib_api_url = f"http://localhost:{ib_api_port}/command"
             
-            # Set longer timeout for RECONNECT command (needs time to reconnect and stabilize)
-            timeout = 30 if command == 'RECONNECT' else 5
+            # Set longer timeout for RECONNECT and RESTART commands (need time to reconnect and stabilize)
+            timeout = 30 if command in ['RECONNECT', 'RESTART'] else 5
             
             # Forward command to IB bot
             response = requests.post(ib_api_url, json={'command': command}, timeout=timeout)
@@ -337,6 +315,40 @@ def get_algorithm_state():
         
     except Exception as e:
         debug_logger.error(f"Error getting algorithm state: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/algorithm_positions', methods=['GET'])
+def get_algorithm_positions():
+    """Get current algorithm positions - IB bot queries this instead of maintaining its own state"""
+    try:
+        import algorithm
+        
+        positions = {}
+        for currency in algorithm.SUPPORTED_CURRENCIES:
+            # Get current trades for this currency
+            open_trades = [t for t in algorithm.trades[currency] if t['status'] == 'open']
+            
+            if not open_trades:
+                positions[currency] = None  # No position
+            elif len(open_trades) == 1:
+                # Single position
+                trade = open_trades[0]
+                positions[currency] = trade['direction']  # 'long' or 'short'
+            else:
+                # Multiple trades - this shouldn't happen but handle gracefully
+                debug_logger.warning(f"Multiple open trades detected for {currency}: {len(open_trades)}")
+                # Use the most recent trade
+                latest_trade = max(open_trades, key=lambda t: t['entry_time'])
+                positions[currency] = latest_trade['direction']
+        
+        return jsonify({
+            'status': 'success',
+            'positions': positions,
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        debug_logger.error(f"Error getting algorithm positions: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/trade_signal_batch', methods=['POST'])
@@ -887,15 +899,15 @@ if __name__ == '__main__':
     print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
     print("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
     print("  SKIP_WARMUP - Skip warmup on next restart")
-    print("  RESTART - Smart restart (skip warmup, load recent zones)")
+    print("  RESTART - Connection restart (auto-saves positions, reconnects to IB)")
     print("  FULL_RESTART - Full restart (complete warmup sequence)")
     print("  STATUS - Show current positions")
     print("  SHOW_PRICES - Show live prices and recent history")
     print("  HELP - Show all commands")
     print("")
-    print("Fast restart: RESTART (smart restart with recent zones)")
+    print("Connection restart: RESTART (saves positions, reconnects to IB)")
     print("Live trading: SWITCH_LIVE (instance 1 only)")
     print("Paper trading: SWITCH_PAPER")
     print("")
     # Increase worker threads to handle concurrent requests better
-    serve(app, host='0.0.0.0', port=5000, threads=32)  # 32 threads - high capacity without lock contention risk
+    serve(app, host='0.0.0.0', port=6000, threads=32)  # 32 threads - high capacity without lock contention risk

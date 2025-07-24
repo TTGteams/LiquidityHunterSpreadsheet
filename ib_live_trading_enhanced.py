@@ -143,6 +143,10 @@ class EnhancedIBTradingBot:
         # Thread lock
         self.position_lock = threading.Lock()
         
+        # Position cache to minimize HTTP calls to algorithm
+        self.position_cache_timeout = 30  # seconds
+        self.last_position_sync = datetime.datetime.min
+        
         # HTTP API for command handling
         self.app = Flask(__name__)
         self.setup_http_api()
@@ -159,8 +163,29 @@ class EnhancedIBTradingBot:
         logger.info(f"[INIT] IB connection: {self.ib_host}:{self.ib_port} (clientId: {self.client_id})")
         logger.info(f"[INIT] HTTP API will listen on port {self.http_port}")
 
-        # Load remembered positions if present
-        self.load_remembered_positions()
+        # Query algorithm for current positions on startup (with retry)
+        self._sync_positions_on_startup()
+
+    def _sync_positions_on_startup(self):
+        """Sync positions from algorithm on startup with retry logic"""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                positions = self.query_algorithm_positions(force_refresh=True)
+                if positions is not None:
+                    logger.info(f"[INIT] Successfully synced positions on startup: {positions}")
+                    return
+                else:
+                    logger.warning(f"[INIT] Position sync attempt {attempt + 1}/{max_attempts} failed")
+            except Exception as e:
+                logger.warning(f"[INIT] Position sync attempt {attempt + 1}/{max_attempts} error: {e}")
+            
+            # Wait before retry (except on last attempt)
+            if attempt < max_attempts - 1:
+                time.sleep(2)
+        
+        # If all attempts failed, log warning but continue
+        logger.warning("[INIT] Could not sync positions on startup - will retry during operation")
 
     @staticmethod
     def get_instance_specific_config():
@@ -961,52 +986,75 @@ class EnhancedIBTradingBot:
                     logger.error(f"[ERROR] API failed after {max_retries} attempts: {e}")
 
     def handle_signal(self, currency: str, signal: str, current_price: float):
-        """Handle trade signals with position management"""
-        with self.position_lock:
-            try:
-                # Brief protection period after restart to ensure data quality
-                if hasattr(self, '_restart_time'):
-                    time_since_restart = (datetime.datetime.now() - self._restart_time).total_seconds()
-                    if time_since_restart < 5:  # Only 5 seconds protection
-                        # Only block if this would be a NEW trade (signal change)
-                        previous_signal = self.last_signals.get(currency, "hold")
-                        if signal != previous_signal:
-                            logger.info(f"[SIGNAL] Delaying {signal} for {currency} - only {time_since_restart:.1f}s since restart (waiting 5s for data quality)")
-                            return
-                    else:
-                        # Clear the restart time after the waiting period
-                        if hasattr(self, '_restart_time'):
-                            delattr(self, '_restart_time')
-                            logger.info(f"[SIGNAL] Restart protection period ended - resuming normal trading")
+        """Handle trade signals with clean position logic"""
+        try:
+            # Brief protection period after restart to ensure data quality
+            if hasattr(self, '_restart_time'):
+                time_since_restart = (datetime.datetime.now() - self._restart_time).total_seconds()
+                if time_since_restart < 5:  # Only 5 seconds protection
+                    # Only block if this would be a NEW trade (signal change)
+                    previous_signal = self.last_signals.get(currency, "hold")
+                    if signal != previous_signal:
+                        logger.info(f"[SIGNAL] Delaying {signal} for {currency} - only {time_since_restart:.1f}s since restart (waiting 5s for data quality)")
+                        return
+                else:
+                    # Clear the restart time after the waiting period
+                    if hasattr(self, '_restart_time'):
+                        delattr(self, '_restart_time')
+                        logger.info(f"[SIGNAL] Restart protection period ended - resuming normal trading")
+            
+            # Get current position from algorithm (with caching)
+            current_positions = self.get_current_positions()
+            current_position = current_positions.get(currency)
+            
+            logger.debug(f"[SIGNAL] Processing {signal} for {currency} (current position: {current_position})")
+            
+            # Clean signal handling logic
+            if signal == "buy":
+                if current_position is None:
+                    # Open long position
+                    logger.info(f"[SIGNAL] Opening long position for {currency}")
+                    self.place_order_with_retry(currency, "BUY", current_price)
+                elif current_position == "short":
+                    # Close short position (buy to cover)
+                    logger.info(f"[SIGNAL] Closing short position for {currency}")
+                    self.place_order_with_retry(currency, "BUY", current_price)
+                else:
+                    # Already long - ignore signal
+                    logger.debug(f"[SIGNAL] Ignoring buy signal for {currency} - already long")
+                    
+            elif signal == "sell":
+                if current_position is None:
+                    # Open short position
+                    logger.info(f"[SIGNAL] Opening short position for {currency}")
+                    self.place_order_with_retry(currency, "SELL", current_price)
+                elif current_position == "long":
+                    # Close long position
+                    logger.info(f"[SIGNAL] Closing long position for {currency}")
+                    self.place_order_with_retry(currency, "SELL", current_price)
+                else:
+                    # Already short - ignore signal
+                    logger.debug(f"[SIGNAL] Ignoring sell signal for {currency} - already short")
+                    
+            elif signal == "close":
+                if current_position == "long":
+                    # Close long position
+                    logger.info(f"[SIGNAL] Closing long position for {currency}")
+                    self.place_order_with_retry(currency, "SELL", current_price)
+                elif current_position == "short":
+                    # Close short position
+                    logger.info(f"[SIGNAL] Closing short position for {currency}")
+                    self.place_order_with_retry(currency, "BUY", current_price)
+                else:
+                    # No position to close
+                    logger.debug(f"[SIGNAL] Ignoring close signal for {currency} - no position to close")
+            
+            else:
+                # Hold or unknown signal - do nothing
+                logger.debug(f"[SIGNAL] No action for {signal} signal on {currency}")
                 
-                current_position = self.positions.get(currency)
-                
-                if signal == "buy":
-                    if current_position is None:
-                        self.place_order_with_retry(currency, "BUY", current_price)
-                        self.positions[currency] = "long"
-                    elif current_position == "short":
-                        self.place_order_with_retry(currency, "BUY", current_price)
-                        self.positions[currency] = None
-                        
-                elif signal == "sell":
-                    if current_position is None:
-                        self.place_order_with_retry(currency, "SELL", current_price)
-                        self.positions[currency] = "short"
-                    elif current_position == "long":
-                        self.place_order_with_retry(currency, "SELL", current_price)
-                        self.positions[currency] = None
-                        
-                elif signal == "close":
-                    if current_position == "long":
-                        self.place_order_with_retry(currency, "SELL", current_price)
-                        self.positions[currency] = None
-                    elif current_position == "short":
-                        self.place_order_with_retry(currency, "BUY", current_price)
-                        self.positions[currency] = None
-                        
-            except Exception as e:
-                logger.error(f"[ERROR] Signal handling error: {e}")
+        except Exception as e:
+            logger.error(f"[ERROR] Signal handling error for {currency}: {e}")
 
     def place_order_with_retry(self, currency: str, action: str, intended_price: float, max_retries=3):
         """Place order with retry logic and account specification"""
@@ -1563,82 +1611,7 @@ class EnhancedIBTradingBot:
         except Exception as e:
             logger.error(f"[ERROR] Market data recovery failed: {e}")
 
-    def remember_positions(self):
-        """Save current positions and last signals to disk for restoration after restart."""
-        try:
-            data = {
-                'positions': self.positions,
-                'last_signals': self.last_signals,  # Also save last signals to prevent re-trading
-                'timestamp': datetime.datetime.now().isoformat()
-            }
-            with open('remembered_positions.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info("[REMEMBER_POSITIONS] Positions and last signals saved to remembered_positions.json")
-            logger.info(f"[REMEMBER_POSITIONS] Saved positions: {self.positions}")
-            logger.info(f"[REMEMBER_POSITIONS] Saved last signals: {self.last_signals}")
-            return "Positions and last signals remembered successfully."
-        except Exception as e:
-            logger.error(f"[REMEMBER_POSITIONS] Failed to save positions: {e}")
-            return f"Failed to remember positions: {e}"
 
-    def load_remembered_positions(self):
-        """Load positions and last signals from disk if present."""
-        try:
-            if os.path.exists('remembered_positions.json'):
-                with open('remembered_positions.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    
-                # Load positions
-                loaded_positions = data.get('positions', {})
-                if isinstance(loaded_positions, dict):
-                    for currency in self.positions:
-                        val = loaded_positions.get(currency)
-                        if val in (None, 'long', 'short'):
-                            self.positions[currency] = val
-                    
-                    # Load last signals to prevent re-trading on restart
-                    loaded_signals = data.get('last_signals', {})
-                    if isinstance(loaded_signals, dict):
-                        for currency in self.last_signals:
-                            signal = loaded_signals.get(currency, 'hold')
-                            if signal in ('buy', 'sell', 'close', 'hold'):
-                                self.last_signals[currency] = signal
-                            else:
-                                self.last_signals[currency] = 'hold'
-                    
-                    logger.info("[REMEMBER_POSITIONS] Loaded from remembered_positions.json:")
-                    logger.info(f"[REMEMBER_POSITIONS]   Positions: {self.positions}")
-                    logger.info(f"[REMEMBER_POSITIONS]   Last signals: {self.last_signals}")
-                    
-                    # Debug: Log each currency's state individually
-                    for currency in self.currency_pairs.keys():
-                        pos = self.positions.get(currency, 'None')
-                        sig = self.last_signals.get(currency, 'hold')
-                        logger.info(f"[REMEMBER_POSITIONS]   {currency}: Position={pos}, Signal={sig}")
-                    
-                    # Set restart time to prevent immediate trading
-                    self._restart_time = datetime.datetime.now()
-                    logger.info("[REMEMBER_POSITIONS] Set restart time - will delay new trades for 5 seconds to ensure data quality")
-                    
-                    # Log load timestamp
-                    saved_time = data.get('timestamp')
-                    if saved_time:
-                        logger.info(f"[REMEMBER_POSITIONS] Data was saved at: {saved_time}")
-                else:
-                    logger.warning("[REMEMBER_POSITIONS] Invalid format in remembered_positions.json")
-            else:
-                logger.info("[REMEMBER_POSITIONS] No remembered_positions.json found; starting fresh.")
-        except Exception as e:
-            logger.error(f"[REMEMBER_POSITIONS] Failed to load positions: {e}")
-
-    def clear_remembered_positions(self):
-        """Delete the remembered positions file after successful restart/close if desired."""
-        try:
-            if os.path.exists('remembered_positions.json'):
-                os.remove('remembered_positions.json')
-                logger.info("[REMEMBER_POSITIONS] remembered_positions.json deleted.")
-        except Exception as e:
-            logger.error(f"[REMEMBER_POSITIONS] Failed to delete remembered_positions.json: {e}")
 
     def start_command_listener(self):
         """Start command listener thread for runtime commands"""
@@ -1653,12 +1626,11 @@ class EnhancedIBTradingBot:
         logger.info("  RECONNECT - Force reconnection to IB")
         logger.info("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-        logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
+        logger.info("  RESTART - Connection restart (auto-saves positions, reconnects to IB)")
         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
         logger.info("  STATUS - Show current positions and connection status")
         logger.info("  SHOW_PRICES - Show live prices and recent history")
-        logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
-        logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
+        logger.info("  SYNC_POSITIONS - Re-sync positions from algorithm")
         logger.info("  TOGGLE_PERSISTENT - Toggle persistent reconnection mode on/off")
 
     def command_listener_loop(self):
@@ -1793,23 +1765,19 @@ class EnhancedIBTradingBot:
                             logger.error(f"[COMMAND] Failed to create skip flag: {e}")
                             
                     elif command == "RESTART":
-                        # Create smart restart flag and shutdown gracefully
-                        logger.info("[COMMAND] RESTART requested - creating smart restart flag")
+                        # Connection restart - positions stay in algorithm memory
+                        logger.info("[COMMAND] RESTART requested - performing connection restart")
                         try:
-                            # Automatically remember positions before restarting
-                            remember_result = self.remember_positions()
-                            logger.info(f"[COMMAND] Auto-saving positions before restart: {remember_result}")
+                            # Perform connection restart (same as RECONNECT)
+                            logger.info("[COMMAND] Performing connection restart...")
+                            self.handle_manual_reconnect()
                             
-                            with open('restart_requested.flag', 'w') as f:
-                                f.write('smart')
-                            logger.info("[COMMAND] Smart restart flag created - will skip warmup and load recent zones")
-                            # Signal shutdown
-                            self.shutdown_requested = True
-                            # Disconnect from IB to trigger clean exit
-                            if self.ib.isConnected():
-                                self.ib.disconnect()
+                            # Re-sync positions from algorithm after restart
+                            logger.info("[COMMAND] Re-syncing positions from algorithm...")
+                            self.query_algorithm_positions(force_refresh=True)
+                            
                         except Exception as e:
-                            logger.error(f"[COMMAND] Failed to create restart flag: {e}")
+                            logger.error(f"[COMMAND] Failed to perform restart: {e}")
                             
                     elif command == "FULL_RESTART":
                         # Create full restart flag and shutdown gracefully
@@ -1839,14 +1807,10 @@ class EnhancedIBTradingBot:
                                     logger.info(f"    {currency}: flat")
                         logger.info(f"  Pending orders: {len(self.pending_orders)}")
                         
-                    elif command == "REMEMBER_POSITIONS":
-                        # Save current positions to disk
-                        result = self.remember_positions()
-                        logger.info(f"[COMMAND] {result}")
-
-                    elif command == "CLEAR_REMEMBERED_POSITIONS":
-                        self.clear_remembered_positions()
-                        logger.info("[COMMAND] remembered_positions.json deleted.")
+                    elif command == "SYNC_POSITIONS":
+                        # Re-sync positions from algorithm
+                        positions = self.query_algorithm_positions(force_refresh=True)
+                        logger.info(f"[COMMAND] Position sync complete: {positions}")
                         
                     elif command == "TOGGLE_PERSISTENT":
                         # Toggle persistent reconnection mode
@@ -1868,12 +1832,11 @@ class EnhancedIBTradingBot:
                         logger.info("  RECONNECT - Force reconnection to IB")
                         logger.info("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
                         logger.info("  SKIP_WARMUP - Skip warmup on next restart")
-                        logger.info("  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)")
+                        logger.info("  RESTART - Connection restart (auto-saves positions, reconnects to IB)")
                         logger.info("  FULL_RESTART - Full restart (complete warmup sequence)")
                         logger.info("  STATUS - Show positions and connection")
                         logger.info("  SHOW_PRICES - Show live prices and recent history")
-                        logger.info("  REMEMBER_POSITIONS - Save current positions to remembered_positions.json")
-                        logger.info("  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json")
+                        logger.info("  SYNC_POSITIONS - Re-sync positions from algorithm")
                         logger.info("  HELP - Show this help")
                         
                     elif command:
@@ -2024,25 +1987,21 @@ class EnhancedIBTradingBot:
                     return f"Failed to create skip flag: {e}"
                     
             elif command == "RESTART":
-                # Create smart restart flag and shutdown gracefully
-                logger.info("[HTTP-COMMAND] RESTART requested - creating smart restart flag")
+                # Connection restart - positions stay in algorithm memory
+                logger.info("[HTTP-COMMAND] RESTART requested - performing connection restart")
                 try:
-                    # Automatically remember positions before restarting
-                    remember_result = self.remember_positions()
-                    logger.info(f"[HTTP-COMMAND] Auto-saving positions before restart: {remember_result}")
+                    # Perform connection restart (same as RECONNECT)
+                    logger.info("[HTTP-COMMAND] Performing connection restart...")
+                    reconnect_result = self.handle_manual_reconnect()
                     
-                    with open('restart_requested.flag', 'w') as f:
-                        f.write('smart')
-                    logger.info("[HTTP-COMMAND] Smart restart flag created - will skip warmup and load recent zones")
-                    # Signal shutdown
-                    self.shutdown_requested = True
-                    # Disconnect from IB to trigger clean exit
-                    if self.ib.isConnected():
-                        self.ib.disconnect()
-                    return f"Smart restart initiated - positions saved and will be restored after restart. {remember_result}"
+                    # Re-sync positions from algorithm after restart
+                    logger.info("[HTTP-COMMAND] Re-syncing positions from algorithm...")
+                    positions = self.query_algorithm_positions(force_refresh=True)
+                    
+                    return f"Connection restart completed - positions synced from algorithm: {positions}"
                 except Exception as e:
-                    logger.error(f"[HTTP-COMMAND] Failed to create restart flag: {e}")
-                    return f"Failed to create restart flag: {e}"
+                    logger.error(f"[HTTP-COMMAND] Failed to perform restart: {e}")
+                    return f"Failed to perform restart: {e}"
                     
             elif command == "FULL_RESTART":
                 # Create full restart flag and shutdown gracefully
@@ -2145,13 +2104,10 @@ class EnhancedIBTradingBot:
                 logger.info(f"[HTTP-COMMAND] Status requested:\n{status_text}")
                 return status_text
                 
-            elif command == "REMEMBER_POSITIONS":
-                result = self.remember_positions()
-                return result
-
-            elif command == "CLEAR_REMEMBERED_POSITIONS":
-                self.clear_remembered_positions()
-                return "remembered_positions.json deleted."
+            elif command == "SYNC_POSITIONS":
+                # Re-sync positions from algorithm
+                positions = self.query_algorithm_positions(force_refresh=True)
+                return f"Position sync complete: {positions}"
                 
             elif command == "TOGGLE_PERSISTENT":
                 # Toggle persistent reconnection mode
@@ -2231,12 +2187,11 @@ class EnhancedIBTradingBot:
   RECONNECT - Force reconnection to IB
   FORCE_DISCONNECT - Force disconnect all zombie IB connections
   SKIP_WARMUP - Skip warmup on next restart
-  RESTART - Smart restart (auto-saves positions, skip warmup, load recent zones)
+  RESTART - Connection restart (auto-saves positions, reconnects to IB)
   FULL_RESTART - Full restart (complete warmup sequence)
   STATUS - Show positions and connection
   SHOW_PRICES - Show live prices and recent history
-  REMEMBER_POSITIONS - Save current positions to remembered_positions.json
-  CLEAR_REMEMBERED_POSITIONS - Delete remembered_positions.json
+  SYNC_POSITIONS - Re-sync positions from algorithm
   TOGGLE_PERSISTENT - Toggle persistent reconnection mode on/off
   HELP - Show this help"""
                 logger.info("[HTTP-COMMAND] Help requested")
@@ -2312,11 +2267,21 @@ class EnhancedIBTradingBot:
         threading.Thread(target=test_event_loop, daemon=True).start()
         
         try:
-            # Status logging
+            # Status logging with smart position syncing
             def status_logger():
                 last_positions = {}
                 while not self.shutdown_requested:
                     time.sleep(300)  # Check every 5 minutes
+                    
+                    # Smart periodic sync - only if cache is getting stale
+                    current_time = datetime.datetime.now()
+                    time_since_sync = (current_time - self.last_position_sync).total_seconds()
+                    
+                    # Force sync if cache is older than 10 minutes (conservative)
+                    if time_since_sync > 600:  # 10 minutes
+                        logger.info(f"[SYNC] Periodic position sync (last sync {time_since_sync/60:.1f} minutes ago)")
+                        self.query_algorithm_positions(force_refresh=True)
+                    
                     current_positions = dict(self.positions)
                     
                     # Only log if positions have changed
@@ -2369,6 +2334,77 @@ class EnhancedIBTradingBot:
             
         except Exception as e:
             logger.error(f"[ERROR] Shutdown error: {e}")
+
+    def query_algorithm_positions(self, force_refresh=False):
+        """Query algorithm for current positions with intelligent caching"""
+        current_time = datetime.datetime.now()
+        
+        # Check if we need to refresh (cache timeout or forced)
+        time_since_sync = (current_time - self.last_position_sync).total_seconds()
+        if not force_refresh and time_since_sync < self.position_cache_timeout:
+            logger.debug(f"[POSITIONS] Using cached positions (synced {time_since_sync:.1f}s ago)")
+            return dict(self.positions)  # Return copy of current positions
+        
+        try:
+            # Use the same base URL as api_url but replace endpoint
+            base_url = self.api_url.replace('/trade_signal', '')
+            positions_url = f"{base_url}/algorithm_positions"
+            
+            logger.debug(f"[POSITIONS] Querying algorithm at {positions_url}")
+            response = requests.get(positions_url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    algorithm_positions = data.get('positions', {})
+                    
+                    # Update our local cache to match algorithm
+                    with self.position_lock:
+                        changes = []
+                        for currency in self.currency_pairs.keys():
+                            old_pos = self.positions.get(currency)
+                            new_pos = algorithm_positions.get(currency)
+                            if old_pos != new_pos:
+                                changes.append(f"{currency}: {old_pos} → {new_pos}")
+                            self.positions[currency] = new_pos
+                        
+                        self.last_position_sync = current_time
+                    
+                    if changes:
+                        logger.info(f"[POSITIONS] Position changes detected: {', '.join(changes)}")
+                    else:
+                        logger.debug(f"[POSITIONS] Positions unchanged: {algorithm_positions}")
+                    
+                    return algorithm_positions
+                else:
+                    logger.warning(f"[POSITIONS] Algorithm returned error: {data.get('error', 'Unknown error')}")
+            else:
+                logger.warning(f"[POSITIONS] Failed to query algorithm positions: HTTP {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[POSITIONS] Network error querying algorithm: {e}")
+        except Exception as e:
+            logger.error(f"[POSITIONS] Unexpected error querying positions: {e}")
+        
+        # On error, return current cached positions if available
+        if hasattr(self, 'positions') and any(pos is not None for pos in self.positions.values()):
+            logger.info("[POSITIONS] Using cached positions due to query failure")
+            return dict(self.positions)
+        
+        return None
+
+    def get_current_positions(self, max_age_seconds=30):
+        """Get current positions efficiently with automatic refresh if needed"""
+        current_time = datetime.datetime.now()
+        time_since_sync = (current_time - self.last_position_sync).total_seconds()
+        
+        # Refresh if cache is stale
+        if time_since_sync > max_age_seconds:
+            self.query_algorithm_positions(force_refresh=True)
+        
+        # Return current cached positions
+        with self.position_lock:
+            return dict(self.positions)
 
 if __name__ == "__main__":
     import os
