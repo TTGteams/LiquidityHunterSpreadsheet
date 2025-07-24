@@ -45,7 +45,7 @@ services:
       IB_HOST: "host.docker.internal"  # Special Docker hostname to reach host machine
       IB_PORT: "7496"  # 7496 for live, 7497 for paper (auto-configured by instance)
       IB_CLIENT_ID: "6969"
-      IB_API_PORT: "5001"  # HTTP API port for IB bot
+      IB_API_PORT: "6001"  # HTTP API port for IB bot
       
       # API configuration
       API_URL: "http://localhost:5000/trade_signal"
