@@ -7,12 +7,9 @@ from logging.handlers import RotatingFileHandler
 from waitress import serve
 import pytz
 import datetime
-import requests
 import time
 import sys
 import signal
-import subprocess
-import atexit
 import os
 
 app = Flask(__name__)
@@ -20,9 +17,6 @@ app = Flask(__name__)
 # Global variables for skip settings
 SKIP_MODE2 = False
 SKIP_MODE3 = False
-
-# IB bot HTTP API configuration
-IB_API_PORT = os.environ.get('IB_API_PORT', '6001')
 
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
@@ -161,7 +155,7 @@ def trade_signal():
 
 @app.route('/command', methods=['POST'])
 def execute_command():
-    """Execute commands via HTTP endpoint"""
+    """Execute commands via HTTP endpoint - simplified for external app usage"""
     try:
         content = request.json
         command = content.get('command', '').strip().upper()
@@ -169,7 +163,7 @@ def execute_command():
         if not command:
             return jsonify({'error': 'No command provided'}), 400
         
-        # Handle server-level commands that don't require IB bot
+        # Handle server-level commands only
         if command == 'SKIP_WARMUP':
             try:
                 # Create skip_warmup.flag file
@@ -210,38 +204,91 @@ def execute_command():
                 debug_logger.error(f"Error creating restart_requested.flag: {e}")
                 return jsonify({'error': f'Failed to initiate full restart: {str(e)}'}), 500
         
-        # For all other commands (including RESTART), forward to IB bot via HTTP API
-        try:
-            # Get IB bot API port from environment or use default
-            ib_api_port = os.environ.get('IB_API_PORT', '6001')
-            ib_api_url = f"http://localhost:{ib_api_port}/command"
-            
-            # Set longer timeout for RECONNECT and RESTART commands (need time to reconnect and stabilize)
-            timeout = 30 if command in ['RECONNECT', 'RESTART'] else 5
-            
-            # Forward command to IB bot
-            response = requests.post(ib_api_url, json={'command': command}, timeout=timeout)
-            
-            if response.status_code == 200:
-                result_data = response.json()
+        elif command == 'RESTART':
+            try:
+                # Enable live trading mode and save current signal state before restart
+                algorithm.is_live_trading_mode = True
+                algorithm.save_algorithm_signal_state()
+                
+                # Create smart restart flag - skips warmup and loads recent data
+                with open('restart_requested.flag', 'w') as f:
+                    f.write('smart')
+                debug_logger.info("Created smart restart flag")
+                trade_logger.info("RESTART command received - initiating smart restart (skip warmup, load recent data)")
+                
                 return jsonify({
                     'command': command,
-                    'result': result_data.get('result', 'Command executed'),
+                    'result': 'Smart restart initiated - will skip warmup and load recent data from database.',
                     'timestamp': datetime.datetime.now().isoformat()
                 }), 200
-            else:
-                # IB bot API returned an error
-                error_data = response.json() if response.headers.get('content-type') == 'application/json' else {}
-                return jsonify({'error': error_data.get('error', f'IB bot returned status {response.status_code}')}), response.status_code
                 
-        except requests.exceptions.ConnectionError:
-            # IB bot is not running or not reachable
-            return jsonify({'error': 'IB trading not yet started'}), 503
-        except requests.exceptions.Timeout:
-            return jsonify({'error': 'IB bot command timeout'}), 504
-        except Exception as e:
-            debug_logger.error(f"Error forwarding command to IB bot: {e}")
-            return jsonify({'error': f'Failed to forward command: {str(e)}'}), 500
+            except Exception as e:
+                debug_logger.error(f"Error creating restart_requested.flag: {e}")
+                return jsonify({'error': f'Failed to initiate restart: {str(e)}'}), 500
+        
+        elif command == 'HELP':
+            help_text = """Available commands for external trading app:
+  RESTART - Smart restart (skip warmup, load recent data from database)
+  FULL_RESTART - Full restart with complete warmup sequence
+  SKIP_WARMUP - Skip warmup on next restart
+  SHOW_PRICES - Show recent price data and algorithm state
+  HELP - Show this help message
+  
+Note: Connection management, position tracking, and order execution
+are handled by your external trading application."""
+            
+            return jsonify({
+                'command': command,
+                'result': help_text,
+                'timestamp': datetime.datetime.now().isoformat()
+            }), 200
+        
+        elif command == 'SHOW_PRICES':
+            try:
+                # Show recent prices and algorithm state
+                price_info = []
+                current_time = datetime.datetime.now()
+                
+                for currency in algorithm.SUPPORTED_CURRENCIES:
+                    # Get recent bars if available
+                    if currency in algorithm.bars and not algorithm.bars[currency].empty:
+                        recent_bars = algorithm.bars[currency].tail(5)
+                        for idx, row in recent_bars.iterrows():
+                            price_info.append({
+                                'currency': currency,
+                                'time': idx.isoformat(),
+                                'price': f"{row['close']:.5f}",
+                                'type': 'bar_close'
+                            })
+                    
+                    # Get zone count
+                    zone_count = len(algorithm.current_valid_zones_dict.get(currency, {}))
+                    if zone_count > 0:
+                        price_info.append({
+                            'currency': currency,
+                            'zones': zone_count,
+                            'type': 'zone_info'
+                        })
+                
+                result = {
+                    'timestamp': current_time.isoformat(),
+                    'price_data': price_info,
+                    'total_zones': sum(len(zones) for zones in algorithm.current_valid_zones_dict.values()),
+                    'supported_currencies': algorithm.SUPPORTED_CURRENCIES
+                }
+                
+                return jsonify({
+                    'command': command,
+                    'result': result,
+                    'timestamp': datetime.datetime.now().isoformat()
+                }), 200
+                
+            except Exception as e:
+                debug_logger.error(f"Error getting price info: {e}")
+                return jsonify({'error': f'Failed to get price information: {str(e)}'}), 500
+        
+        else:
+            return jsonify({'error': f'Unknown command: {command}. Use HELP for available commands.'}), 400
         
     except Exception as e:
         debug_logger.error(f"Error executing command: {e}", exc_info=True)
@@ -252,7 +299,8 @@ def health_check():
     """Simple health check endpoint"""
     return jsonify({
         'status': 'running',
-        'timestamp': datetime.datetime.now().isoformat()
+        'timestamp': datetime.datetime.now().isoformat(),
+        'supported_currencies': algorithm.SUPPORTED_CURRENCIES
     }), 200
 
 @app.route('/algorithm_state', methods=['GET'])
@@ -317,48 +365,12 @@ def get_algorithm_state():
         debug_logger.error(f"Error getting algorithm state: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-@app.route('/algorithm_positions', methods=['GET'])
-def get_algorithm_positions():
-    """Get current algorithm positions - IB bot queries this instead of maintaining its own state"""
-    try:
-        import algorithm
-        
-        positions = {}
-        for currency in algorithm.SUPPORTED_CURRENCIES:
-            # Get current trades for this currency
-            open_trades = [t for t in algorithm.trades[currency] if t['status'] == 'open']
-            
-            if not open_trades:
-                positions[currency] = None  # No position
-            elif len(open_trades) == 1:
-                # Single position
-                trade = open_trades[0]
-                positions[currency] = trade['direction']  # 'long' or 'short'
-            else:
-                # Multiple trades - this shouldn't happen but handle gracefully
-                debug_logger.warning(f"Multiple open trades detected for {currency}: {len(open_trades)}")
-                # Use the most recent trade
-                latest_trade = max(open_trades, key=lambda t: t['entry_time'])
-                positions[currency] = latest_trade['direction']
-        
-        return jsonify({
-            'status': 'success',
-            'positions': positions,
-            'timestamp': datetime.datetime.now().isoformat()
-        }), 200
-        
-    except Exception as e:
-        debug_logger.error(f"Error getting algorithm positions: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/trade_signal_batch', methods=['POST'])
 def trade_signal_batch():
     """
     Batch endpoint for processing multiple price ticks sequentially.
     Used by testing scripts to speed up historical data processing.
     Maintains tick-by-tick algorithm behavior.
-    
-    Note: Signal forwarding has been disabled to prevent connection exhaustion during backtesting.
     """
     try:
         content = request.json
@@ -437,14 +449,6 @@ def trade_signal_batch():
                 }
                 results.append(signal_result)
                 
-                # Forward non-hold signals to /trade_signal endpoint for external monitoring
-                # COMMENTED OUT: This causes connection exhaustion during high-volume backtesting
-                # if signal != 'hold':
-                #     forward_signal_to_trade_endpoint(signal_result)
-                
-                # Log non-hold signals only once (removed duplicate logging)
-                # Logging is now handled by the notification endpoint
-                
             except Exception as e:
                 results.append({'error': str(e), 'index': i})
                 debug_logger.error(f"Error processing batch item {i}: {e}")
@@ -464,136 +468,9 @@ def trade_signal_batch():
         debug_logger.error(f"Error in batch processing: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 400
 
-# Global variable to track IB process
-ib_process = None
-
-def start_ib_live_trading():
-    """
-    Start the IB live trading script as a subprocess.
-    """
-    global ib_process
-    
-    try:
-        import subprocess
-        import os
-        
-        debug_logger.info("Starting IB Live Trading...")
-        
-        # Pass environment variables to subprocess
-        env = os.environ.copy()
-        
-        # Log critical environment variables for debugging
-        debug_logger.info(f"IB_HOST from environment: {env.get('IB_HOST', 'NOT SET')}")
-        debug_logger.info(f"IB_PORT from environment: {env.get('IB_PORT', 'NOT SET')}")
-        debug_logger.info(f"ALGO_INSTANCE from environment: {env.get('ALGO_INSTANCE', '1')}")
-        debug_logger.info(f"IB_API_PORT from environment: {env.get('IB_API_PORT', '6001')}")
-        
-        # Force unbuffered output for better subprocess behavior
-        env['PYTHONUNBUFFERED'] = '1'
-        
-        # Start the IB trading script with environment
-        ib_process = subprocess.Popen(
-            [sys.executable, '-u', 'ib_live_trading_enhanced.py'],  # -u for unbuffered
-            cwd=os.getcwd(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1,  # Line buffered
-            env=env  # Pass the environment variables
-        )
-        
-        debug_logger.info(f"IB Live Trading started with PID: {ib_process.pid}")
-        trade_logger.info("IB Live Trading system activated")
-        
-        # Start a thread to monitor the IB process
-        monitor_thread = threading.Thread(target=monitor_ib_process, daemon=True)
-        monitor_thread.start()
-        
-    except Exception as e:
-        debug_logger.error(f"Failed to start IB Live Trading: {e}", exc_info=True)
-
-def monitor_ib_process():
-    """
-    Monitor the IB process and restart it if it crashes.
-    """
-    global ib_process
-    
-    restart_count = 0
-    max_restarts = 5
-    
-    while ib_process is not None:
-        try:
-            # Check if process is still running
-            if ib_process.poll() is not None:
-                exit_code = ib_process.returncode
-                debug_logger.warning(f"IB Live Trading process has stopped with exit code: {exit_code}")
-                
-                restart_count += 1
-                if restart_count > max_restarts:
-                    debug_logger.error(f"IB process crashed {max_restarts} times, giving up")
-                    trade_logger.error("IB Live Trading failed to start after multiple attempts")
-                    ib_process = None
-                    break
-                
-                # Wait longer between restart attempts
-                wait_time = min(5 * restart_count, 30)
-                debug_logger.info(f"Waiting {wait_time} seconds before restart attempt {restart_count}/{max_restarts}...")
-                time.sleep(wait_time)
-                
-                debug_logger.info(f"Restarting IB Live Trading (attempt {restart_count}/{max_restarts})...")
-                start_ib_live_trading()
-                break
-            
-            # Read and log output from IB process
-            try:
-                line = ib_process.stdout.readline()
-                if line:
-                    line_stripped = line.strip()
-                    # Log important messages to trade logger too
-                    if any(keyword in line_stripped for keyword in ['[ERROR]', '[OK]', '[RECONNECT]', '[START]', '[MARKET_DATA]', 'Connected', 'Disconnected']):
-                        trade_logger.info(f"IB: {line_stripped}")
-                    debug_logger.info(f"IB: {line_stripped}")
-                    
-                    # Force flush to ensure logs are visible
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-            except Exception as e:
-                debug_logger.error(f"Error reading IB output: {e}")
-            
-            time.sleep(0.5)  # Reduce sleep for more responsive monitoring
-            
-        except Exception as e:
-            debug_logger.error(f"Error monitoring IB process: {e}")
-            time.sleep(5)
-
-def stop_ib_live_trading():
-    """
-    Stop the IB live trading process gracefully.
-    """
-    global ib_process
-    
-    if ib_process is not None:
-        try:
-            debug_logger.info("Stopping IB Live Trading...")
-            ib_process.terminate()
-            
-            # Wait for graceful shutdown
-            try:
-                ib_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                debug_logger.warning("IB process didn't stop gracefully, forcing shutdown...")
-                ib_process.kill()
-                ib_process.wait()
-            
-            ib_process = None
-            debug_logger.info("IB Live Trading stopped")
-            
-        except Exception as e:
-            debug_logger.error(f"Error stopping IB process: {e}")
-
 def run_post_startup_warmup():
     """
-    Run the complete warmup sequence after server startup, then start IB live trading.
+    Run the complete warmup sequence after server startup.
     This runs in a background thread to avoid blocking the server.
     """
     global SKIP_MODE2, SKIP_MODE3
@@ -603,7 +480,7 @@ def run_post_startup_warmup():
         debug_logger.info("Waiting 2 seconds for server to be ready...")
         time.sleep(2)
         
-        # Check for skip_warmup.flag file (set by IB command listener)
+        # Check for skip_warmup.flag file
         skip_file_exists = False
         try:
             import os
@@ -689,8 +566,7 @@ def run_post_startup_warmup():
             debug_logger.info("Resetting trading state for fresh live trading start...")
             algorithm.reset_trading_state_for_live_trading()
             
-            # Now start IB live trading
-            start_ib_live_trading()
+            trade_logger.info("Trading algorithm ready - waiting for external app to send price data")
             
         except Exception as e:
             debug_logger.error(f"Error during post-startup warmup: {e}", exc_info=True)
@@ -699,52 +575,10 @@ def run_post_startup_warmup():
     except Exception as e:
         debug_logger.error(f"Fatal error in post-startup warmup: {e}", exc_info=True)
 
-# Add signal forwarding function
-# COMMENTED OUT: This function caused connection exhaustion during high-volume backtesting
-# Keeping for reference in case needed for live trading scenarios
-# def forward_signal_to_trade_endpoint(signal_data):
-#     """
-#     Forward signals to the original /trade_signal endpoint for external monitoring.
-#     This is async and lightweight - just forwards the original tick data, not reprocessing.
-#     """
-#     def do_forward():
-#         try:
-#             # Forward the original tick data to /trade_signal (same format as individual requests)
-#             forward_payload = {
-#                 "data": {
-#                     "Time": signal_data['time'], 
-#                     "Price": signal_data['price']
-#                 },
-#                 "currency": signal_data['currency'],
-#                 "source": "batch_forward"  # Flag to indicate this is a forward, not original
-#             }
-#             
-#             # Quick forward with short timeout
-#             response = requests.post("http://localhost:5000/trade_signal", 
-#                                    json=forward_payload, 
-#                                    timeout=2)  # Short timeout for forwarding
-#             
-#             if response.status_code == 200:
-#                 debug_logger.info(f"Successfully forwarded {signal_data['signal']} to /trade_signal")
-#             else:
-#                 debug_logger.warning(f"Failed to forward signal: HTTP {response.status_code}")
-#                 
-#         except Exception as e:
-#             debug_logger.warning(f"Error forwarding to /trade_signal: {e}")
-#             # Don't raise - forwarding failures shouldn't break batch processing
-#     
-#     # Run in background thread to avoid blocking
-#     import threading
-#     threading.Thread(target=do_forward, daemon=True).start()
-
-# Removed /signal_notification endpoint - all signals now forwarded to /trade_signal 
-# for better compatibility with external monitoring systems
-
 # Signal handling for graceful shutdown
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     debug_logger.info(f"Received signal {signum}, shutting down gracefully...")
-    stop_ib_live_trading()
     sys.exit(0)
 
 def check_restart_flag():
@@ -769,9 +603,6 @@ def check_restart_flag():
                     trade_logger.info("FULL_RESTART command received - full restart with complete warmup")
                 else:
                     trade_logger.info("RESTART command received - shutting down for restart")
-                
-                # Stop IB trading first
-                stop_ib_live_trading()
                 
                 # Give it a moment to clean up
                 time.sleep(2)
@@ -804,9 +635,6 @@ def check_restart_flag():
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
-
-# Register cleanup function for normal exit
-atexit.register(stop_ib_live_trading)
 
 if __name__ == '__main__':
     # Parse command line arguments for skip options and restart types
@@ -882,32 +710,25 @@ if __name__ == '__main__':
     debug_logger.info("Restart monitor started")
     
     # Start the server (this will block and keep the server running)
-    debug_logger.info("Server starting on http://0.0.0.0:6000")
+    debug_logger.info("Server starting on http://0.0.0.0:5000")
     print("Server is now running and accepting requests!")
     if SKIP_MODE2 and SKIP_MODE3:
         print("Warmup process running in background (SKIP MODE - faster)...")
     else:
         print("Warmup process running in background...")
-    print("API available at: http://0.0.0.0:6000 (accessible from any IP)")
+    print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
     print("")
-    print("COMMAND LISTENER: After IB Live Trading starts, you can use these commands:")
-    print("  CLOSE_EURUSD/USDCAD/GBPUSD - Close position for currency")
-    print("  TWS_CLOSED_EURUSD/USDCAD/GBPUSD - Mark position as closed in TWS")
-    print("  SWITCH_LIVE - Switch to live trading (instance 1 only)")
-    print("  SWITCH_PAPER - Switch to paper trading")
-    print("  SET_ORDER_SIZE <amount> - Set position size (e.g., SET_ORDER_SIZE 50000)")
-    print("  RECONNECT - Force reconnection to IB (use after max attempts reached)")
-    print("  FORCE_DISCONNECT - Force disconnect all zombie IB connections")
+    print("EXTERNAL APP INTEGRATION:")
+    print("  Send price data to: POST /trade_signal")
+    print("  Payload: {'data': {'Time': '2024-01-01 12:00:00', 'Price': 1.0523}, 'currency': 'EUR.USD'}")
+    print("  Response: {'signal': 'buy|sell|close|hold', 'currency': 'EUR.USD'}")
+    print("")
+    print("AVAILABLE COMMANDS (via POST /command):")
+    print("  RESTART - Smart restart (skip warmup, load recent data)")
+    print("  FULL_RESTART - Full restart with complete warmup")
     print("  SKIP_WARMUP - Skip warmup on next restart")
-    print("  RESTART - Connection restart (auto-saves positions, reconnects to IB)")
-    print("  FULL_RESTART - Full restart (complete warmup sequence)")
-    print("  STATUS - Show current positions")
-    print("  SHOW_PRICES - Show live prices and recent history")
-    print("  HELP - Show all commands")
-    print("")
-    print("Connection restart: RESTART (saves positions, reconnects to IB)")
-    print("Live trading: SWITCH_LIVE (instance 1 only)")
-    print("Paper trading: SWITCH_PAPER")
+    print("  SHOW_PRICES - Show recent price data and algorithm state")
+    print("  HELP - Show available commands")
     print("")
     # Increase worker threads to handle concurrent requests better
-    serve(app, host='0.0.0.0', port=6000, threads=32)  # 32 threads - high capacity without lock contention risk
+    serve(app, host='0.0.0.0', port=5000, threads=32)  # 32 threads - high capacity without lock contention risk

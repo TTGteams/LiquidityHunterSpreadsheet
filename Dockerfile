@@ -31,8 +31,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code
 COPY . .
 
-# No longer need startup script - orchestration integrated into server.py
-
 # Create logs directory
 RUN mkdir -p /app/logs
 
@@ -41,16 +39,13 @@ ENV FLASK_ENV=production
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Expose the port that Flask will run on
-EXPOSE 6000
+# Expose the port that Flask will run on (API for external trading app)
+EXPOSE 5000
 
-# Add health check for the complete system
-# The health check waits longer during startup to allow for warmup (35 min + buffer)
-HEALTHCHECK --interval=60s --timeout=15s --start-period=2400s --retries=3 \
-    CMD curl -f http://localhost:6000/trade_signal -X POST \
-    -H "Content-Type: application/json" \
-    -d '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}' \
-    || exit 1
+# Health check for external app integration
+# Reduced start period since there's no IB connection setup time
+HEALTHCHECK --interval=30s --timeout=10s --start-period=900s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
 
-# Run the Flask server which now orchestrates both services internally
+# Run the Flask server (trading algorithm API)
 CMD ["python", "server.py"]

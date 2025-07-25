@@ -5,8 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: forex_trading_system
     ports:
-      - "6000:6000"  # Flask server
-      - "6001:6001"  # IB bot HTTP API
+      - "5000:5000"  # Flask server API for external trading app
     environment:
       # Flask configuration
       FLASK_ENV: production
@@ -14,25 +13,9 @@ services:
       PYTHONPATH: /app
 
       #########################################
-      # Algorithm instance ID and trading configuration
-      # Instance 1: Live trading capable (default)
-      # Instance 2, 3, etc.: Paper trading only
-      ALGO_INSTANCE: "1"
-      
-      # Trading mode configuration
-      # For Instance 1: Can be "live" or "paper"
-      # For Instance 2+: Must be "paper" (enforced by code)
-      TRADING_MODE: "live"  # or "paper"
-      
-      # Sub-account configuration (for live trading)
-      # Only used when TRADING_MODE=live and ALGO_INSTANCE=1
-      # This connects to sub-account U11134039 within the live trading account
-      ACCOUNT_ID: "U11134039"
-      
-      # Position size configuration
-      # Default: 10k for live trading, 100k for paper trading
-      # Can be overridden with SET_ORDER_SIZE command
-      POSITION_SIZE: "1000"  # Set to 1k for live, 100k for paper
+      # Algorithm instance ID
+      # Multiple instances can run simultaneously for different strategies
+      ALGO_INSTANCE: "4"
       #########################################
       
       # Database configuration (can be overridden via env file)
@@ -40,15 +23,6 @@ services:
       DB_DATABASE: "FXStrat"
       DB_USERNAME: "djaime"
       DB_PASSWORD: "Enrique30072000!3"
-      
-      # Interactive Brokers configuration
-      IB_HOST: "host.docker.internal"  # Special Docker hostname to reach host machine
-      IB_PORT: "7496"  # 7496 for live, 7497 for paper (auto-configured by instance)
-      IB_CLIENT_ID: "6969"
-      IB_API_PORT: "6001"  # HTTP API port for IB bot
-      
-      # API configuration
-      API_URL: "http://localhost:6000/trade_signal"
       
       # Accept EULA for SQL Server components
       ACCEPT_EULA: Y
@@ -79,16 +53,13 @@ services:
           memory: 1G
           cpus: '2.0'
     
-    # Health check configuration
+    # Health check configuration for external app integration
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6000/trade_signal", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"data":{"Time":"2024-01-01 12:00:00","Price":1.0},"currency":"EUR.USD"}']
-      interval: 60s
-      timeout: 15s
-      start_period: 40m  # Allow 40 minutes for full startup and warmup (35m + buffer)
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15m  # Allow 15 minutes for startup and warmup
       retries: 3
-
-  
-
 
 networks:
   trading_network:
