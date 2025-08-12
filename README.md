@@ -24,7 +24,7 @@ Your Trading App → HTTP API → Trading Algorithm → Trading Signals → Your
 ### **Core Components**
 - **`algorithm.py`** - Core trading logic (zones, indicators, signals)
 - **`server.py`** - Flask API server for external app integration
-- **`run_test.py`** - Warmup system and historical backtesting
+- `run_test.py` remains for reference/historical backtesting only. The server no longer uses warmup.
 - **Database** - SQL Server for persistence and analysis
 - **Docker** - Containerized deployment
 
@@ -77,14 +77,19 @@ payload = {
 response = requests.post("http://localhost:5000/trade_signal", json=payload)
 result = response.json()
 
-# Result: {"signal": "buy|sell|close|hold", "currency": "EUR.USD"}
+# Result: {"signal": "buy|sell|hold", "currency": "EUR.USD"}
 ```
 
 ### **Available Signals**
-- **`buy`** - Open long position or close short and open long
-- **`sell`** - Open short position or close long and open short  
-- **`close`** - Close current position
+- **`buy`** - Open long position OR close short position
+- **`sell`** - Open short position OR close long position  
 - **`hold`** - No action required
+
+**Position Logic:**
+- When opening a long trade → sends `buy`
+- When closing a long trade → sends `sell` 
+- When opening a short trade → sends `sell`
+- When closing a short trade → sends `buy`
 
 ### **Supported Currency Pairs**
 - `EUR.USD`
@@ -102,9 +107,9 @@ Send commands via POST to `/command`:
 
 ```python
 commands = {
-    "RESTART": "Smart restart (load recent data from database)",
-    "FULL_RESTART": "Full restart with complete warmup",
-    "SKIP_WARMUP": "Skip warmup on next restart", 
+    "RESTART": "Smart restart",
+    "FULL_RESTART": "Full restart",
+    "SKIP_WARMUP": "No-op; warmup removed", 
     "SHOW_PRICES": "Show recent price data and algorithm state",
     "HELP": "Show available commands"
 }
@@ -185,12 +190,20 @@ class MyTradingApp:
     def execute_trade_signal(self, currency, signal, price):
         current_position = self.broker.get_position(currency)
         
-        if signal == 'buy' and current_position != 'long':
-            self.broker.place_buy_order(currency, self.calculate_position_size())
-        elif signal == 'sell' and current_position != 'short':
-            self.broker.place_sell_order(currency, self.calculate_position_size())
-        elif signal == 'close':
-            self.broker.close_position(currency)
+        if signal == 'buy':
+            if current_position == 'short':
+                # Close short position first
+                self.broker.close_position(currency)
+            if current_position != 'long':
+                # Open long position
+                self.broker.place_buy_order(currency, self.calculate_position_size())
+        elif signal == 'sell':
+            if current_position == 'long':
+                # Close long position first  
+                self.broker.close_position(currency)
+            if current_position != 'short':
+                # Open short position
+                self.broker.place_sell_order(currency, self.calculate_position_size())
 ```
 
 ## 📋 **System Requirements**
@@ -230,11 +243,6 @@ curl -X POST http://localhost:5000/command \
 ```
 
 ## 🧪 **Testing & Development**
-
-### **Run Historical Backtest**
-```bash
-python run_test.py
-```
 
 ### **Test API with Simulated Data**
 ```bash

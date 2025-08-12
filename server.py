@@ -170,11 +170,11 @@ def execute_command():
                 with open('skip_warmup.flag', 'w') as f:
                     f.write('skip')
                 debug_logger.info("Created skip_warmup.flag file")
-                trade_logger.info("SKIP_WARMUP command received - will skip warmup on next restart")
+                trade_logger.info("SKIP_WARMUP command received - warmup is disabled (no-op)")
                 
                 return jsonify({
                     'command': command,
-                    'result': 'Skip warmup flag set. Will skip warmup on next restart.',
+                    'result': 'Warmup disabled. Command retained for backward compatibility.',
                     'timestamp': datetime.datetime.now().isoformat()
                 }), 200
                 
@@ -188,15 +188,15 @@ def execute_command():
                 algorithm.is_live_trading_mode = True
                 algorithm.save_algorithm_signal_state()
                 
-                # Create full restart flag - performs complete warmup
+                # Create full restart flag
                 with open('restart_requested.flag', 'w') as f:
                     f.write('full')
                 debug_logger.info("Created full restart flag")
-                trade_logger.info("FULL_RESTART command received - initiating full restart with complete warmup")
+                trade_logger.info("FULL_RESTART command received - initiating full restart")
                 
                 return jsonify({
                     'command': command,
-                    'result': 'Full restart initiated - will perform complete warmup sequence.',
+                    'result': 'Full restart initiated.',
                     'timestamp': datetime.datetime.now().isoformat()
                 }), 200
                 
@@ -210,15 +210,15 @@ def execute_command():
                 algorithm.is_live_trading_mode = True
                 algorithm.save_algorithm_signal_state()
                 
-                # Create smart restart flag - skips warmup and loads recent data
+                # Create smart restart flag
                 with open('restart_requested.flag', 'w') as f:
                     f.write('smart')
                 debug_logger.info("Created smart restart flag")
-                trade_logger.info("RESTART command received - initiating smart restart (skip warmup, load recent data)")
+                trade_logger.info("RESTART command received - initiating smart restart")
                 
                 return jsonify({
                     'command': command,
-                    'result': 'Smart restart initiated - will skip warmup and load recent data from database.',
+                    'result': 'Smart restart initiated.',
                     'timestamp': datetime.datetime.now().isoformat()
                 }), 200
                 
@@ -228,9 +228,9 @@ def execute_command():
         
         elif command == 'HELP':
             help_text = """Available commands for external trading app:
-  RESTART - Smart restart (skip warmup, load recent data from database)
-  FULL_RESTART - Full restart with complete warmup sequence
-  SKIP_WARMUP - Skip warmup on next restart
+  RESTART - Smart restart
+  FULL_RESTART - Full restart
+  SKIP_WARMUP - No-op (warmup disabled)
   SHOW_PRICES - Show recent price data and algorithm state
   HELP - Show this help message
   
@@ -390,7 +390,7 @@ def trade_signal_batch():
             return jsonify({'error': error_msg}), 400
         
         results = []
-        signals_count = {'buy': 0, 'sell': 0, 'close': 0, 'hold': 0}
+        signals_count = {'buy': 0, 'sell': 0, 'hold': 0}
         
         # Process each data point sequentially
         for i, data_point in enumerate(data_points):
@@ -469,111 +469,12 @@ def trade_signal_batch():
         return jsonify({'error': str(e)}), 400
 
 def run_post_startup_warmup():
-    """
-    Run the complete warmup sequence after server startup.
-    This runs in a background thread to avoid blocking the server.
-    """
-    global SKIP_MODE2, SKIP_MODE3
-    
+    """Warmup disabled. External data fetcher starts during algorithm init."""
     try:
-        # Wait a moment for server to be fully ready
-        debug_logger.info("Waiting 2 seconds for server to be ready...")
-        time.sleep(2)
-        
-        # Check for skip_warmup.flag file
-        skip_file_exists = False
-        try:
-            import os
-            if os.path.exists('skip_warmup.flag'):
-                skip_file_exists = True
-                debug_logger.info("Found skip_warmup.flag - will skip warmup modes")
-                # Delete the flag so it only applies once
-                try:
-                    os.remove('skip_warmup.flag')
-                    debug_logger.info("Deleted skip_warmup.flag")
-                except Exception as e:
-                    debug_logger.warning(f"Could not delete skip_warmup.flag: {e}")
-        except Exception as e:
-            debug_logger.error(f"Error checking for skip_warmup.flag: {e}")
-        
-        # Apply skip flag if it existed
-        if skip_file_exists:
-            SKIP_MODE2 = True
-            SKIP_MODE3 = True
-        
-        if SKIP_MODE2 or SKIP_MODE3:
-            skipped_modes = []
-            if SKIP_MODE2:
-                skipped_modes.append("Mode 2 (Historical)")
-            if SKIP_MODE3:
-                skipped_modes.append("Mode 3 (Warmup)")
-            debug_logger.info(f"Starting post-startup warmup sequence... SKIPPING: {', '.join(skipped_modes)}")
-        else:
-            debug_logger.info("Starting post-startup warmup sequence...")
-        
-        # Import and run the complete warmup sequence
-        try:
-            from run_test import warmup_data
-            
-            # Run warmup_data with skip parameters
-            debug_logger.info("Calling warmup_data function...")
-            result = warmup_data(skip_mode2=SKIP_MODE2, skip_mode3=SKIP_MODE3)
-            
-            # If we skipped warmup modes, load recent zones AND bars with indicators from database
-            if SKIP_MODE2 and SKIP_MODE3:
-                debug_logger.info("Loading recent zones and bars with indicators from database (HYBRID APPROACH)...")
-                try:
-                    # Load the most recent 10 zones per currency from database
-                    recent_zones = algorithm.load_recent_zones_from_database(limit=10)
-                    
-                    # Load the most recent 100 bars with indicators per currency from database
-                    recent_bars = algorithm.load_recent_bars_with_indicators_from_database(limit=100)
-                    
-                    # Apply the loaded zones to the algorithm state
-                    zones_loaded = 0
-                    bars_loaded = 0
-                    
-                    for currency in algorithm.SUPPORTED_CURRENCIES:
-                        # Load zones
-                        if currency in recent_zones and recent_zones[currency]:
-                            algorithm.load_preexisting_zones(recent_zones[currency], currency)
-                            zones_loaded += len(recent_zones[currency])
-                            debug_logger.warning(
-                                f"Populated {currency} with {len(recent_zones[currency])} recent zones from database"
-                            )
-                        
-                        # Load bars with indicators
-                        if currency in recent_bars and not recent_bars[currency].empty:
-                            algorithm.load_preexisting_bars_and_indicators(recent_bars[currency], currency)
-                            bars_loaded += len(recent_bars[currency])
-                            debug_logger.warning(
-                                f"Populated {currency} with {len(recent_bars[currency])} recent bars with indicators from database"
-                            )
-                    
-                    trade_logger.info(
-                        f"HYBRID SMART RESTART complete - loaded {zones_loaded} zones and {bars_loaded} bars with indicators from database"
-                    )
-                    
-                except Exception as e:
-                    debug_logger.error(f"Error loading recent data from database: {e}", exc_info=True)
-                    debug_logger.warning("Continuing without recent zones and bars")
-            
-            debug_logger.info("Post-startup warmup completed successfully")
-            trade_logger.info("Algorithm warmup complete - all zones and bars loaded")
-            
-            # Reset trading state to start fresh for live trading
-            # This ensures no backtest trades affect live trading
-            debug_logger.info("Resetting trading state for fresh live trading start...")
-            algorithm.reset_trading_state_for_live_trading()
-            
-            trade_logger.info("Trading algorithm ready - waiting for external app to send price data")
-            
-        except Exception as e:
-            debug_logger.error(f"Error during post-startup warmup: {e}", exc_info=True)
-            debug_logger.warning("Server will continue with empty algorithm state")
-            
+        debug_logger.info("Warmup disabled. External data fetcher handles zones/indicators.")
+        trade_logger.info("Startup complete - waiting for external price data.")
     except Exception as e:
-        debug_logger.error(f"Fatal error in post-startup warmup: {e}", exc_info=True)
+        debug_logger.error(f"Error in placeholder warmup: {e}")
 
 # Signal handling for graceful shutdown
 def signal_handler(signum, frame):
@@ -598,9 +499,9 @@ def check_restart_flag():
                 debug_logger.info(f"Restart flag detected - type: {restart_type}")
                 
                 if restart_type == 'smart':
-                    trade_logger.info("RESTART command received - smart restart (skip warmup, load recent zones)")
+                    trade_logger.info("RESTART command received - smart restart")
                 elif restart_type == 'full':
-                    trade_logger.info("FULL_RESTART command received - full restart with complete warmup")
+                    trade_logger.info("FULL_RESTART command received - full restart")
                 else:
                     trade_logger.info("RESTART command received - shutting down for restart")
                 
@@ -648,24 +549,22 @@ if __name__ == '__main__':
         elif arg == "smart_restart":
             SKIP_MODE2 = True
             SKIP_MODE3 = True
-            print("Server started with SMART RESTART - will skip warmup and load recent zones from database")
+            print("Server started with SMART RESTART")
         elif arg == "full_restart":
             SKIP_MODE2 = False
             SKIP_MODE3 = False
-            print("Server started with FULL RESTART - will perform complete warmup sequence")
+            print("Server started with FULL RESTART")
         elif arg == "help" or arg == "--help":
             print("Usage: python server.py [option]")
-            print("  skip: Skip Modes 2 and 3 during startup warmup (faster startup)")
-            print("  smart_restart: Skip warmup and load recent zones (used by RESTART command)")
-            print("  full_restart: Perform complete warmup (used by FULL_RESTART command)")
+            print("  smart_restart: Smart restart (used by RESTART command)")
+            print("  full_restart: Full restart (used by FULL_RESTART command)")
             print("  (no argument): Run all modes during startup (normal operation)")
             sys.exit(0)
         else:
             print(f"Unknown argument: {arg}")
             print("Usage: python server.py [option]")
-            print("  skip: Skip Modes 2 and 3 during startup warmup")
-            print("  smart_restart: Skip warmup and load recent zones")
-            print("  full_restart: Perform complete warmup")
+            print("  smart_restart: Smart restart")
+            print("  full_restart: Full restart")
             print("  (no argument): Run all modes during startup")
             sys.exit(1)
     
@@ -676,7 +575,7 @@ if __name__ == '__main__':
     # Show immediate startup message
     print(f"Starting Algorithm Trading Server - Instance #{ALGO_INSTANCE}...")
     if SKIP_MODE2 and SKIP_MODE3:
-        print("SKIP MODE: Will skip historical backtest and warmup preparation")
+        print("SKIP MODE enabled (legacy flag - warmup disabled)")
     print("Initializing database connections...")
     
     # Import algorithm but DON'T run warmup during startup (avoid circular dependency)
@@ -693,11 +592,7 @@ if __name__ == '__main__':
     debug_logger.info("Starting server...")
     
     # Start the warmup sequence in a background thread AFTER server starts
-    print("Starting background warmup process...")
-    if SKIP_MODE2 and SKIP_MODE3:
-        print("   (SKIP MODE: Only signal test will run - much faster startup)")
-    else:
-        print("   (This will take 5-10 minutes to complete)")
+    print("Starting background startup task...")
     print("   Server will be ready for API calls immediately")
     print("")
     
@@ -712,21 +607,18 @@ if __name__ == '__main__':
     # Start the server (this will block and keep the server running)
     debug_logger.info("Server starting on http://0.0.0.0:5000")
     print("Server is now running and accepting requests!")
-    if SKIP_MODE2 and SKIP_MODE3:
-        print("Warmup process running in background (SKIP MODE - faster)...")
-    else:
-        print("Warmup process running in background...")
+    print("Background startup task running (warmup disabled)...")
     print("API available at: http://0.0.0.0:5000 (accessible from any IP)")
     print("")
     print("EXTERNAL APP INTEGRATION:")
     print("  Send price data to: POST /trade_signal")
     print("  Payload: {'data': {'Time': '2024-01-01 12:00:00', 'Price': 1.0523}, 'currency': 'EUR.USD'}")
-    print("  Response: {'signal': 'buy|sell|close|hold', 'currency': 'EUR.USD'}")
+    print("  Response: {'signal': 'buy|sell|hold', 'currency': 'EUR.USD'}")
     print("")
     print("AVAILABLE COMMANDS (via POST /command):")
-    print("  RESTART - Smart restart (skip warmup, load recent data)")
-    print("  FULL_RESTART - Full restart with complete warmup")
-    print("  SKIP_WARMUP - Skip warmup on next restart")
+    print("  RESTART - Smart restart")
+    print("  FULL_RESTART - Full restart")
+    print("  SKIP_WARMUP - No-op (warmup disabled)")
     print("  SHOW_PRICES - Show recent price data and algorithm state")
     print("  HELP - Show available commands")
     print("")

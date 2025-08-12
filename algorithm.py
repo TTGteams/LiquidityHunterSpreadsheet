@@ -8,6 +8,7 @@ import pyodbc
 import datetime
 import json
 import os
+import threading
 
 # Use the named trade_logger and debug_logger created in app.py
 trade_logger = logging.getLogger("trade_logger")
@@ -69,8 +70,18 @@ balance = {currency: 100000 for currency in SUPPORTED_CURRENCIES}  # Initialize 
 # Signal tracking
 last_non_hold_signal = {currency: None for currency in SUPPORTED_CURRENCIES}
 
-# Zone formation tracking
+# Zone formation tracking (kept for backward compatibility but will be deprecated)
 cumulative_zone_info = {currency: None for currency in SUPPORTED_CURRENCIES}
+
+# NEW: External data sourcing system
+external_indicators = {currency: {'rsi': None, 'macd_line': None, 'signal_line': None, 'timestamp': None, 'freshness_status': 'missing'} for currency in SUPPORTED_CURRENCIES}
+invalidated_zones_memory = {currency: [] for currency in SUPPORTED_CURRENCIES}  # Track locally invalidated zones
+
+# External data fetching configuration
+EXTERNAL_DATA_FETCH_INTERVAL = 300  # 5 minutes in seconds
+INDICATOR_STALENESS_WARNING = 600  # 10 minutes in seconds
+MAX_INVALIDATED_ZONES_MEMORY = 500  # Maximum zones to remember per currency
+external_data_timer = None  # Will hold the timer object
 
 # Add at the top with other constants
 VALID_PRICE_RANGES = {
@@ -419,25 +430,10 @@ def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
         bars[currency].loc[current_bar_start[currency]] = current_bar_data[currency]
         
         bar_count = len(bars[currency])
+        # Indicators are now sourced externally from IndicatorTracker; don't compute here
         rsi_value = None
         macd_value = None
         signal_value = None
-
-        # If we have at least 35 bars, calculate indicators
-        if bar_count >= 35:
-            # Clean any duplicate timestamps before calculating indicators
-            bars[currency] = clean_duplicate_bars(bars[currency], currency)
-            
-            rolling_window_data = bars[currency].tail(384).copy()
-            close_series = rolling_window_data["close"].dropna()
-            if len(close_series) >= 35:
-                rsi_vals = ta.rsi(close_series, length=14)
-                macd_vals = ta.macd(close_series, fast=12, slow=26, signal=9)
-                if rsi_vals is not None and not rsi_vals.dropna().empty:
-                    rsi_value = float(rsi_vals.iloc[-1])
-                if macd_vals is not None and not macd_vals.dropna().empty:
-                    macd_value = float(macd_vals["MACD_12_26_9"].iloc[-1])
-                    signal_value = float(macd_vals["MACDs_12_26_9"].iloc[-1])
 
         # Prepare bar data for storage
         finalized_bar_data = {
@@ -455,8 +451,8 @@ def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
         }
 
         # Enhanced logging with better formatting
-        rsi_str = "Not enough data" if rsi_value is None else f"{rsi_value:.2f}"
-        macd_str = "Not enough data" if macd_value is None else f"{macd_value:.2f}"
+        rsi_str = "external" if rsi_value is None else f"{rsi_value:.2f}"
+        macd_str = "external" if macd_value is None else f"{macd_value:.2f}"
         
         debug_logger.warning(
             f"\n\n{'='*40} {currency} BAR COMPLETED {'='*40}\n"
@@ -493,190 +489,7 @@ def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
 # --------------------------------------------------------------------------
 # Optimize identify_liquidity_zones to reduce logging
 def identify_liquidity_zones(data, current_valid_zones_dict, currency="EUR.USD", pre_calculated_atr=None):
-    # Keep only ONE global declaration
-    global cumulative_zone_info
-    
-    # Add diagnostic logging at the start - simplified
-    debug_logger.info(f"Identifying zones for {currency}: Processing {len(data)} bars, existing zones: {len(current_valid_zones_dict)}")
-    
-    # Ensure currency is initialized in cumulative_zone_info
-    if currency not in cumulative_zone_info:
-        cumulative_zone_info[currency] = None
-    
-    data = data.copy()
-    new_zones_detected = 0
-    new_zones_for_sql = []
-
-    # Initialize columns
-    data.loc[:, 'Liquidity_Zone'] = np.nan
-    data.loc[:, 'Zone_Size'] = np.nan
-    data.loc[:, 'Zone_Start_Price'] = np.nan
-    data.loc[:, 'Zone_End_Price'] = np.nan
-    data.loc[:, 'Zone_Length'] = np.nan
-    data.loc[:, 'zone_type'] = ''
-    data.loc[:, 'Confirmation_Time'] = pd.NaT
-
-    # Calculate dynamic PIPS_REQUIRED based on ATR (use pre-calculated value if provided)
-    if pre_calculated_atr is not None:
-        dynamic_pips_required = pre_calculated_atr
-    else:
-        dynamic_pips_required = calculate_atr_pips_required(data, currency)
-    
-    debug_logger.info(f"Dynamic pip threshold: {dynamic_pips_required*10000:.1f} pips")
-
-    # Add candle direction column
-    data['candle_direction'] = np.where(data['close'] > data['open'], 'green', 
-                                      np.where(data['close'] < data['open'], 'red', 'doji'))
-
-    # Track new zones detected in this run
-    new_zones_detected = 0
-    new_zones_for_sql = []  # List to store new zones for SQL insertion
-
-    # If we have a zone in progress from previous window, restore it
-    current_run = None
-    if cumulative_zone_info[currency] is not None:
-        current_run = cumulative_zone_info[currency]
-        if current_run['start_index'] < len(data):
-            current_run['start_index'] = 0
-        else:
-            current_run = None
-
-    # Only log the first few candles to reduce logging overhead
-    for i in range(len(data)):
-        # On the first few candles, log values to understand what's happening
-        if i < 3:  # Reduced from 5 to 3
-            debug_logger.info(f"Candle {i}: Open={data.iloc[i]['open']:.5f}, Close={data.iloc[i]['close']:.5f}, Direction={data.iloc[i]['candle_direction']}")
-        
-        current_candle = data.iloc[i]
-        
-        if current_run is None:
-            # Start new run
-            current_run = {
-                'start_index': i,
-                'start_price': current_candle['open'],
-                'direction': current_candle['candle_direction'],
-                'high': current_candle['high'],
-                'low': current_candle['low'],
-                'start_time': data.index[i]
-            }
-            continue
-
-        # Check if this candle continues the run
-        if current_candle['candle_direction'] == current_run['direction'] and \
-           current_candle['candle_direction'] != 'doji':
-            
-            # Update run's high/low
-            current_run['high'] = max(current_run['high'], current_candle['high'])
-            current_run['low'] = min(current_run['low'], current_candle['low'])
-            
-            # Calculate total movement
-            if current_run['direction'] == 'green':
-                total_move = current_run['high'] - current_run['start_price']
-            else:  # red
-                total_move = current_run['start_price'] - current_run['low']
-
-            # Check if movement meets dynamic pip requirement
-            if abs(total_move) >= dynamic_pips_required:
-                # Log zone qualification less verbosely
-                debug_logger.info(f"ZONE QUALIFICATION: Move={abs(total_move)*10000:.1f} pips >= Required={dynamic_pips_required*10000:.1f} pips")
-                zone_type = 'demand' if current_run['direction'] == 'green' else 'supply'
-                
-                if zone_type == 'demand':
-                    zone_start = current_run['low']
-                    zone_end = current_run['high']
-                else:
-                    zone_start = current_run['high']
-                    zone_end = current_run['low']
-
-                # CRITICAL FIX: Round zone prices to prevent floating point duplicates
-                zone_start = round(zone_start, 6)  # 6 decimals for consistency
-                zone_end = round(zone_end, 6)
-                
-                zone_id = (zone_start, zone_end)
-                
-                # Only check if zone exists in memory dictionary
-                if zone_id not in current_valid_zones_dict:
-                    # Create zone object with all required fields
-                    zone_object = {
-                        'start_price': zone_start,
-                        'end_price': zone_end,
-                        'zone_size': abs(zone_end - zone_start),
-                        'confirmation_time': data.index[i],
-                        'zone_type': zone_type,
-                        'start_time': current_run['start_time']
-                    }
-                    
-                    # Add to local dictionary and ensure key is (float, float) tuple
-                    current_valid_zones_dict[zone_id] = zone_object
-                    
-                    new_zones_detected += 1
-                    
-                    # Queue for batched DB operation instead of immediate save
-                    new_zones_for_sql.append({
-                        'currency': currency,
-                        'zone_start_price': zone_start,
-                        'zone_end_price': zone_end,
-                        'zone_size': abs(zone_end - zone_start),
-                        'zone_type': zone_type,
-                        'confirmation_time': data.index[i]
-                    })
-
-                    # Mark the zone in the data
-                    zone_indices = slice(current_run['start_index'], i + 1)
-                    data.loc[data.index[zone_indices], 'Liquidity_Zone'] = zone_start
-                    data.loc[data.index[zone_indices], 'Zone_Size'] = abs(zone_end - zone_start)
-                    data.loc[data.index[zone_indices], 'Zone_Start_Price'] = zone_start
-                    data.loc[data.index[zone_indices], 'Zone_End_Price'] = zone_end
-                    data.loc[data.index[zone_indices], 'Zone_Length'] = i - current_run['start_index'] + 1
-                    data.loc[data.index[zone_indices], 'zone_type'] = zone_type
-                    data.loc[data.index[zone_indices], 'Confirmation_Time'] = data.index[i]
-
-                    # Enhanced logging for new zone detection - simplified
-                    debug_logger.warning(
-                        f"NEW {currency} {zone_type.upper()} ZONE: Start={zone_start:.5f}, End={zone_end:.5f}, "
-                        f"Size={abs(zone_end - zone_start)*10000:.1f} pips, Time={data.index[i]}"
-                    )
-
-                # Reset run after creating zone
-                current_run = None
-            # Log zone rejections less verbosely
-            elif abs(total_move) >= dynamic_pips_required * 0.7:  # Only log rejections close to threshold
-                debug_logger.info(f"ZONE REJECTED: Move={abs(total_move)*10000:.1f} pips < Required={dynamic_pips_required*10000:.1f} pips")
-
-        else:
-            # Direction changed, reset the run
-            current_run = {
-                'start_index': i,
-                'start_price': current_candle['open'],
-                'direction': current_candle['candle_direction'],
-                'high': current_candle['high'],
-                'low': current_candle['low'],
-                'start_time': data.index[i]
-            }
-
-    # Save current run state for next window
-    cumulative_zone_info[currency] = current_run
-    
-    # Log zone status after processing only if new zones were detected
-    if new_zones_detected > 0:
-        log_zone_status("After Zone Detection", currency)
-
-    # After all zone identification, batch store the new zones in SQL
-    if new_zones_for_sql:
-        store_zones_in_sql(new_zones_for_sql)
-
-    # Log results more concisely
-    debug_logger.info(f"ZONE DETECTION RESULTS: New zones: {new_zones_detected}, Total: {len(current_valid_zones_dict)}")
-    
-    # Debug the zones that have been successfully constructed
-    if len(current_valid_zones_dict) > 0:
-        debug_logger.warning(f"Current zones (count: {len(current_valid_zones_dict)}):")
-        for zone_key, zone_data in list(current_valid_zones_dict.items())[:5]:  # Show up to 5 zones
-            if isinstance(zone_data, dict) and 'zone_type' in zone_data:
-                debug_logger.warning(f"  {zone_data['zone_type'].upper()} zone: {zone_key[0]:.5f}-{zone_key[1]:.5f}")
-            else:
-                debug_logger.warning(f"  Invalid zone structure: {zone_key}")
-
+    # Deprecated: zones now sourced externally; return inputs unchanged
     return data, current_valid_zones_dict
 
 
@@ -705,6 +518,7 @@ def set_support_resistance_lines(data, currency="EUR.USD"):
 def remove_consecutive_losers(trades_list, valid_zones_dict, currency="EUR.USD"):
     """
     Invalidates zones that have produced consecutive losing trades.
+    Now also adds invalidated zones to memory to prevent re-import from external system.
     
     Args:
         trades_list: List of trades for this currency
@@ -746,6 +560,10 @@ def remove_consecutive_losers(trades_list, valid_zones_dict, currency="EUR.USD")
     
     for zone_id in zones_to_remove:
         if zone_id in valid_zones_dict:
+            # Add to invalidated memory before removing
+            invalidation_time = datetime.datetime.now()
+            add_zone_to_invalidated_memory(currency, zone_id[0], zone_id[1], invalidation_time)
+            
             del valid_zones_dict[zone_id]
     
     return valid_zones_dict
@@ -830,9 +648,14 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
     # Add diagnostic logging to track critical values
     debug_logger.warning(f"\n\nENTRY CONDITION CHECK for {currency}:")
     debug_logger.warning(f"  Current price: {data['close'].iloc[bar_index]:.5f}")
-    debug_logger.warning(f"  RSI: {data['RSI'].iloc[bar_index]:.2f}")
-    debug_logger.warning(f"  MACD: {data['MACD_Line'].iloc[bar_index]:.6f}")
-    debug_logger.warning(f"  Signal: {data['Signal_Line'].iloc[bar_index]:.6f}")
+    # Use external indicators for decision context
+    ind = external_indicators.get(currency, {})
+    rsi_val = ind.get('rsi')
+    macd_val = ind.get('macd_line')
+    sig_val = ind.get('signal_line')
+    debug_logger.warning(f"  RSI: {rsi_val if rsi_val is not None else 'N/A'}")
+    debug_logger.warning(f"  MACD: {macd_val if macd_val is not None else 'N/A'}")
+    debug_logger.warning(f"  Signal: {sig_val if sig_val is not None else 'N/A'}")
     
     # Initialize if not already present
     if currency not in trades:
@@ -847,6 +670,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
     
     # IMPORTANT FIX: Don't create a new empty dictionary for this currency, use the one provided
     # The issue was that we were creating a new empty dictionary instead of using the one with zones
+    # Zones are provided externally via current_valid_zones_dict
     zones_dict = valid_zones_dict
     debug_logger.warning(f"  Active zones: {len(zones_dict)}")
     
@@ -908,15 +732,14 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 debug_logger.warning(f"    Skipping zone: size too small ({zone_size*10000:.1f} < {current_pips_required*10000:.1f} pips)")
                 continue
             
-            # Check direction and indicators
+            # Check direction and indicators using external values
             if zone_type == 'demand' and current_price < zone_end:
-                # FIX: Make explicit RSI/MACD checks and log each condition
-                rsi_condition = data['RSI'].iloc[bar_index] < DEMAND_ZONE_RSI_TOP
-                macd_condition = data['MACD_Line'].iloc[bar_index] > data['Signal_Line'].iloc[bar_index]
+                rsi_condition = (rsi_val is not None) and (rsi_val < DEMAND_ZONE_RSI_TOP)
+                macd_condition = (macd_val is not None and sig_val is not None) and (macd_val > sig_val)
                 
                 debug_logger.warning(f"    DEMAND zone conditions:")
-                debug_logger.warning(f"      RSI < {DEMAND_ZONE_RSI_TOP}: {rsi_condition} (value: {data['RSI'].iloc[bar_index]:.2f})")
-                debug_logger.warning(f"      MACD > Signal: {macd_condition} (MACD: {data['MACD_Line'].iloc[bar_index]:.6f}, Signal: {data['Signal_Line'].iloc[bar_index]:.6f})")
+                debug_logger.warning(f"      RSI < {DEMAND_ZONE_RSI_TOP}: {rsi_condition} (value: {rsi_val if rsi_val is not None else 'N/A'})")
+                debug_logger.warning(f"      MACD > Signal: {macd_condition} (MACD: {macd_val if macd_val is not None else 'N/A'}, Signal: {sig_val if sig_val is not None else 'N/A'})")
                 
                 if not (rsi_condition or macd_condition):
                     debug_logger.warning("    Skipping zone: RSI/MACD conditions not met")
@@ -927,13 +750,12 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 take_profit = entry_price + (TAKE_PROFIT_PROPORTION * zone_size)
             
             elif zone_type == 'supply' and current_price > zone_end:
-                # FIX: Make explicit RSI/MACD checks and log each condition
-                rsi_condition = data['RSI'].iloc[bar_index] > SUPPLY_ZONE_RSI_BOTTOM
-                macd_condition = data['MACD_Line'].iloc[bar_index] < data['Signal_Line'].iloc[bar_index]
+                rsi_condition = (rsi_val is not None) and (rsi_val > SUPPLY_ZONE_RSI_BOTTOM)
+                macd_condition = (macd_val is not None and sig_val is not None) and (macd_val < sig_val)
                 
                 debug_logger.warning(f"    SUPPLY zone conditions:")
-                debug_logger.warning(f"      RSI > {SUPPLY_ZONE_RSI_BOTTOM}: {rsi_condition} (value: {data['RSI'].iloc[bar_index]:.2f})")
-                debug_logger.warning(f"      MACD < Signal: {macd_condition} (MACD: {data['MACD_Line'].iloc[bar_index]:.6f}, Signal: {data['Signal_Line'].iloc[bar_index]:.6f})")
+                debug_logger.warning(f"      RSI > {SUPPLY_ZONE_RSI_BOTTOM}: {rsi_condition} (value: {rsi_val if rsi_val is not None else 'N/A'})")
+                debug_logger.warning(f"      MACD < Signal: {macd_condition} (MACD: {macd_val if macd_val is not None else 'N/A'}, Signal: {sig_val if sig_val is not None else 'N/A'})")
                 
                 if not (rsi_condition or macd_condition):
                     debug_logger.warning("    Skipping zone: RSI/MACD conditions not met")
@@ -951,6 +773,8 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 # Create the trade
                 debug_logger.warning(f"\n  >> TRADE SIGNAL GENERATED for {currency}: {zone_type} at {entry_price:.5f}!")
                 
+                trade_direction = 'long' if zone_type == 'demand' else 'short'
+                
                 trades_for_currency.append({
                     'entry_time': current_time,
                     'entry_price': entry_price,
@@ -958,13 +782,16 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                     'take_profit': take_profit,
                     'position_size': position_size,
                     'status': 'open',
-                    'direction': 'long' if zone_type == 'demand' else 'short',
+                    'direction': trade_direction,
                     'zone_start_price': zone_start,
                     'zone_end_price': zone_end,
                     'zone_length': zone_data.get('zone_length', 0),
                     'required_pips': current_pips_required,  # Added for analysis
                     'currency': currency  # Store the currency for reference
                 })
+                
+                # Save position to database for crash recovery
+                save_current_position_to_db(currency, trade_direction, current_time, entry_price)
 
                 last_trade_time[currency] = current_time
                 trade_logger.info(
@@ -981,6 +808,28 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 return zones_dict
 
     return zones_dict
+
+
+def get_last_closed_trade(currency):
+    """
+    Get the most recently closed trade for signal determination.
+    Used to determine the opposite signal when closing a position.
+    
+    Args:
+        currency: The currency pair to check
+        
+    Returns:
+        dict: The most recently closed trade, or None if no closed trades exist
+    """
+    if currency not in trades or not trades[currency]:
+        return None
+        
+    closed_trades = [t for t in trades[currency] if t['status'] == 'closed']
+    if not closed_trades:
+        return None
+        
+    # Return the most recently closed trade (by exit_time, fallback to entry_time)
+    return max(closed_trades, key=lambda x: x.get('exit_time', x['entry_time']))
 
 
 def manage_trades(current_price, current_time, currency="EUR.USD"):
@@ -1030,6 +879,9 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                     'close_reason': 'max_pip_loss'
                 })
                 
+                # Remove position from database
+                delete_current_position_from_db(currency)
+                
                 debug_logger.warning(
                     f"\n\nFORCE CLOSING {currency} TRADE - MAX PIP LOSS EXCEEDED IN MANAGEMENT\n"
                     f"Entry: {trade['entry_price']:.5f}\n"
@@ -1054,6 +906,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'stop_loss'
                     })
+                    # Remove position from database
+                    delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Long trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
                     closed_any_trade = True
                     trade_closed = True
@@ -1068,6 +922,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'take_profit'
                     })
+                    # Remove position from database
+                    delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Long trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
                     closed_any_trade = True
                     trade_closed = True
@@ -1083,6 +939,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'stop_loss'
                     })
+                    # Remove position from database
+                    delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Short trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
                     closed_any_trade = True
                     trade_closed = True
@@ -1097,6 +955,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'take_profit'
                     })
+                    # Remove position from database
+                    delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Short trade hit take profit at {trade['take_profit']}. P/L: {trade_result}")
                     closed_any_trade = True
                     trade_closed = True
@@ -1111,6 +971,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                 'profit_loss': 0,
                 'close_reason': 'error_in_trade_management'
             })
+            # Remove position from database
+            delete_current_position_from_db(currency)
             closed_any_trade = True
             trade_closed = True
 
@@ -1119,6 +981,334 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
     log_trade_state(current_time, "after_manage", currency)
     
     return closed_any_trade
+
+# --------------------------------------------------------------------------
+# EXTERNAL DATA FETCHING FUNCTIONS - NEW SYSTEM
+# --------------------------------------------------------------------------
+def fetch_active_zones_from_db():
+    """
+    Fetch all active zones from the ZoneTracker table.
+    Returns zones organized by currency with proper data type conversion.
+    
+    Returns:
+        dict: {currency: {(start_price, end_price): zone_object}} format
+    """
+    conn = None
+    cursor = None
+    fetched_zones = {currency: {} for currency in SUPPORTED_CURRENCIES}
+    
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            debug_logger.error("[EXTERNAL_ZONES] Failed to connect to database")
+            return fetched_zones
+        
+        cursor = conn.cursor()
+        
+        # Query active zones for all supported currencies
+        cursor.execute("""
+        SELECT 
+            Currency,
+            ROUND(ZoneStartPrice, 6) as StartPrice,
+            ROUND(ZoneEndPrice, 6) as EndPrice, 
+            ZoneSize,
+            ZoneType,
+            ConfirmationTime
+        FROM ZoneTracker
+        WHERE IsActive = 1
+        AND Currency IN (?, ?, ?)
+        ORDER BY Currency, ConfirmationTime DESC
+        """, SUPPORTED_CURRENCIES[0], SUPPORTED_CURRENCIES[1], SUPPORTED_CURRENCIES[2])
+        
+        zones = cursor.fetchall()
+        zone_count = 0
+        
+        for row in zones:
+            currency = row[0]
+            zone_start = float(row[1])
+            zone_end = float(row[2])
+            zone_size = float(row[3])
+            zone_type = row[4].lower()  # Ensure lowercase for consistency
+            confirmation_time = row[5]
+            
+            # Create zone ID tuple
+            zone_id = (zone_start, zone_end)
+            
+            # Check if this zone was locally invalidated
+            if is_zone_locally_invalidated(currency, zone_start, zone_end, confirmation_time):
+                debug_logger.info(f"[EXTERNAL_ZONES] Skipping locally invalidated {currency} zone: {zone_start:.5f}-{zone_end:.5f}")
+                continue
+            
+            # Create zone object matching existing format
+            zone_object = {
+                'start_price': zone_start,
+                'end_price': zone_end,
+                'zone_size': zone_size,
+                'zone_type': zone_type,
+                'confirmation_time': confirmation_time,
+                'start_time': confirmation_time,  # Use confirmation time as start time
+                'source': 'external'  # Mark as externally sourced
+            }
+            
+            fetched_zones[currency][zone_id] = zone_object
+            zone_count += 1
+        
+        debug_logger.info(f"[EXTERNAL_ZONES] Fetched {zone_count} active zones from ZoneTracker")
+        
+        # Log zone counts per currency
+        for currency in SUPPORTED_CURRENCIES:
+            count = len(fetched_zones[currency])
+            if count > 0:
+                debug_logger.info(f"[EXTERNAL_ZONES] {currency}: {count} active zones")
+        
+        return fetched_zones
+        
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_ZONES] Error fetching zones from database: {e}", exc_info=True)
+        return fetched_zones
+    
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        # Don't close connection when using connection pooling
+
+def fetch_latest_indicators_from_db():
+    """
+    Fetch the most recent indicators from the IndicatorTracker table.
+    Returns indicators organized by currency.
+    
+    Returns:
+        dict: {currency: {rsi, macd_line, signal_line, timestamp, freshness_status}}
+    """
+    conn = None
+    cursor = None
+    fetched_indicators = {currency: {'rsi': None, 'macd_line': None, 'signal_line': None, 'timestamp': None, 'freshness_status': 'missing'} for currency in SUPPORTED_CURRENCIES}
+    
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            debug_logger.error("[EXTERNAL_INDICATORS] Failed to connect to database")
+            return fetched_indicators
+        
+        cursor = conn.cursor()
+        
+        # Get the most recent indicators for each currency
+        for currency in SUPPORTED_CURRENCIES:
+            try:
+                cursor.execute("""
+                SELECT TOP 1
+                    RSI,
+                    MACD,
+                    MACDSignal,
+                    CreatedAt
+                FROM IndicatorTracker
+                WHERE Currency = ?
+                ORDER BY CreatedAt DESC
+                """, currency)
+                
+                row = cursor.fetchone()
+                if row:
+                    rsi_value = float(row[0]) if row[0] is not None else None
+                    macd_line = float(row[1]) if row[1] is not None else None
+                    signal_line = float(row[2]) if row[2] is not None else None
+                    timestamp = row[3]
+                    
+                    # Calculate data freshness
+                    if timestamp:
+                        time_diff = (datetime.datetime.now() - timestamp).total_seconds()
+                        if time_diff <= INDICATOR_STALENESS_WARNING:
+                            freshness_status = 'fresh'
+                        else:
+                            freshness_status = 'stale'
+                            debug_logger.warning(f"[EXTERNAL_INDICATORS] {currency} indicators are stale ({time_diff/60:.1f} minutes old)")
+                    else:
+                        freshness_status = 'missing'
+                    
+                    fetched_indicators[currency] = {
+                        'rsi': rsi_value,
+                        'macd_line': macd_line,
+                        'signal_line': signal_line,
+                        'timestamp': timestamp,
+                        'freshness_status': freshness_status
+                    }
+                    
+                    rsi_str = f"{rsi_value:.2f}" if rsi_value is not None else "None"
+                    macd_str = f"{macd_line:.6f}" if macd_line is not None else "None"
+                    sig_str = f"{signal_line:.6f}" if signal_line is not None else "None"
+                    debug_logger.info(f"[EXTERNAL_INDICATORS] {currency}: RSI={rsi_str}, MACD={macd_str}, Signal={sig_str}")
+                else:
+                    debug_logger.warning(f"[EXTERNAL_INDICATORS] No indicators found for {currency}")
+                    
+            except Exception as e:
+                debug_logger.error(f"[EXTERNAL_INDICATORS] Error fetching indicators for {currency}: {e}")
+                continue
+        
+        return fetched_indicators
+        
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_INDICATORS] Error fetching indicators from database: {e}", exc_info=True)
+        return fetched_indicators
+    
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        # Don't close connection when using connection pooling
+
+def is_zone_locally_invalidated(currency, zone_start, zone_end, confirmation_time):
+    """
+    Check if a zone was locally invalidated due to losing trades.
+    Compares zone confirmation time with local invalidation time.
+    
+    Args:
+        currency: Currency pair
+        zone_start: Zone start price
+        zone_end: Zone end price
+        confirmation_time: When the zone was confirmed in the external system
+    
+    Returns:
+        bool: True if zone should be excluded due to local invalidation
+    """
+    if currency not in invalidated_zones_memory:
+        return False
+    
+    # Check if this zone exists in our invalidated memory
+    for invalidated_zone in invalidated_zones_memory[currency]:
+        inv_start, inv_end, inv_time = invalidated_zone
+        
+        # Check if this is the same zone (with small tolerance for floating point comparison)
+        start_match = abs(zone_start - inv_start) <= 0.00001
+        end_match = abs(zone_end - inv_end) <= 0.00001
+        
+        if start_match and end_match:
+            # Check if invalidation happened after confirmation
+            if confirmation_time and inv_time > confirmation_time:
+                debug_logger.info(f"[ZONE_INVALIDATION] {currency} zone {zone_start:.5f}-{zone_end:.5f} locally invalidated after confirmation")
+                return True
+    
+    return False
+
+def add_zone_to_invalidated_memory(currency, zone_start, zone_end, invalidation_time):
+    """
+    Add a zone to the invalidated zones memory with capacity management.
+    
+    Args:
+        currency: Currency pair
+        zone_start: Zone start price
+        zone_end: Zone end price
+        invalidation_time: When the zone was invalidated
+    """
+    if currency not in invalidated_zones_memory:
+        invalidated_zones_memory[currency] = []
+    
+    # Add new invalidated zone
+    new_entry = (zone_start, zone_end, invalidation_time)
+    invalidated_zones_memory[currency].append(new_entry)
+    
+    # Maintain capacity limit - keep only most recent entries
+    if len(invalidated_zones_memory[currency]) > MAX_INVALIDATED_ZONES_MEMORY:
+        # Sort by invalidation time and keep the most recent ones
+        invalidated_zones_memory[currency].sort(key=lambda x: x[2], reverse=True)
+        invalidated_zones_memory[currency] = invalidated_zones_memory[currency][:MAX_INVALIDATED_ZONES_MEMORY]
+        
+        debug_logger.info(f"[ZONE_INVALIDATION] Trimmed {currency} invalidated zones memory to {MAX_INVALIDATED_ZONES_MEMORY} entries")
+    
+    debug_logger.info(f"[ZONE_INVALIDATION] Added {currency} zone {zone_start:.5f}-{zone_end:.5f} to invalidated memory")
+
+def update_external_data():
+    """
+    Scheduled function to update both zones and indicators from external sources.
+    Called every 5 minutes via timer.
+    """
+    global external_indicators, current_valid_zones_dict, external_data_timer
+    
+    try:
+        debug_logger.info("[EXTERNAL_UPDATE] Starting scheduled external data update...")
+        
+        # Fetch fresh indicators
+        new_indicators = fetch_latest_indicators_from_db()
+        if new_indicators:
+            external_indicators.update(new_indicators)
+            debug_logger.info("[EXTERNAL_UPDATE] Updated external indicators")
+        
+        # Fetch fresh zones
+        new_zones = fetch_active_zones_from_db()
+        if new_zones:
+            # Update the global zones dictionary
+            for currency in SUPPORTED_CURRENCIES:
+                if currency in new_zones:
+                    current_valid_zones_dict[currency] = new_zones[currency]
+                    debug_logger.info(f"[EXTERNAL_UPDATE] Updated {currency} zones: {len(new_zones[currency])} active zones")
+        
+        # Log summary of updated data
+        total_zones = sum(len(zones) for zones in current_valid_zones_dict.values())
+        fresh_indicators = sum(1 for ind in external_indicators.values() if ind['freshness_status'] == 'fresh')
+        
+        debug_logger.warning(f"[EXTERNAL_UPDATE] Update complete - Total zones: {total_zones}, Fresh indicators: {fresh_indicators}/{len(SUPPORTED_CURRENCIES)}")
+        
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_UPDATE] Error during scheduled update: {e}", exc_info=True)
+    
+    finally:
+        # Schedule next update
+        schedule_next_external_update()
+
+def schedule_next_external_update():
+    """
+    Schedule the next external data update using threading.Timer.
+    """
+    global external_data_timer
+    
+    try:
+        # Cancel existing timer if it exists
+        if external_data_timer and external_data_timer.is_alive():
+            external_data_timer.cancel()
+        
+        # Schedule next update
+        external_data_timer = threading.Timer(EXTERNAL_DATA_FETCH_INTERVAL, update_external_data)
+        external_data_timer.daemon = True  # Dies when main thread dies
+        external_data_timer.start()
+        
+        debug_logger.info(f"[EXTERNAL_SCHEDULER] Next external data update scheduled in {EXTERNAL_DATA_FETCH_INTERVAL} seconds")
+        
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_SCHEDULER] Error scheduling next update: {e}")
+
+def start_external_data_fetching():
+    """
+    Initialize the external data fetching system.
+    Should be called during algorithm startup.
+    """
+    debug_logger.info("[EXTERNAL_SYSTEM] Starting external data fetching system...")
+    
+    # Perform initial fetch immediately
+    try:
+        update_external_data()
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_SYSTEM] Error during initial data fetch: {e}")
+        # Schedule first update anyway
+        schedule_next_external_update()
+
+def stop_external_data_fetching():
+    """
+    Stop the external data fetching system.
+    Should be called during algorithm shutdown.
+    """
+    global external_data_timer
+    
+    try:
+        if external_data_timer and external_data_timer.is_alive():
+            external_data_timer.cancel()
+            debug_logger.info("[EXTERNAL_SYSTEM] External data fetching system stopped")
+        else:
+            debug_logger.info("[EXTERNAL_SYSTEM] External data fetching system was not running")
+    except Exception as e:
+        debug_logger.error(f"[EXTERNAL_SYSTEM] Error stopping external data fetching: {e}")
 
 # --------------------------------------------------------------------------
 # DATABASE CONNECTION FUNCTIONS - OPTIMIZATION
@@ -1186,6 +1376,9 @@ def get_db_connection():
 # Updated function to close the connection when needed
 def close_db_connection():
     """Explicitly close the database connection when shutting down"""
+    # Stop external data fetching system
+    stop_external_data_fetching()
+    
     if hasattr(get_db_connection, "_connection") and get_db_connection._connection is not None:
         try:
             get_db_connection._connection.close()
@@ -1272,6 +1465,20 @@ def create_tables_if_not_exist():
         CREATE INDEX IX_FXStrat_TradeSignalsSent_SignalTime ON FXStrat_TradeSignalsSent(SignalTime);
         """)
         
+        # Table 4: FXStrat_CurrentPositions - for crash recovery
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'FXStrat_CurrentPositions')
+        CREATE TABLE FXStrat_CurrentPositions (
+            Currency NVARCHAR(10) NOT NULL,
+            Direction NVARCHAR(5) NOT NULL,
+            EntryTime DATETIME NOT NULL,
+            EntryPrice DECIMAL(10,5) NOT NULL,
+            AlgoInstance INT NOT NULL,
+            CreatedAt DATETIME DEFAULT GETDATE(),
+            PRIMARY KEY (Currency, AlgoInstance)
+        );
+        """)
+        
         conn.commit()
         debug_logger.warning("\n\nSuccessfully created or verified all database tables\n")
         return True
@@ -1300,6 +1507,7 @@ def create_tables_if_not_exist():
 def initialize_database():
     """
     Initializes the database connection and ensures all required tables exist.
+    Now also starts the external data fetching system.
     Should be called once at application startup.
     
     Returns:
@@ -1320,6 +1528,34 @@ def initialize_database():
     if not tables_created:
         debug_logger.error("Database initialization failed - could not create required tables")
         return False
+
+    # Startup sanity check: verify external tables have data
+    try:
+        conn_check = get_db_connection()
+        if conn_check is not None:
+            cur = conn_check.cursor()
+            try:
+                cur.execute("SELECT TOP 1 CreatedAt FROM IndicatorTracker ORDER BY CreatedAt DESC")
+                row = cur.fetchone()
+                latest_ind_ts = row[0] if row else None
+                debug_logger.warning(f"[STARTUP_CHECK] Latest IndicatorTracker.CreatedAt: {latest_ind_ts}")
+            except Exception as e:
+                debug_logger.error(f"[STARTUP_CHECK] IndicatorTracker check failed: {e}")
+            try:
+                cur.execute("SELECT COUNT(*) FROM ZoneTracker WHERE IsActive = 1")
+                row = cur.fetchone()
+                active_zones = row[0] if row else 0
+                debug_logger.warning(f"[STARTUP_CHECK] ZoneTracker active zones: {active_zones}")
+            except Exception as e:
+                debug_logger.error(f"[STARTUP_CHECK] ZoneTracker check failed: {e}")
+            try:
+                cur.close()
+            except:
+                pass
+        else:
+            debug_logger.error("[STARTUP_CHECK] Skipped table sanity checks - no DB connection")
+    except Exception as e:
+        debug_logger.error(f"[STARTUP_CHECK] Unexpected error during sanity check: {e}")
     
     # Only load signal state if we're in live trading mode (i.e., after a RESTART)
     # During initial startup, we want fresh signal state
@@ -1327,6 +1563,10 @@ def initialize_database():
         load_algorithm_signal_state()
     else:
         debug_logger.info("[SIGNAL_STATE] Skipping signal state load - not in live trading mode yet")
+    
+    # NEW: Start external data fetching system
+    debug_logger.info("Starting external data fetching system...")
+    start_external_data_fetching()
     
     debug_logger.info("Database initialization completed successfully")
     return True
@@ -1350,28 +1590,17 @@ def save_bar_to_database(bar_data, currency="EUR.USD"):
     bar_start_time = current_bar_start[currency]
     bar_end_time = current_bar_start[currency] + pd.Timedelta(minutes=15)
     
-    # Get indicators if available
+    # Get indicators from external source (no endogenous calculation)
     rsi_value = None
     macd_value = None
     signal_value = None
-    
-    if currency in bars and len(bars[currency]) >= 35:
-        try:
-            recent_data = bars[currency].tail(384).copy()
-            close_series = recent_data["close"].dropna()
-            
-            if len(close_series) >= 35:
-                rsi_values = ta.rsi(close_series, length=14)
-                macd_values = ta.macd(close_series, fast=12, slow=26, signal=9)
-                
-                if rsi_values is not None and not rsi_values.dropna().empty:
-                    rsi_value = float(rsi_values.iloc[-1])
-                    
-                if macd_values is not None and not macd_values.dropna().empty:
-                    macd_value = float(macd_values["MACD_12_26_9"].iloc[-1])
-                    signal_value = float(macd_values["MACDs_12_26_9"].iloc[-1])
-        except Exception as e:
-            debug_logger.error(f"Error calculating indicators for {currency} DB: {e}")
+    try:
+        ind = external_indicators.get(currency, {})
+        rsi_value = ind.get('rsi')
+        macd_value = ind.get('macd_line')
+        signal_value = ind.get('signal_line')
+    except Exception as e:
+        debug_logger.error(f"Error reading external indicators for {currency} DB: {e}")
     
     # Format decimal values as requested
     open_price = round(bar_data["open"], 5)
@@ -1444,6 +1673,163 @@ def save_zone_to_database(zone_id, zone_data, currency="EUR.USD"):
     # The actual save is handled by store_zones_in_sql
     debug_logger.info(f"Zone {zone_id} queued for batch database storage")
     return True
+
+# --------------------------------------------------------------------------
+# POSITION PERSISTENCE FUNCTIONS
+# --------------------------------------------------------------------------
+def save_current_position_to_db(currency, direction, entry_time, entry_price):
+    """
+    Save or update current position in database for crash recovery.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return False
+        
+        cursor = conn.cursor()
+        
+        # Use MERGE for upsert behavior
+        cursor.execute("""
+        MERGE FXStrat_CurrentPositions AS target
+        USING (SELECT ? AS Currency, ? AS AlgoInstance) AS source
+        ON (target.Currency = source.Currency AND target.AlgoInstance = source.AlgoInstance)
+        WHEN MATCHED THEN 
+            UPDATE SET Direction = ?, EntryTime = ?, EntryPrice = ?
+        WHEN NOT MATCHED THEN
+            INSERT (Currency, Direction, EntryTime, EntryPrice, AlgoInstance)
+            VALUES (?, ?, ?, ?, ?);
+        """, 
+        currency, ALGO_INSTANCE,  # source values
+        direction, entry_time, entry_price,  # update values
+        currency, direction, entry_time, entry_price, ALGO_INSTANCE  # insert values
+        )
+        
+        conn.commit()
+        debug_logger.info(f"[POSITION] Saved {currency} {direction} position to DB")
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"Error saving position to DB: {e}")
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+def delete_current_position_from_db(currency):
+    """
+    Remove current position from database when trade closes.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return False
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        DELETE FROM FXStrat_CurrentPositions 
+        WHERE Currency = ? AND AlgoInstance = ?
+        """, currency, ALGO_INSTANCE)
+        
+        conn.commit()
+        debug_logger.info(f"[POSITION] Deleted {currency} position from DB")
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"Error deleting position from DB: {e}")
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+def get_current_position_from_db(currency):
+    """
+    Get current position from database.
+    
+    Returns:
+        dict: Position info or None if no position exists
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return None
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT Direction, EntryTime, EntryPrice 
+        FROM FXStrat_CurrentPositions 
+        WHERE Currency = ? AND AlgoInstance = ?
+        """, currency, ALGO_INSTANCE)
+        
+        row = cursor.fetchone()
+        if row:
+            return {
+                'direction': row[0],
+                'entry_time': row[1],
+                'entry_price': row[2]
+            }
+        return None
+        
+    except Exception as e:
+        debug_logger.error(f"Error getting position from DB: {e}")
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+def load_all_positions_from_db():
+    """
+    Load all current positions for this algorithm instance.
+    Used during restart to recover position state.
+    
+    Returns:
+        dict: {currency: position_info} for all open positions
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return {}
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT Currency, Direction, EntryTime, EntryPrice 
+        FROM FXStrat_CurrentPositions 
+        WHERE AlgoInstance = ?
+        """, ALGO_INSTANCE)
+        
+        positions = {}
+        for row in cursor.fetchall():
+            currency = row[0]
+            positions[currency] = {
+                'direction': row[1],
+                'entry_time': row[2],
+                'entry_price': row[3]
+            }
+        
+        debug_logger.info(f"[POSITION] Loaded {len(positions)} positions from DB: {list(positions.keys())}")
+        return positions
+        
+    except Exception as e:
+        debug_logger.error(f"Error loading positions from DB: {e}")
+        return {}
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD"):
     """
@@ -1698,10 +2084,11 @@ def store_bar_in_sql(bar_data):
             debug_logger.error(f"Missing required field '{field}' in bar_data")
             return False
     
-    # Get optional indicator values with defaults
-    rsi_value = bar_data.get('rsi', None)
-    macd_value = bar_data.get('macd_line', None)
-    signal_value = bar_data.get('signal_line', None)
+    # Get optional indicator values from external source
+    ind = external_indicators.get(bar_data.get('currency', 'EUR.USD'), {})
+    rsi_value = ind.get('rsi')
+    macd_value = ind.get('macd_line')
+    signal_value = ind.get('signal_line')
     zones_count = bar_data.get('zones_count', 0)
     
     # Format decimal values as requested: prices and RSI to 5 decimals, MACD to 10
@@ -1963,7 +2350,7 @@ def process_market_data(new_data_point, currency="EUR.USD"):
         currency: The currency pair to process (default: EUR.USD)
         
     Returns:
-        tuple: (signal, currency) where signal is 'buy', 'sell', 'close', or 'hold'
+        tuple: (signal, currency) where signal is 'buy', 'sell', or 'hold'
     """
     global historical_ticks, bars, current_valid_zones_dict
     global trades, last_trade_time, balance
@@ -2031,16 +2418,7 @@ def process_market_data(new_data_point, currency="EUR.USD"):
             # Store the finalized bar in SQL
             store_bar_in_sql(finalized_bar_data)
             
-            # SYNC ZONES TO DATABASE - This ensures DB stays in sync with current_valid_zones_dict
-            # Called every 15 minutes when a bar completes to:
-            # - Add new zones that were created in memory
-            # - Remove zones that were invalidated from memory
-            # - Keep database as the single source of truth for historical zone analysis
-            sync_success = sync_zones_to_database(currency)
-            if not sync_success:
-                debug_logger.warning(f"Failed to sync zones to database for {currency}")
-            
-            # Log zone status after bar completion only if we have zones
+        # Zones are external; no DB sync required. Log status if we have zones.
             if current_valid_zones_dict[currency]:
                 log_zone_status("After Bar Completion", currency, force_detailed=False)
 
@@ -2066,35 +2444,24 @@ def process_market_data(new_data_point, currency="EUR.USD"):
             rolling_window_data['close'].notnull(), np.nan
         )
 
-        # 8) Calculate indicators (RSI, MACD)
-        rolling_window_data['RSI'] = ta.rsi(rolling_window_data['close'], length=14)
-        macd = ta.macd(rolling_window_data['close'], fast=12, slow=26, signal=9)
-        
-        if macd is None or macd.empty:
-            return ('hold', currency)
+        # 8) Indicators are sourced externally; attach latest values for downstream consumers
+        # Use the latest external indicators for this currency, if available
+        latest_ind = external_indicators.get(currency, {})
+        rolling_window_data['RSI'] = np.nan
+        rolling_window_data['MACD_Line'] = np.nan
+        rolling_window_data['Signal_Line'] = np.nan
+        if latest_ind and latest_ind.get('rsi') is not None:
+            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('RSI')] = latest_ind['rsi']
+        if latest_ind and latest_ind.get('macd_line') is not None:
+            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('MACD_Line')] = latest_ind['macd_line']
+        if latest_ind and latest_ind.get('signal_line') is not None:
+            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('Signal_Line')] = latest_ind['signal_line']
 
-        macd.dropna(inplace=True)
-        if macd.empty:
-            return ('hold', currency)
+        # 9) Zones are sourced externally, so skip endogenous detection. Keep invalidation only.
+        # current_valid_zones_dict[currency] is populated by the external fetcher.
 
-        rolling_window_data['MACD_Line'] = macd['MACD_12_26_9']
-        rolling_window_data['Signal_Line'] = macd['MACDs_12_26_9']
-
-        # 9) Identify and invalidate zones (CUMULATIVE logic for zone detection)
-        # Calculate ATR once and reuse it for better performance
-        atr_value = calculate_atr_pips_required(rolling_window_data, currency)
-        
-        # FIX: Store the return value properly
-        rolling_window_data, zones_for_currency = identify_liquidity_zones(
-            rolling_window_data, current_valid_zones_dict[currency], currency, atr_value
-        )
-
-        # FIX: Make sure we're properly assigning the zones dictionary
-        if zones_for_currency is not None:  
-            current_valid_zones_dict[currency] = zones_for_currency
-            debug_logger.info(f"Updated zones dictionary for {currency}, now has {len(current_valid_zones_dict[currency])} zones")
-
-        rolling_window_data = set_support_resistance_lines(rolling_window_data, currency)
+        # Support/Resistance lines were previously derived from endogenous zones.
+        # With external zones, we skip adding those columns to the rolling data.
         latest_bar_idx = rolling_window_data.index[-1]
         i = rolling_window_data.index.get_loc(latest_bar_idx)
 
@@ -2125,13 +2492,23 @@ def process_market_data(new_data_point, currency="EUR.USD"):
             closed_any_trade = True
 
         # -----------------------------------------------------------------
-        # 13) Determine final signal: buy, sell, close, or 'hold'
+        # 13) Determine final signal: buy, sell, or 'hold' (NO MORE CLOSE SIGNALS)
         # -----------------------------------------------------------------
         if closed_any_trade:
-            # Only generate close signal if we haven't already generated one for this trade
-            if last_non_hold_signal[currency] not in ['close']:
-                raw_signal = 'close'
+            # Find the just-closed trade's direction and send opposite signal
+            last_closed_trade = get_last_closed_trade(currency)
+            if last_closed_trade and last_closed_trade['direction'] == 'long':
+                raw_signal = 'sell'  # Close long position with sell signal
+                debug_logger.info(f"[SIGNAL] {currency} long trade closed, sending sell signal")
+            elif last_closed_trade and last_closed_trade['direction'] == 'short':
+                raw_signal = 'buy'   # Close short position with buy signal
+                debug_logger.info(f"[SIGNAL] {currency} short trade closed, sending buy signal")
             else:
+                # Fallback if we can't determine the closed trade direction
+                # This could indicate a restart scenario where trade history was lost
+                debug_logger.error(f"[SIGNAL] CRITICAL: {currency} trade closed but direction unknown!")
+                debug_logger.error(f"[SIGNAL] This may indicate trade state was lost during restart")
+                debug_logger.error(f"[SIGNAL] External app may have orphaned position - manual intervention needed")
                 raw_signal = 'hold'
         elif new_trade_opened:
             # Figure out direction of the newly opened trade
@@ -2142,12 +2519,57 @@ def process_market_data(new_data_point, currency="EUR.USD"):
         else:
             raw_signal = 'hold'
 
-        # 14) Block consecutive opens (either 'buy' or 'sell')
-        if raw_signal in ['buy', 'sell'] and last_non_hold_signal[currency] in ['buy', 'sell']:
-            # Already had a 'buy' or 'sell' before, so return hold
+        # 14) Block consecutive signals of the same type
+        # This prevents duplicate buy/buy or sell/sell signals
+        if raw_signal in ['buy', 'sell'] and last_non_hold_signal[currency] == raw_signal:
+            # Already had the same signal before, so return hold to prevent duplicates
             raw_signal = 'hold'
 
-        # 15) Check against previous signal to prevent duplicates after restart
+        # 15) Validate position state before sending non-hold signals
+        if raw_signal in ['buy', 'sell']:
+            try:
+                db_position = get_current_position_from_db(currency)
+                memory_position = None
+                
+                # Get current memory position
+                open_trades = [t for t in trades[currency] if t['status'] == 'open']
+                if open_trades:
+                    memory_position = {
+                        'direction': open_trades[0]['direction'],
+                        'entry_time': open_trades[0]['entry_time'],
+                        'entry_price': open_trades[0]['entry_price']
+                    }
+                
+                # Compare positions
+                if db_position and memory_position:
+                    if (db_position['direction'] != memory_position['direction'] or 
+                        abs(db_position['entry_price'] - memory_position['entry_price']) > 0.00001):
+                        debug_logger.warning(
+                            f"[POSITION_VALIDATION] {currency} position mismatch detected!\n"
+                            f"  DB: {db_position['direction']} at {db_position['entry_price']}\n"
+                            f"  Memory: {memory_position['direction']} at {memory_position['entry_price']}\n"
+                            f"  Signal: {raw_signal} (proceeding anyway)"
+                        )
+                elif db_position and not memory_position:
+                    debug_logger.warning(
+                        f"[POSITION_VALIDATION] {currency} DB has position but memory doesn't!\n"
+                        f"  DB: {db_position['direction']} at {db_position['entry_price']}\n"
+                        f"  Signal: {raw_signal} (proceeding anyway)"
+                    )
+                elif memory_position and not db_position:
+                    debug_logger.warning(
+                        f"[POSITION_VALIDATION] {currency} Memory has position but DB doesn't!\n"
+                        f"  Memory: {memory_position['direction']} at {memory_position['entry_price']}\n"
+                        f"  Signal: {raw_signal} (proceeding anyway)"
+                    )
+                else:
+                    debug_logger.debug(f"[POSITION_VALIDATION] {currency} positions in sync for {raw_signal} signal")
+                    
+            except Exception as e:
+                debug_logger.error(f"[POSITION_VALIDATION] Error validating {currency} position: {e}")
+                # Continue with signal anyway - validation is non-blocking
+
+        # 16) Check against previous signal to prevent duplicates after restart
         previous_signal = last_signals.get(currency, 'hold')
         
         # Only process if signal actually changed
@@ -2190,98 +2612,15 @@ def process_market_data(new_data_point, currency="EUR.USD"):
         debug_logger.error(f"Error in process_market_data for {currency}: {e}", exc_info=True)
         return ('hold', currency)
 
-# --------------------------------------------------------------------------
-# OPTIONAL: Warmup script integration
-# --------------------------------------------------------------------------
 def main():
-    """
-    Initialize the algorithm with database setup and historical data.
-    Loads data for all supported currencies and sets up initial state.
-    """
+    """Minimal startup: initialize DB and external data fetching system."""
     try:
-        # Initialize database first
         db_initialized = initialize_database()
         if not db_initialized:
-            debug_logger.error("Database initialization failed, but continuing with algorithm startup")
+            debug_logger.error("Database initialization failed, continuing with minimal state")
         else:
             debug_logger.info("Database successfully initialized")
-        
-        # Import warmup_data function from run_test.py (which now includes testing and warmup)
-        try:
-            from run_test import warmup_data
-            
-            # Process each supported currency individually to handle both old and new return formats
-            for currency in SUPPORTED_CURRENCIES:
-                try:
-                    debug_logger.info(f"Initializing data for {currency}")
-                    
-                    # Call warmup_data with explicit currency to get data for just this currency
-                    result = warmup_data(currency)
-                    
-                    # Check the type of the result to handle different return formats
-                    if isinstance(result, tuple) and len(result) == 2:
-                        # Unpack the result - could be (DataFrame, dict) or (dict, dict)
-                        bars_data, zones_data = result
-                        
-                        # Check if we received dictionaries of currencies or direct data
-                        if isinstance(bars_data, dict) and bars_data and isinstance(next(iter(bars_data.keys()) if bars_data else None), str):
-                            # We received a dictionary with DataFrames for each currency
-                            if currency in bars_data:
-                                precomputed_bars = bars_data[currency]
-                                precomputed_zones = zones_data[currency]
-                                debug_logger.info(f"Extracted {currency} data from multi-currency dictionary")
-                            else:
-                                debug_logger.warning(f"Currency {currency} not found in returned data")
-                                continue
-                        else:
-                            # We received direct (DataFrame, dict) data for the requested currency
-                            precomputed_bars = bars_data
-                            precomputed_zones = zones_data
-                            debug_logger.info(f"Received direct data for {currency}")
-                    else:
-                        debug_logger.error(f"Unexpected result type from warmup_data for {currency}")
-                        continue
-                    
-                    # Skip empty data
-                    if isinstance(precomputed_bars, pd.DataFrame) and precomputed_bars.empty:
-                        debug_logger.warning(f"Empty bars dataset received for {currency}")
-                        continue
-                        
-                    # Load the data into algorithm state
-                    load_preexisting_bars_and_indicators(precomputed_bars, currency)
-                    load_preexisting_zones(precomputed_zones, currency)
-                    
-                    # Get the latest indicator values for logging
-                    if isinstance(precomputed_bars, pd.DataFrame) and not precomputed_bars.empty:
-                        latest_rsi = precomputed_bars['RSI'].iloc[-1] if 'RSI' in precomputed_bars.columns and not precomputed_bars['RSI'].empty else "N/A"
-                        latest_macd = precomputed_bars['MACD_Line'].iloc[-1] if 'MACD_Line' in precomputed_bars.columns and not precomputed_bars['MACD_Line'].empty else "N/A"
-                        latest_signal = precomputed_bars['Signal_Line'].iloc[-1] if 'Signal_Line' in precomputed_bars.columns and not precomputed_bars['Signal_Line'].empty else "N/A"
-                        
-                        # Enhanced logging with better formatting
-                        debug_logger.warning(
-                            f"\n\n{'='*30} {currency} ALGORITHM WARMUP COMPLETE {'='*30}\n"
-                            f"Loaded {len(precomputed_bars)} historical bars\n"
-                            f"Initialized {len(current_valid_zones_dict[currency])} liquidity zones\n\n"
-                            f"Latest Indicators:\n"
-                            f"  * RSI: {latest_rsi}\n"
-                            f"  * MACD: {latest_macd}\n"
-                            f"  * Signal: {latest_signal}\n"
-                            f"{'='*80}\n"
-                        )
-                        
-                        # Log initial zone status
-                        if len(current_valid_zones_dict[currency]) > 0:
-                            log_zone_status("Initial Warmup", currency)
-                
-                except Exception as e:
-                    debug_logger.error(f"Error warming up {currency}: {e}", exc_info=True)
-                    debug_logger.warning(f"\n\nInitializing empty structures for {currency} due to error\n")
-            
-            trade_logger.info("Warm-up complete. Ready for live ticks.")
-            
-        except ImportError:
-            debug_logger.warning("\n\nrun_test.py not found. Running with empty bars and zones.\n")
-            
+        trade_logger.info("Startup complete. Ready for live ticks.")
     except Exception as e:
         debug_logger.error(f"Unexpected error in main initialization: {e}", exc_info=True)
         debug_logger.warning("Algorithm continuing with minimal initialization")
@@ -2578,7 +2917,7 @@ def load_algorithm_signal_state():
                 if isinstance(loaded_signals, dict):
                     for currency in SUPPORTED_CURRENCIES:
                         signal = loaded_signals.get(currency, 'hold')
-                        if signal in ('buy', 'sell', 'close', 'hold'):
+                        if signal in ('buy', 'sell', 'hold'):
                             last_signals[currency] = signal
                         else:
                             last_signals[currency] = 'hold'
@@ -2599,13 +2938,65 @@ def load_algorithm_signal_state():
         debug_logger.error(f"[SIGNAL_STATE] Failed to load signal state: {e}")
         return False
 
+def recover_positions_from_database():
+    """
+    Recover open positions from database after restart.
+    Rebuilds in-memory trade state from persistent position data.
+    """
+    global trades
+    
+    try:
+        # Load all positions from database
+        saved_positions = load_all_positions_from_db()
+        
+        if not saved_positions:
+            debug_logger.info("[POSITION_RECOVERY] No saved positions found in database")
+            return True
+        
+        # Rebuild trade objects for each recovered position
+        for currency, position_info in saved_positions.items():
+            if currency not in trades:
+                trades[currency] = []
+            
+            # Create a trade object from the saved position
+            recovered_trade = {
+                'entry_time': position_info['entry_time'],
+                'entry_price': position_info['entry_price'],
+                'stop_loss': 0,  # Will be recalculated if needed
+                'take_profit': 0,  # Will be recalculated if needed
+                'position_size': 1,  # Default size
+                'status': 'open',
+                'direction': position_info['direction'],
+                'zone_start_price': 0,
+                'zone_end_price': 0,
+                'zone_length': 0,
+                'required_pips': 0,
+                'currency': currency,
+                'close_reason': None,
+                'recovered_from_db': True  # Mark as recovered
+            }
+            
+            trades[currency].append(recovered_trade)
+            
+            debug_logger.info(
+                f"[POSITION_RECOVERY] Recovered {currency} {position_info['direction']} position "
+                f"from {position_info['entry_time']} at {position_info['entry_price']}"
+            )
+        
+        debug_logger.info(f"[POSITION_RECOVERY] Successfully recovered {len(saved_positions)} positions")
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"[POSITION_RECOVERY] Error recovering positions: {e}")
+        return False
+
 def reset_trading_state_for_live_trading():
     """
     Reset all trading-related state to start fresh for live trading.
     This is called after backtest/warmup to ensure no backtest trades affect live trading.
     
     KEEPS: Zones, indicators, bars, market analysis state
-    RESETS: Signal state, trade history, position tracking
+    RESETS: Signal state, trade history (but recovers real positions from DB)
     """
     global last_signals, last_non_hold_signal, is_live_trading_mode
     
@@ -2623,6 +3014,10 @@ def reset_trading_state_for_live_trading():
         if os.path.exists(signal_state_file):
             os.remove(signal_state_file)
             debug_logger.info("[TRADING_RESET] Removed old signal state file")
+        
+        # IMPORTANT: Recover any open positions from database before clearing trades
+        debug_logger.info("[TRADING_RESET] Recovering positions from database...")
+        recover_positions_from_database()
         
         # Save fresh signal state
         save_algorithm_signal_state()
