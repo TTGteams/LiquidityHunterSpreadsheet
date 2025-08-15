@@ -1457,12 +1457,17 @@ def create_tables_if_not_exist():
             SignalType NVARCHAR(20),
             Price FLOAT,
             Currency NVARCHAR(10),
+            SignalIntent NVARCHAR(20) NULL,  -- 'OPEN_LONG', 'CLOSE_LONG', 'OPEN_SHORT', 'CLOSE_SHORT'
             AlgoInstance INT DEFAULT 1,
             CreatedAt DATETIME DEFAULT GETDATE()
         );
         
         IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_FXStrat_TradeSignalsSent_SignalTime')
         CREATE INDEX IX_FXStrat_TradeSignalsSent_SignalTime ON FXStrat_TradeSignalsSent(SignalTime);
+        
+        -- Add SignalIntent column to existing table if it doesn't exist
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('FXStrat_TradeSignalsSent') AND name = 'SignalIntent')
+            ALTER TABLE FXStrat_TradeSignalsSent ADD SignalIntent NVARCHAR(20) NULL;
         """)
         
         # Table 4: FXStrat_CurrentPositions - for crash recovery
@@ -1831,12 +1836,391 @@ def load_all_positions_from_db():
         if conn:
             conn.close()
 
-def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD"):
+def get_current_position_state(currency):
     """
-    Saves a trade signal to the database with duplicate prevention aligned with 15-minute bars.
+    Determine current position state based on open trades in memory and DB.
+    
+    Returns:
+        str: 'FLAT', 'LONG', or 'SHORT'
+    """
+    try:
+        # Check memory first
+        if currency in trades:
+            open_trades = [t for t in trades[currency] if t['status'] == 'open']
+            if open_trades:
+                # Should only have one open trade
+                if len(open_trades) > 1:
+                    debug_logger.warning(f"Multiple open trades detected for {currency} - using first one")
+                return 'LONG' if open_trades[0]['direction'] == 'long' else 'SHORT'
+        
+        # Check DB as backup
+        db_position = get_current_position_from_db(currency)
+        if db_position:
+            return 'LONG' if db_position['direction'] == 'long' else 'SHORT'
+        
+        return 'FLAT'
+        
+    except Exception as e:
+        debug_logger.error(f"Error determining position state for {currency}: {e}")
+        return 'FLAT'  # Default to flat on error
+
+def determine_signal_intent(signal_type, position_before, position_after):
+    """
+    Determine the intent of a signal based on position transitions.
+    
+    Args:
+        signal_type: 'buy' or 'sell'
+        position_before: 'FLAT', 'LONG', 'SHORT'
+        position_after: 'FLAT', 'LONG', 'SHORT'
+        
+    Returns:
+        str: Signal intent like 'OPEN_LONG', 'CLOSE_SHORT', etc.
+    """
+    if position_before == 'FLAT' and position_after == 'LONG':
+        return 'OPEN_LONG'
+    elif position_before == 'FLAT' and position_after == 'SHORT':
+        return 'OPEN_SHORT'
+    elif position_before == 'LONG' and position_after == 'FLAT':
+        return 'CLOSE_LONG'
+    elif position_before == 'SHORT' and position_after == 'FLAT':
+        return 'CLOSE_SHORT'
+    elif position_before == 'LONG' and position_after == 'SHORT':
+        return 'CLOSE_LONG_OPEN_SHORT'  # Close long and open short
+    elif position_before == 'SHORT' and position_after == 'LONG':
+        return 'CLOSE_SHORT_OPEN_LONG'  # Close short and open long
+    else:
+        return 'UNKNOWN'
+
+def validate_position_against_signal_intent(currency, position_value):
+    """
+    Validate external position against the last SignalIntent for a currency.
+    Handles position reconciliation and conflict resolution.
+    
+    Args:
+        currency: Currency pair (e.g., 'USD.CAD')
+        position_value: Position from external system (negative=short, positive=long, 0=flat, None=unknown)
+        
+    Returns:
+        dict: {
+            'is_valid': bool,
+            'expected_position': str,  # 'LONG', 'SHORT', 'FLAT'
+            'actual_position': str,    # 'LONG', 'SHORT', 'FLAT', 'UNKNOWN'
+            'conflict_detected': bool,
+            'last_signal_intent': str,
+            'resolution_action': str   # What action was taken
+        }
+    """
+    try:
+        # Get the last SignalIntent from database
+        last_intent_info = get_last_signal_intent_from_db(currency)
+        
+        # Determine expected position from SignalIntent
+        if last_intent_info:
+            intent = last_intent_info['signal_intent']
+            if intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+                expected_position = 'LONG'
+            elif intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+                expected_position = 'SHORT'
+            elif intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+                expected_position = 'FLAT'
+            else:
+                expected_position = 'UNKNOWN'
+        else:
+            # No SignalIntent in database, assume FLAT
+            intent = None
+            expected_position = 'FLAT'
+        
+        # Determine actual position from external value
+        if position_value is None:
+            actual_position = 'UNKNOWN'
+        elif position_value == 0:
+            actual_position = 'FLAT'
+        elif position_value > 0:
+            actual_position = 'LONG'
+        elif position_value < 0:
+            actual_position = 'SHORT'
+        else:
+            actual_position = 'UNKNOWN'
+        
+        # Check for conflicts
+        conflict_detected = False
+        resolution_action = 'no_action'
+        
+        if actual_position != 'UNKNOWN' and expected_position != 'UNKNOWN':
+            if actual_position != expected_position:
+                conflict_detected = True
+                # Position parameter is assumed correct - update our internal state
+                resolution_action = 'update_internal_state'
+                
+                debug_logger.warning(
+                    f"[POSITION_CONFLICT] {currency} position mismatch detected!\n"
+                    f"  Expected (from SignalIntent {intent}): {expected_position}\n"
+                    f"  Actual (from external system): {actual_position} (value: {position_value})\n"
+                    f"  Resolution: Trusting external position as authoritative"
+                )
+        
+        # Determine validation result
+        is_valid = not conflict_detected or actual_position == 'UNKNOWN'
+        
+        result = {
+            'is_valid': is_valid,
+            'expected_position': expected_position,
+            'actual_position': actual_position,
+            'conflict_detected': conflict_detected,
+            'last_signal_intent': intent,
+            'resolution_action': resolution_action,
+            'position_value': position_value
+        }
+        
+        # Log validation result
+        if conflict_detected:
+            debug_logger.error(
+                f"[POSITION_VALIDATION] {currency} CONFLICT: "
+                f"Expected {expected_position}, Got {actual_position} ({position_value})"
+            )
+        else:
+            debug_logger.info(
+                f"[POSITION_VALIDATION] {currency} OK: "
+                f"Position {actual_position} ({position_value}) matches expected {expected_position}"
+            )
+        
+        return result
+        
+    except Exception as e:
+        debug_logger.error(f"[POSITION_VALIDATION] Error validating {currency} position: {e}")
+        return {
+            'is_valid': False,
+            'expected_position': 'UNKNOWN',
+            'actual_position': 'UNKNOWN',
+            'conflict_detected': True,
+            'last_signal_intent': None,
+            'resolution_action': 'error',
+            'position_value': position_value
+        }
+
+def reconcile_position_conflict(currency, validation_result):
+    """
+    Handle position conflicts by updating internal state to match external position.
+    
+    Args:
+        currency: Currency pair
+        validation_result: Result from validate_position_against_signal_intent()
+        
+    Returns:
+        bool: True if reconciliation was successful
+    """
+    try:
+        if not validation_result['conflict_detected']:
+            return True  # No conflict to resolve
+        
+        actual_position = validation_result['actual_position']
+        position_value = validation_result['position_value']
+        
+        # Update internal signal state to match external position
+        global last_signals
+        
+        if actual_position == 'LONG':
+            corrected_signal = 'buy'
+        elif actual_position == 'SHORT':
+            corrected_signal = 'sell'
+        elif actual_position == 'FLAT':
+            corrected_signal = 'hold'
+        else:
+            corrected_signal = 'hold'  # Default for unknown
+        
+        # Update in-memory state
+        old_signal = last_signals.get(currency, 'hold')
+        last_signals[currency] = corrected_signal
+        
+        # Save corrected state to file if in live trading mode
+        if is_live_trading_mode:
+            save_algorithm_signal_state()
+        
+        debug_logger.warning(
+            f"[POSITION_RECONCILIATION] {currency} internal state updated:\n"
+            f"  Old signal state: {old_signal}\n"
+            f"  New signal state: {corrected_signal}\n"
+            f"  Based on external position: {actual_position} ({position_value})\n"
+            f"  Reason: External position is authoritative"
+        )
+        
+        return True
+        
+    except Exception as e:
+        debug_logger.error(f"[POSITION_RECONCILIATION] Error reconciling {currency}: {e}")
+        return False
+
+def get_last_signal_intent_from_db(currency):
+    """
+    Get the most recent SignalIntent for a specific currency.
+    Used for duplicate prevention and state recovery.
+    
+    Args:
+        currency: Currency pair
+        
+    Returns:
+        dict: {'signal_intent': str, 'signal_time': datetime, 'price': float} or None
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return None
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT TOP 1 SignalIntent, SignalTime, Price, SignalType
+        FROM FXStrat_TradeSignalsSent 
+        WHERE Currency = ? 
+        AND AlgoInstance = ?
+        AND SignalIntent IS NOT NULL
+        ORDER BY SignalTime DESC
+        """, currency, ALGO_INSTANCE)
+        
+        row = cursor.fetchone()
+        if row:
+            return {
+                'signal_intent': row[0],
+                'signal_time': row[1],
+                'price': row[2],
+                'signal_type': row[3]
+            }
+        
+        return None
+        
+    except Exception as e:
+        debug_logger.error(f"Error getting last SignalIntent for {currency}: {e}")
+        return None
+    
+    finally:
+        if cursor:
+            cursor.close()
+
+def get_last_n_signals_from_db(currency, n=3):
+    """
+    Get the last N trade signals for a currency from the database.
+    
+    Args:
+        currency: Currency pair
+        n: Number of signals to retrieve (default 3)
+        
+    Returns:
+        list: List of signal dictionaries with signal intent
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return []
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT TOP (?) 
+            SignalTime, SignalType, Price, SignalIntent
+        FROM FXStrat_TradeSignalsSent 
+        WHERE Currency = ? 
+        AND AlgoInstance = ?
+        ORDER BY SignalTime DESC
+        """, n, currency, ALGO_INSTANCE)
+        
+        signals = []
+        for row in cursor.fetchall():
+            signals.append({
+                'signal_time': row[0],
+                'signal_type': row[1],
+                'price': row[2],
+                'signal_intent': row[3]
+            })
+        
+        return signals
+        
+    except Exception as e:
+        debug_logger.error(f"Error getting last {n} signals for {currency}: {e}")
+        return []
+    
+    finally:
+        if cursor:
+            cursor.close()
+
+def determine_position_from_signal_history(currency):
+    """
+    Determine current position based on signal history using SignalIntent.
+    
+    Args:
+        currency: Currency pair
+        
+    Returns:
+        str: 'FLAT', 'LONG', or 'SHORT'
+    """
+    try:
+        # Get last signal first (most efficient)
+        signals = get_last_n_signals_from_db(currency, 1)
+        
+        if not signals:
+            debug_logger.info(f"[POSITION_HISTORY] No signals found for {currency}, assuming FLAT")
+            return 'FLAT'
+        
+        latest_signal = signals[0]
+        
+        # Use SignalIntent to determine current position
+        if latest_signal.get('signal_intent'):
+            intent = latest_signal['signal_intent']
+            if intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+                debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: LONG ({intent})")
+                return 'LONG'
+            elif intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+                debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: SHORT ({intent})")
+                return 'SHORT'
+            elif intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+                debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: FLAT ({intent})")
+                return 'FLAT'
+        
+        # Fallback: Get last 3 signals for pattern analysis (old logic for backward compatibility)
+        debug_logger.warning(f"[POSITION_HISTORY] {currency} missing SignalIntent, using fallback analysis")
+        signals = get_last_n_signals_from_db(currency, 3)
+        
+        if len(signals) >= 2:
+            last_two = [s['signal_type'] for s in signals[:2]]
+            
+            if last_two == ['sell', 'buy']:  # Most recent: sell, before: buy
+                return 'FLAT'  # Likely closed a long position
+            elif last_two == ['buy', 'sell']:  # Most recent: buy, before: sell
+                return 'FLAT'  # Likely closed a short position
+            elif signals[0]['signal_type'] == 'buy':
+                return 'LONG'  # Likely opened long
+            elif signals[0]['signal_type'] == 'sell':
+                return 'SHORT'  # Likely opened short
+        
+        return 'FLAT'
+        
+    except Exception as e:
+        debug_logger.error(f"Error determining position from signal history for {currency}: {e}")
+        return 'FLAT'
+
+def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD", signal_intent=None):
+    """
+    Saves a trade signal to the database with robust duplicate prevention and signal intent.
+    Enhanced to prevent duplicate SignalIntent states per currency.
+    
+    Args:
+        signal_type: 'buy' or 'sell'
+        price: Signal price
+        signal_time: When signal occurred
+        currency: Currency pair
+        signal_intent: 'OPEN_LONG', 'CLOSE_LONG', 'OPEN_SHORT', 'CLOSE_SHORT', etc.
+    
+    Returns:
+        bool: True if signal was saved or duplicate was prevented, False on error
     """
     if signal_type == 'hold':
         return True
+    
+    # Validate required parameters
+    if not signal_intent:
+        debug_logger.error(f"Cannot save {currency} signal without SignalIntent")
+        return False
         
     if signal_time is None:
         signal_time = datetime.datetime.now()
@@ -1848,50 +2232,65 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
     try:
         conn = get_db_connection()
         if conn is None:
+            debug_logger.error(f"Failed to save {currency} signal - no database connection")
             return False
         
         cursor = conn.cursor()
         
-        # Check for duplicate signals within the same 15-minute bar
-        # This aligns with our bar-based trading logic
+        # ENHANCED DUPLICATE PREVENTION: Check for duplicate SignalIntent per currency
+        # This prevents sending the same intent multiple times (e.g., multiple OPEN_LONG signals)
+        cursor.execute("""
+        SELECT TOP 1 SignalIntent, SignalTime, Price
+        FROM FXStrat_TradeSignalsSent 
+        WHERE Currency = ?
+        AND AlgoInstance = ?
+        ORDER BY SignalTime DESC
+        """, currency, ALGO_INSTANCE)
+        
+        last_signal = cursor.fetchone()
+        
+        # Check for duplicate SignalIntent
+        if last_signal and last_signal[0] == signal_intent:
+            time_diff = (signal_time - last_signal[1]).total_seconds() if last_signal[1] else 0
+            debug_logger.info(
+                f"Prevented duplicate {currency} SignalIntent: {signal_intent} "
+                f"(last sent {time_diff:.0f}s ago at {last_signal[2]:.5f})"
+            )
+            return True  # Not an error - duplicate prevention worked
+        
+        # Additional check: Prevent rapid-fire signals within same 15-minute bar
         cursor.execute("""
         SELECT COUNT(*) 
         FROM FXStrat_TradeSignalsSent 
         WHERE SignalType = ? 
         AND Currency = ?
-        AND Price = ?
         AND SignalTime BETWEEN DATEADD(minute, -15, ?) AND ?
         AND AlgoInstance = ?
         """, 
-        signal_type,
-        currency,
-        price,
-        signal_time,
-        signal_time,
-        ALGO_INSTANCE
+        signal_type, currency, signal_time, signal_time, ALGO_INSTANCE)
+        
+        rapid_fire_count = cursor.fetchone()[0]
+        
+        if rapid_fire_count > 0:
+            debug_logger.info(f"Prevented rapid-fire {currency} {signal_type} signal within 15m bar")
+            return True  # Not an error - duplicate prevention worked
+        
+        # Insert the new signal
+        cursor.execute("""
+        INSERT INTO FXStrat_TradeSignalsSent 
+        (SignalTime, SignalType, Price, Currency, SignalIntent, AlgoInstance)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, 
+        signal_time, signal_type, price, currency, signal_intent, ALGO_INSTANCE)
+        
+        conn.commit()
+        
+        # Enhanced logging with more context
+        debug_logger.warning(
+            f"✓ {currency} {signal_type.upper()} signal saved: {signal_intent} at {price:.5f}"
         )
         
-        count = cursor.fetchone()[0]
-        
-        if count == 0:  # Only insert if no duplicate exists
-            cursor.execute("""
-            INSERT INTO FXStrat_TradeSignalsSent 
-            (SignalTime, SignalType, Price, Currency, AlgoInstance)
-            VALUES (?, ?, ?, ?, ?)
-            """, 
-            signal_time,
-            signal_type,
-            price,
-            currency,
-            ALGO_INSTANCE
-            )
-            
-            conn.commit()
-            debug_logger.warning(f"New {currency} {signal_type} signal stored at {price:.5f}")
-            return True
-        else:
-            debug_logger.info(f"Skipped duplicate {currency} {signal_type} signal at {price:.5f} (already exists in current 15m bar)")
-            return True
+        return True
     
     except Exception as e:
         debug_logger.error(f"Error saving {currency} signal to database: {e}", exc_info=True)
@@ -2340,14 +2739,15 @@ def calculate_atr_pips_required(data, currency="EUR.USD", use_cache=True):
 # --------------------------------------------------------------------------
 # MAIN TICK HANDLER
 # --------------------------------------------------------------------------
-def process_market_data(new_data_point, currency="EUR.USD"):
+def process_market_data(new_data_point, currency="EUR.USD", external_position=None):
     """
-    Process new market data for a specific currency.
+    Process new market data for a specific currency with position validation.
     Optimized for better performance with multi-currency support.
     
     Args:
         new_data_point: DataFrame containing the new tick data
         currency: The currency pair to process (default: EUR.USD)
+        external_position: Position from external system (negative=short, positive=long, 0=flat, None=unknown)
         
     Returns:
         tuple: (signal, currency) where signal is 'buy', 'sell', or 'hold'
@@ -2365,6 +2765,31 @@ def process_market_data(new_data_point, currency="EUR.USD"):
                 debug_logger.info(f"Using currency from data: {currency}")
             else:
                 debug_logger.warning(f"Unsupported currency in data: {extracted_currency}. Using {currency} instead.")
+        
+        # POSITION VALIDATION: Validate external position against our SignalIntent records
+        position_validation_result = None
+        if external_position is not None:
+            position_validation_result = validate_position_against_signal_intent(currency, external_position)
+            
+            # Handle position conflicts
+            if position_validation_result['conflict_detected']:
+                debug_logger.warning(
+                    f"[POSITION_CONFLICT] {currency} position conflict detected - "
+                    f"Expected: {position_validation_result['expected_position']}, "
+                    f"External: {position_validation_result['actual_position']} ({external_position})"
+                )
+                
+                # Reconcile the conflict (external position is authoritative)
+                reconciliation_success = reconcile_position_conflict(currency, position_validation_result)
+                
+                if reconciliation_success:
+                    debug_logger.info(f"[POSITION_CONFLICT] {currency} conflict resolved successfully")
+                else:
+                    debug_logger.error(f"[POSITION_CONFLICT] {currency} conflict resolution failed")
+            else:
+                debug_logger.debug(f"[POSITION_VALIDATION] {currency} position validated: {external_position}")
+        else:
+            debug_logger.debug(f"[POSITION_VALIDATION] {currency} no external position provided")
         
         # Initialize if not already present - combine into one block for efficiency
         if currency not in historical_ticks:
@@ -2585,8 +3010,56 @@ def process_market_data(new_data_point, currency="EUR.USD"):
             if raw_signal not in ['hold']:
                 last_non_hold_signal[currency] = raw_signal
                 
-                # SAVE NON-HOLD SIGNAL TO DATABASE
-                save_signal_to_database(raw_signal, tick_price, tick_time, currency)
+                # DETERMINE SIGNAL INTENT WITH ENHANCED VALIDATION
+                position_before = get_current_position_state(currency)
+                
+                # Determine position after based on signal and current state
+                if raw_signal == 'buy':
+                    if closed_any_trade:
+                        # This is a close signal (closing short position)
+                        position_after = 'FLAT'
+                    else:
+                        # This is an open signal (opening long position)
+                        position_after = 'LONG'
+                elif raw_signal == 'sell':
+                    if closed_any_trade:
+                        # This is a close signal (closing long position)
+                        position_after = 'FLAT'
+                    else:
+                        # This is an open signal (opening short position)
+                        position_after = 'SHORT'
+                else:
+                    position_after = position_before  # No change for hold
+                
+                # Determine signal intent
+                signal_intent = determine_signal_intent(raw_signal, position_before, position_after)
+                
+                # VALIDATION: Check for invalid signal intent
+                if signal_intent == 'UNKNOWN':
+                    debug_logger.error(
+                        f"[SIGNAL_INTENT] Invalid signal transition for {currency}: "
+                        f"{raw_signal} from {position_before} to {position_after}"
+                    )
+                    # Don't save invalid signal intent
+                    pass
+                else:
+                    # ENHANCED: Check against last SignalIntent to prevent duplicates
+                    last_intent_info = get_last_signal_intent_from_db(currency)
+                    if last_intent_info and last_intent_info['signal_intent'] == signal_intent:
+                        debug_logger.info(
+                            f"[SIGNAL_INTENT] Prevented duplicate {currency} SignalIntent: {signal_intent} "
+                            f"(last sent at {last_intent_info['signal_time']})"
+                        )
+                        # Don't save duplicate signal intent
+                        pass
+                    else:
+                        # SAVE NON-HOLD SIGNAL TO DATABASE WITH VALIDATED SIGNAL INTENT
+                        success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent)
+                        
+                        if not success:
+                            debug_logger.error(f"[SIGNAL_SAVE] Failed to save {currency} signal: {signal_intent}")
+                        else:
+                            debug_logger.info(f"[SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
 
                 # Enhanced signal logging - but less verbose
                 debug_logger.warning(
@@ -2904,9 +3377,15 @@ def save_algorithm_signal_state():
         return False
 
 def load_algorithm_signal_state():
-    """Load signal state from disk if present"""
+    """
+    Load signal state from disk and validate against database SignalIntent records.
+    Enhanced to use SignalIntent for accurate state recovery.
+    """
     try:
         global last_signals
+        
+        # First, try to load from file
+        file_loaded = False
         if os.path.exists(signal_state_file):
             with open(signal_state_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -2923,19 +3402,77 @@ def load_algorithm_signal_state():
                             last_signals[currency] = 'hold'
                     
                     saved_time = data.get('timestamp')
-                    debug_logger.info(f"[SIGNAL_STATE] Loaded signal state: {last_signals}")
+                    debug_logger.info(f"[SIGNAL_STATE] Loaded signal state from file: {last_signals}")
                     if saved_time:
-                        debug_logger.info(f"[SIGNAL_STATE] State was saved at: {saved_time}")
-                    return True
+                        debug_logger.info(f"[SIGNAL_STATE] File was saved at: {saved_time}")
+                    file_loaded = True
                 else:
                     debug_logger.warning("[SIGNAL_STATE] Invalid format in signal state file")
             else:
                 debug_logger.info(f"[SIGNAL_STATE] Signal state file is for different instance ({data.get('algo_instance')} vs {ALGO_INSTANCE})")
-        else:
-            debug_logger.info("[SIGNAL_STATE] No signal state file found; starting with fresh signals")
-        return False
+        
+        # ENHANCED: Also validate against database SignalIntent records
+        debug_logger.info("[SIGNAL_STATE] Validating signal state against database SignalIntent records...")
+        
+        db_state_loaded = False
+        for currency in SUPPORTED_CURRENCIES:
+            try:
+                last_intent_info = get_last_signal_intent_from_db(currency)
+                if last_intent_info:
+                    intent = last_intent_info['signal_intent']
+                    signal_time = last_intent_info['signal_time']
+                    
+                    # Determine expected signal state from SignalIntent
+                    if intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+                        expected_signal = 'buy'  # Should be in long position
+                    elif intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+                        expected_signal = 'sell'  # Should be in short position
+                    elif intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+                        expected_signal = 'hold'  # Should be flat
+                    else:
+                        expected_signal = 'hold'  # Default for unknown intents
+                    
+                    # Compare with file-loaded state
+                    file_signal = last_signals.get(currency, 'hold')
+                    if file_signal != expected_signal:
+                        debug_logger.warning(
+                            f"[SIGNAL_STATE] {currency} state mismatch! "
+                            f"File: {file_signal}, DB SignalIntent: {expected_signal} ({intent})"
+                        )
+                        # Use database SignalIntent as authoritative source
+                        last_signals[currency] = expected_signal
+                        db_state_loaded = True
+                    
+                    debug_logger.info(
+                        f"[SIGNAL_STATE] {currency}: {expected_signal} "
+                        f"(from SignalIntent: {intent} at {signal_time})"
+                    )
+                else:
+                    # No SignalIntent in database, keep file state or default to hold
+                    if currency not in last_signals:
+                        last_signals[currency] = 'hold'
+                    debug_logger.info(f"[SIGNAL_STATE] {currency}: {last_signals[currency]} (no DB SignalIntent)")
+                    
+            except Exception as e:
+                debug_logger.error(f"[SIGNAL_STATE] Error validating {currency} state: {e}")
+                # Ensure we have a valid state
+                if currency not in last_signals:
+                    last_signals[currency] = 'hold'
+        
+        if db_state_loaded:
+            debug_logger.warning("[SIGNAL_STATE] Used database SignalIntent to correct signal state")
+            # Save corrected state back to file
+            save_algorithm_signal_state()
+        
+        debug_logger.info(f"[SIGNAL_STATE] Final signal state: {last_signals}")
+        return file_loaded or db_state_loaded
+        
     except Exception as e:
         debug_logger.error(f"[SIGNAL_STATE] Failed to load signal state: {e}")
+        # Ensure all currencies have valid state on error
+        for currency in SUPPORTED_CURRENCIES:
+            if currency not in last_signals:
+                last_signals[currency] = 'hold'
         return False
 
 def recover_positions_from_database():

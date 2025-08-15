@@ -89,6 +89,16 @@ def trade_signal():
                 error_msg = f"Missing field: {field}"
                 trade_logger.error(error_msg)
                 return jsonify({'error': error_msg}), 400
+        
+        # Extract optional Position parameter
+        external_position = data.get('Position', None)
+        if external_position is not None:
+            try:
+                external_position = int(external_position)  # Ensure it's an integer
+                debug_logger.info(f"Received {currency} position: {external_position}")
+            except (ValueError, TypeError):
+                debug_logger.warning(f"Invalid position value for {currency}: {data.get('Position')} - ignoring")
+                external_position = None
 
         # For forwarded signals, just log and return (avoid double processing)
         if is_forwarded:
@@ -138,9 +148,9 @@ def trade_signal():
         # Set 'Time' as the index
         df.set_index('Time', inplace=True)
         
-        # Process the new data point through the algorithm
+        # Process the new data point through the algorithm with position validation
         with state_lock:
-            signal, processed_currency = algorithm.process_market_data(df, currency)
+            signal, processed_currency = algorithm.process_market_data(df, currency, external_position)
             
         # Only log if signal is not 'hold'
         if signal != 'hold':
@@ -400,6 +410,14 @@ def trade_signal_batch():
                     results.append({'error': 'Missing Time or Price field', 'index': i})
                     continue
                 
+                # Extract optional Position parameter
+                external_position = data_point.get('Position', None)
+                if external_position is not None:
+                    try:
+                        external_position = int(external_position)
+                    except (ValueError, TypeError):
+                        external_position = None
+                
                 # Create DataFrame for single data point
                 df = pd.DataFrame([data_point])
                 
@@ -432,9 +450,9 @@ def trade_signal_batch():
                 # Set index
                 df.set_index('Time', inplace=True)
                 
-                # Process through algorithm
+                # Process through algorithm with position validation
                 with state_lock:
-                    signal, processed_currency = algorithm.process_market_data(df, currency)
+                    signal, processed_currency = algorithm.process_market_data(df, currency, external_position)
                 
                 # Track signal counts
                 signals_count[signal] = signals_count.get(signal, 0) + 1
@@ -447,6 +465,10 @@ def trade_signal_batch():
                     'time': data_point['Time'],
                     'price': data_point['Price']
                 }
+                
+                # Include position information if provided
+                if external_position is not None:
+                    signal_result['position'] = external_position
                 results.append(signal_result)
                 
             except Exception as e:
