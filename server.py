@@ -70,8 +70,12 @@ def trade_signal():
         content = request.json
         data = content['data']
         
-        # Extract currency from request, default to EUR.USD if not provided
-        currency = content.get('currency', 'EUR.USD')
+        # Extract currency from request - REQUIRED parameter, no defaulting
+        currency = content.get('currency')
+        if not currency:
+            error_msg = "Missing required 'currency' parameter"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
         
         # Check if this is a forwarded signal from batch processing
         is_forwarded = content.get('source') == 'batch_forward'
@@ -385,7 +389,11 @@ def trade_signal_batch():
     try:
         content = request.json
         data_points = content['data']  # Expecting array of {Time, Price} objects
-        currency = content.get('currency', 'EUR.USD')
+        currency = content.get('currency')
+        if not currency:
+            error_msg = "Missing required 'currency' parameter"
+            trade_logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
         
         # Validate currency
         if currency not in algorithm.SUPPORTED_CURRENCIES:

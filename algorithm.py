@@ -19,13 +19,20 @@ SUPPORTED_CURRENCIES = ["EUR.USD", "USD.CAD", "GBP.USD"]
 
 # Constants (Trading Parameters)
 WINDOW_LENGTH = 10
-#PIPS_REQUIRED = 0.0030  
+
 SUPPORT_RESISTANCE_ALLOWANCE = 0.0011
-STOP_LOSS_PROPORTION = 0.11
+STOP_LOSS_PROPORTION = 0.11  # Default stop loss proportion (kept for backward compatibility)
 TAKE_PROFIT_PROPORTION = 0.65
+
+# Dynamic Stop Loss Proportions based on zone size (in pips)
+STOP_LOSS_SMALL_ZONE_THRESHOLD = 30  # pips
+STOP_LOSS_MEDIUM_ZONE_THRESHOLD = 40  # pips
+STOP_LOSS_SMALL_ZONE_PROPORTION = 0.20  # 20% for zones < 30 pips
+STOP_LOSS_MEDIUM_ZONE_PROPORTION = 0.15  # 15% for zones 30-40 pips
+STOP_LOSS_LARGE_ZONE_PROPORTION = 0.11  # 11% for zones > 40 pips
 LIQUIDITY_ZONE_ALERT = 0.002
-DEMAND_ZONE_RSI_TOP = 70
-SUPPLY_ZONE_RSI_BOTTOM = 30
+DEMAND_ZONE_RSI_TOP = 40
+SUPPLY_ZONE_RSI_BOTTOM = 60
 INVALIDATE_ZONE_LENGTH = 0.0013
 COOLDOWN_SECONDS = 7200
 RISK_PROPORTION = 0.03
@@ -54,13 +61,6 @@ is_live_trading_mode = False
 # Raw tick-by-tick data (trimmed to 12 hours)
 historical_ticks = {currency: pd.DataFrame() for currency in SUPPORTED_CURRENCIES}
 
-# Incrementally built 15-min bars
-bars = {currency: pd.DataFrame(columns=["open", "high", "low", "close"]) for currency in SUPPORTED_CURRENCIES}
-
-# Current bar metadata
-current_bar_start = {currency: None for currency in SUPPORTED_CURRENCIES}
-current_bar_data = {currency: None for currency in SUPPORTED_CURRENCIES}
-
 # Trading zones and state
 current_valid_zones_dict = {currency: {} for currency in SUPPORTED_CURRENCIES}
 last_trade_time = {currency: None for currency in SUPPORTED_CURRENCIES}
@@ -85,10 +85,30 @@ external_data_timer = None  # Will hold the timer object
 
 # Add at the top with other constants
 VALID_PRICE_RANGES = {
-    "EUR.USD": (0.5, 1.5),    # EUR.USD typically 1.0-1.2
-    "USD.CAD": (1.2, 1.5),    # USD.CAD typically 1.3-1.4
-    "GBP.USD": (0.8, 1.8)     # GBP.USD typically 1.2-1.4
+    "EUR.USD": (1.0, 1.5),    # EUR.USD tightened from 0.5-1.5 to 1.0-1.5
+    "USD.CAD": (1.2, 1.5),    # USD.CAD unchanged (already tight)
+    "GBP.USD": (0.8, 1.5)     # GBP.USD tightened from 0.8-1.8 to 0.8-1.5
 }
+
+# Function to calculate dynamic stop loss proportion based on zone size
+def get_stop_loss_proportion(zone_size):
+    """
+    Calculate stop loss proportion based on zone size in pips.
+    
+    Args:
+        zone_size (float): Zone size in price units (not pips)
+    
+    Returns:
+        float: Stop loss proportion to use
+    """
+    zone_size_pips = zone_size * 10000  # Convert to pips
+    
+    if zone_size_pips < STOP_LOSS_SMALL_ZONE_THRESHOLD:
+        return STOP_LOSS_SMALL_ZONE_PROPORTION
+    elif zone_size_pips < STOP_LOSS_MEDIUM_ZONE_THRESHOLD:
+        return STOP_LOSS_MEDIUM_ZONE_PROPORTION
+    else:
+        return STOP_LOSS_LARGE_ZONE_PROPORTION
 
 # SQL script to clean duplicate zones - to be run manually
 CLEAN_DUPLICATE_ZONES_SQL = """
@@ -180,28 +200,7 @@ def load_preexisting_zones(zones_dict, currency="EUR.USD"):
     debug_logger.info(f"After load, {currency} has {len(current_valid_zones_dict[currency])} zones.")
 
 
-def load_preexisting_bars_and_indicators(precomputed_bars_df, currency="EUR.USD"):
-    """
-    Initializes the global 'bars' DataFrame with a precomputed set of 15-minute bars
-    that should already have RSI, MACD, etc.
-    
-    Args:
-        precomputed_bars_df: DataFrame containing precomputed bars
-        currency: The currency pair these bars belong to
-    """
-    global bars
-    debug_logger.info(f"Loading precomputed bars for {currency}")
-    
-    # Initialize if not already
-    if currency not in bars:
-        bars[currency] = pd.DataFrame(columns=["open", "high", "low", "close"])
-        
-    bars[currency] = precomputed_bars_df.copy()
-    
-    # Clean any duplicate timestamps after loading
-    bars[currency] = clean_duplicate_bars(bars[currency], currency)
-    
-    debug_logger.info(f"Loaded {len(bars[currency])} bars for {currency}")
+
 
 # --------------------------------------------------------------------------
 # TRADE STATE VALIDATION
@@ -345,144 +344,7 @@ def log_zone_status(location="", currency="EUR.USD", force_detailed=False):
     # Log the simplified table
     debug_logger.warning(table)
 
-# --------------------------------------------------------------------------
-# INCREMENTAL BAR UPDATING
-# --------------------------------------------------------------------------
-def clean_duplicate_bars(bars_df, currency="EUR.USD"):
-    """
-    Remove duplicate timestamps from bars DataFrame, keeping the most recent one.
-    This prevents the 'cannot reindex on an axis with duplicate labels' error.
-    """
-    if bars_df.empty or not bars_df.index.duplicated().any():
-        return bars_df
-    
-    # Count duplicates before cleaning
-    duplicate_count = bars_df.index.duplicated().sum()
-    debug_logger.warning(f"Found {duplicate_count} duplicate bar timestamps for {currency}. Cleaning...")
-    
-    # Keep last occurrence of each timestamp (most recent data)
-    cleaned_df = bars_df[~bars_df.index.duplicated(keep='last')]
-    
-    debug_logger.info(f"Removed {duplicate_count} duplicate bars for {currency}")
-    return cleaned_df
 
-def update_bars_with_tick(tick_time, tick_price, currency="EUR.USD"):
-    """
-    Updates bar data with a new price tick. If the tick is in a new 15-min period,
-    the previous bar is finalized and saved.
-    
-    Args:
-        tick_time: Timestamp of the tick
-        tick_price: Price of the tick
-        currency: The currency pair this tick belongs to
-        
-    Returns:
-        dict or False: Dictionary with finalized bar data if a bar was completed, False otherwise
-    """
-    global bars, current_bar_start, current_bar_data
-    
-    # Initialize if not already
-    if currency not in bars:
-        bars[currency] = pd.DataFrame(columns=["open", "high", "low", "close"])
-    if currency not in current_bar_start:
-        current_bar_start[currency] = None
-    if currency not in current_bar_data:
-        current_bar_data[currency] = None
-
-    # Floor to the 15-minute boundary
-    bar_start = tick_time.floor("15min")
-
-    if current_bar_start[currency] is None:
-        # First incoming tick for this currency
-        current_bar_start[currency] = bar_start
-        current_bar_data[currency] = {
-            "open": tick_price,
-            "high": tick_price,
-            "low": tick_price,
-            "close": tick_price
-        }
-        return False  # No completed bar yet
-
-    if bar_start == current_bar_start[currency]:
-        # Still in the same bar => update OHLC
-        current_bar_data[currency]["close"] = tick_price
-        if tick_price > current_bar_data[currency]["high"]:
-            current_bar_data[currency]["high"] = tick_price
-        if tick_price < current_bar_data[currency]["low"]:
-            current_bar_data[currency]["low"] = tick_price
-        return False  # No completed bar yet
-    else:
-        # We have crossed into a new 15-min bar => finalize the old bar
-        old_open = current_bar_data[currency]["open"]
-        old_high = current_bar_data[currency]["high"]
-        old_low = current_bar_data[currency]["low"]
-        old_close = current_bar_data[currency]["close"]
-
-        # Ensure bars has a proper DateTimeIndex
-        if not isinstance(bars[currency].index, pd.DatetimeIndex):
-            bars[currency].index = pd.to_datetime(bars[currency].index)
-
-        # Remove any existing bar at this timestamp to prevent duplicates
-        if current_bar_start[currency] in bars[currency].index:
-            debug_logger.warning(f"Duplicate bar timestamp detected for {currency} at {current_bar_start[currency]}. Replacing with new bar data.")
-            bars[currency] = bars[currency].drop(current_bar_start[currency])
-
-        bars[currency].loc[current_bar_start[currency]] = current_bar_data[currency]
-        
-        bar_count = len(bars[currency])
-        # Indicators are now sourced externally from IndicatorTracker; don't compute here
-        rsi_value = None
-        macd_value = None
-        signal_value = None
-
-        # Prepare bar data for storage
-        finalized_bar_data = {
-            'currency': currency,
-            'bar_start_time': current_bar_start[currency],
-            'bar_end_time': current_bar_start[currency] + pd.Timedelta(minutes=15),
-            'open_price': old_open,
-            'high_price': old_high,
-            'low_price': old_low,
-            'close_price': old_close,
-            'zones_count': len(current_valid_zones_dict[currency]) if currency in current_valid_zones_dict else 0,
-            'rsi': rsi_value,
-            'macd_line': macd_value,
-            'signal_line': signal_value
-        }
-
-        # Enhanced logging with better formatting
-        rsi_str = "external" if rsi_value is None else f"{rsi_value:.2f}"
-        macd_str = "external" if macd_value is None else f"{macd_value:.2f}"
-        
-        debug_logger.warning(
-            f"\n\n{'='*40} {currency} BAR COMPLETED {'='*40}\n"
-            f"Time: {current_bar_start[currency]} to {current_bar_start[currency] + pd.Timedelta(minutes=15)}\n"
-            f"OHLC: Open={old_open:.5f}, High={old_high:.5f}, Low={old_low:.5f}, Close={old_close:.5f}\n"
-            f"Indicators: RSI={rsi_str}, MACD={macd_str}\n"
-            f"Stats: Bars count={bar_count}/384, Zones={len(current_valid_zones_dict[currency])}\n"
-            f"{'='*90}\n"
-        )
-
-        # Start a new bar
-        current_bar_start[currency] = bar_start
-        current_bar_data[currency] = {
-            "open": tick_price,
-            "high": tick_price,
-            "low": tick_price,
-            "close": tick_price
-        }
-
-        # Keep last 72 hours of bars for indicator calculations
-        cutoff_time = tick_time - pd.Timedelta(hours=72)
-        
-        # Ensure index is datetime before filtering
-        if not isinstance(bars[currency].index, pd.DatetimeIndex):
-            bars[currency].index = pd.to_datetime(bars[currency].index)
-        
-        bars[currency] = bars[currency][bars[currency].index >= cutoff_time]
-        
-        # Return the finalized bar data for storage
-        return finalized_bar_data
 
 # --------------------------------------------------------------------------
 # ZONE DETECTION - OPTIMIZATION
@@ -633,13 +495,13 @@ def invalidate_zones_via_sup_and_resist(current_price, valid_zones_dict, currenc
     return zones_dict
 
 
-def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"):
+def check_entry_conditions(current_time, current_price, valid_zones_dict, currency="EUR.USD"):
     """
     Check if conditions are met to enter a trade based on liquidity zones and indicators.
     
     Args:
-        data: DataFrame with price and indicator data
-        bar_index: Index of the current bar
+        current_time: Current timestamp
+        current_price: Current price
         valid_zones_dict: Dictionary of current valid zones
         currency: The currency pair to process
     """
@@ -647,7 +509,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
     
     # Add diagnostic logging to track critical values
     debug_logger.warning(f"\n\nENTRY CONDITION CHECK for {currency}:")
-    debug_logger.warning(f"  Current price: {data['close'].iloc[bar_index]:.5f}")
+    debug_logger.warning(f"  Current price: {current_price:.5f}")
     # Use external indicators for decision context
     ind = external_indicators.get(currency, {})
     rsi_val = ind.get('rsi')
@@ -668,9 +530,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
     # Get currency-specific data
     trades_for_currency = trades[currency]
     
-    # IMPORTANT FIX: Don't create a new empty dictionary for this currency, use the one provided
-    # The issue was that we were creating a new empty dictionary instead of using the one with zones
-    # Zones are provided externally via current_valid_zones_dict
+    # Use the zones provided from external system
     zones_dict = valid_zones_dict
     debug_logger.warning(f"  Active zones: {len(zones_dict)}")
     
@@ -681,10 +541,6 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
             if isinstance(zone_data, dict) and 'zone_type' in zone_data:
                 debug_logger.warning(f"    {zone_data['zone_type'].upper()} zone: {zone_id[0]:.5f}-{zone_id[1]:.5f}")
     
-    # Current price and time
-    current_time = data.index[bar_index]
-    current_price = data['close'].iloc[bar_index]
-    
     # Check if we're in cooldown period
     if last_trade_time[currency] is not None:
         seconds_since_last_trade = (current_time - last_trade_time[currency]).total_seconds()
@@ -692,9 +548,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
             debug_logger.warning(f"  Still in cooldown period ({seconds_since_last_trade:.0f}s / {COOLDOWN_SECONDS}s)")
             return zones_dict
 
-    # Get the dynamic pip requirement
-    current_pips_required = calculate_atr_pips_required(data, currency)
-    debug_logger.warning(f"  Pips required: {current_pips_required*10000:.1f} pips")
+
     
     # If we have no zones, exit early
     if not zones_dict:
@@ -724,13 +578,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
             # Set position size based on risk
             position_size = (balance[currency] * RISK_PROPORTION) / (zone_size * 10000)
             
-            # FIX: Make explicit zone size check
-            zone_size_sufficient = zone_size >= current_pips_required
-            debug_logger.warning(f"    Zone size sufficient: {zone_size_sufficient}")
-            
-            if not zone_size_sufficient:
-                debug_logger.warning(f"    Skipping zone: size too small ({zone_size*10000:.1f} < {current_pips_required*10000:.1f} pips)")
-                continue
+
             
             # Check direction and indicators using external values
             if zone_type == 'demand' and current_price < zone_end:
@@ -746,8 +594,10 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                     continue
 
                 entry_price = current_price
-                stop_loss = entry_price - (STOP_LOSS_PROPORTION * zone_size)
+                stop_loss_proportion = get_stop_loss_proportion(zone_size)
+                stop_loss = entry_price - (stop_loss_proportion * zone_size)
                 take_profit = entry_price + (TAKE_PROFIT_PROPORTION * zone_size)
+                debug_logger.warning(f"    Zone size: {zone_size*10000:.1f} pips, Using stop loss proportion: {stop_loss_proportion*100:.0f}%")
             
             elif zone_type == 'supply' and current_price > zone_end:
                 rsi_condition = (rsi_val is not None) and (rsi_val > SUPPLY_ZONE_RSI_BOTTOM)
@@ -762,8 +612,10 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                     continue
 
                 entry_price = current_price
-                stop_loss = entry_price + (STOP_LOSS_PROPORTION * zone_size)
+                stop_loss_proportion = get_stop_loss_proportion(zone_size)
+                stop_loss = entry_price + (stop_loss_proportion * zone_size)
                 take_profit = entry_price - (TAKE_PROFIT_PROPORTION * zone_size)
+                debug_logger.warning(f"    Zone size: {zone_size*10000:.1f} pips, Using stop loss proportion: {stop_loss_proportion*100:.0f}%")
             else:
                 debug_logger.warning("    Skipping zone: price not in correct position relative to zone")
                 continue
@@ -786,7 +638,7 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                     'zone_start_price': zone_start,
                     'zone_end_price': zone_end,
                     'zone_length': zone_data.get('zone_length', 0),
-                    'required_pips': current_pips_required,  # Added for analysis
+
                     'currency': currency  # Store the currency for reference
                 })
                 
@@ -794,9 +646,20 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 save_current_position_to_db(currency, trade_direction, current_time, entry_price)
 
                 last_trade_time[currency] = current_time
+                
+                # CRITICAL FIX: SAVE SIGNAL TO DATABASE FOR ALL PATHS
+                signal_type = 'buy' if zone_type == 'demand' else 'sell'
+                signal_intent = 'OPEN_LONG' if zone_type == 'demand' else 'OPEN_SHORT'
+                
+                success = save_signal_to_database(signal_type, entry_price, current_time, currency, signal_intent)
+                if not success:
+                    debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
+                else:
+                    debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
+                
                 trade_logger.info(
                     f"{currency} Signal generated: {zone_type} trade at {entry_price} "
-                    f"(Required pips: {current_pips_required:.5f}, Zone size: {zone_size:.5f})"
+                    f"(Zone size: {zone_size:.5f})"
                 )
                 debug_logger.warning(f"\n\nNew {currency} {zone_type} trade opened at {entry_price}\n")
 
@@ -805,6 +668,14 @@ def check_entry_conditions(data, bar_index, valid_zones_dict, currency="EUR.USD"
                 debug_logger.warning(f"  Open trades: {len([t for t in trades[currency] if t['status'] == 'open'])}")
 
                 # Exit immediately after opening a trade
+                # CRITICAL FIX: Set signal state so it gets returned to API
+                last_signals[currency] = signal_type
+                last_non_hold_signal[currency] = signal_type
+                
+                # Save signal state if in live trading mode
+                if is_live_trading_mode:
+                    save_algorithm_signal_state()
+                
                 return zones_dict
 
     return zones_dict
@@ -1576,93 +1447,7 @@ def initialize_database():
     debug_logger.info("Database initialization completed successfully")
     return True
 
-def save_bar_to_database(bar_data, currency="EUR.USD"):
-    """
-    Saves a completed 15-minute bar to the database.
-    
-    Args:
-        bar_data: Dictionary containing bar OHLC data
-        currency: The currency pair this bar belongs to
-    """
-    if bar_data is None or not isinstance(bar_data, dict):
-        return False
-    
-    # Extract data from bar
-    if currency not in current_bar_start:
-        debug_logger.error(f"Cannot save bar: current_bar_start not found for {currency}")
-        return False
-        
-    bar_start_time = current_bar_start[currency]
-    bar_end_time = current_bar_start[currency] + pd.Timedelta(minutes=15)
-    
-    # Get indicators from external source (no endogenous calculation)
-    rsi_value = None
-    macd_value = None
-    signal_value = None
-    try:
-        ind = external_indicators.get(currency, {})
-        rsi_value = ind.get('rsi')
-        macd_value = ind.get('macd_line')
-        signal_value = ind.get('signal_line')
-    except Exception as e:
-        debug_logger.error(f"Error reading external indicators for {currency} DB: {e}")
-    
-    # Format decimal values as requested
-    open_price = round(bar_data["open"], 5)
-    high_price = round(bar_data["high"], 5)
-    low_price = round(bar_data["low"], 5)
-    close_price = round(bar_data["close"], 5)
-    
-    # Only round non-None values
-    if rsi_value is not None:
-        rsi_value = round(rsi_value, 5)
-    if macd_value is not None:
-        macd_value = round(macd_value, 10)
-    if signal_value is not None:
-        signal_value = round(signal_value, 10)
-    
-    # Insert to database
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            return False
-        
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO FXStrat_AlgorithmBars 
-        (Currency, BarStartTime, BarEndTime, OpenPrice, HighPrice, LowPrice, ClosePrice, 
-         ZonesCount, RSI, MACD_Line, Signal_Line, AlgoInstance)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, 
-        currency, 
-        bar_start_time, 
-        bar_end_time,
-        open_price,
-        high_price,
-        low_price,
-        close_price,
-        len(current_valid_zones_dict[currency]) if currency in current_valid_zones_dict else 0,
-        rsi_value,
-        macd_value,
-        signal_value,
-        ALGO_INSTANCE
-        )
-        
-        conn.commit()
-        debug_logger.info(f"Saved {currency} bar to database: {bar_start_time}")
-        return True
-    
-    except Exception as e:
-        debug_logger.error(f"Error saving {currency} bar to database: {e}", exc_info=True)
-        return False
-    
-    finally:
-        if cursor:
-            try:
-                cursor.close()
-            except:
-                pass
-        # DO NOT close the connection when using connection pooling
+
 
 def save_zone_to_database(zone_id, zone_data, currency="EUR.USD"):
     """
@@ -2164,16 +1949,19 @@ def determine_position_from_signal_history(currency):
         
         latest_signal = signals[0]
         
-        # Use SignalIntent to determine current position
+        # Use SignalIntent to determine current position (handles OVERWRITE variants)
         if latest_signal.get('signal_intent'):
             intent = latest_signal['signal_intent']
-            if intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+            # Remove _OVERWRITE suffix for analysis
+            base_intent = intent.replace('_OVERWRITE', '') if intent else ''
+            
+            if base_intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
                 debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: LONG ({intent})")
                 return 'LONG'
-            elif intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+            elif base_intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
                 debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: SHORT ({intent})")
                 return 'SHORT'
-            elif intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+            elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
                 debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: FLAT ({intent})")
                 return 'FLAT'
         
@@ -2199,10 +1987,54 @@ def determine_position_from_signal_history(currency):
         debug_logger.error(f"Error determining position from signal history for {currency}: {e}")
         return 'FLAT'
 
-def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD", signal_intent=None):
+def determine_expected_position_from_intent(signal_intent):
     """
-    Saves a trade signal to the database with robust duplicate prevention and signal intent.
-    Enhanced to prevent duplicate SignalIntent states per currency.
+    Determine what position should be based on SignalIntent.
+    Handles both regular and OVERWRITE variants.
+    
+    Args:
+        signal_intent: The SignalIntent from database
+        
+    Returns:
+        str: 'FLAT', 'LONG', or 'SHORT'
+    """
+    # Remove _OVERWRITE suffix if present for analysis
+    base_intent = signal_intent.replace('_OVERWRITE', '') if signal_intent else ''
+    
+    if base_intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+        return 'LONG'
+    elif base_intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+        return 'SHORT'
+    elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+        return 'FLAT'
+    else:
+        return 'UNKNOWN'
+
+def determine_position_from_external_value(external_position):
+    """
+    Convert external position value to position state.
+    
+    Args:
+        external_position: Position from external system (negative=short, positive=long, 0=flat)
+        
+    Returns:
+        str: 'FLAT', 'LONG', or 'SHORT'
+    """
+    if external_position is None:
+        return 'UNKNOWN'
+    elif external_position == 0:
+        return 'FLAT'
+    elif external_position > 0:
+        return 'LONG'
+    elif external_position < 0:
+        return 'SHORT'
+    else:
+        return 'UNKNOWN'
+
+def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.USD", signal_intent=None, external_position=None):
+    """
+    FIXED DUPLICATE PREVENTION: Prevents duplicate SignalIntent for NEXT TRADE ONLY.
+    Can be overridden if external position indicates previous signal was incorrect.
     
     Args:
         signal_type: 'buy' or 'sell'
@@ -2210,17 +2042,18 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         signal_time: When signal occurred
         currency: Currency pair
         signal_intent: 'OPEN_LONG', 'CLOSE_LONG', 'OPEN_SHORT', 'CLOSE_SHORT', etc.
+        external_position: External position to validate against (for override logic)
     
     Returns:
-        bool: True if signal was saved or duplicate was prevented, False on error
+        bool: True if signal was saved, False on database error only
     """
     if signal_type == 'hold':
         return True
     
-    # Validate required parameters
+    # Save signal even without SignalIntent
     if not signal_intent:
-        debug_logger.error(f"Cannot save {currency} signal without SignalIntent")
-        return False
+        signal_intent = 'UNKNOWN_INTENT'
+        debug_logger.warning(f"Saving {currency} signal with UNKNOWN_INTENT - this needs investigation")
         
     if signal_time is None:
         signal_time = datetime.datetime.now()
@@ -2237,8 +2070,7 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         
         cursor = conn.cursor()
         
-        # ENHANCED DUPLICATE PREVENTION: Check for duplicate SignalIntent per currency
-        # This prevents sending the same intent multiple times (e.g., multiple OPEN_LONG signals)
+        # CORRECT DUPLICATE PREVENTION: Check last signal for this currency only
         cursor.execute("""
         SELECT TOP 1 SignalIntent, SignalTime, Price
         FROM FXStrat_TradeSignalsSent 
@@ -2249,33 +2081,39 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         
         last_signal = cursor.fetchone()
         
-        # Check for duplicate SignalIntent
+        # Check for duplicate SignalIntent for NEXT TRADE only
         if last_signal and last_signal[0] == signal_intent:
-            time_diff = (signal_time - last_signal[1]).total_seconds() if last_signal[1] else 0
-            debug_logger.info(
-                f"Prevented duplicate {currency} SignalIntent: {signal_intent} "
-                f"(last sent {time_diff:.0f}s ago at {last_signal[2]:.5f})"
-            )
-            return True  # Not an error - duplicate prevention worked
+            # Check if external position indicates previous signal was incorrect
+            position_override = False
+            if external_position is not None:
+                # Determine what position should be based on last SignalIntent
+                expected_position = determine_expected_position_from_intent(last_signal[0])
+                actual_position = determine_position_from_external_value(external_position)
+                
+                if expected_position != actual_position:
+                    position_override = True
+                    debug_logger.warning(
+                        f"[POSITION_OVERRIDE] {currency} external position ({actual_position}) "
+                        f"doesn't match expected ({expected_position}) from last SignalIntent ({last_signal[0]}). "
+                        f"Allowing duplicate SignalIntent: {signal_intent}"
+                    )
+            
+            if not position_override:
+                time_diff = (signal_time - last_signal[1]).total_seconds() if last_signal[1] else 0
+                debug_logger.info(
+                    f"Prevented duplicate {currency} SignalIntent: {signal_intent} "
+                    f"(last sent {time_diff:.0f}s ago at {last_signal[2]:.5f}). "
+                    f"Next different SignalIntent will be allowed."
+                )
+                return True  # Block duplicate for next trade only
+            else:
+                # Position override occurred - mark signal as OVERWRITE
+                signal_intent = f"{signal_intent}_OVERWRITE"
+                debug_logger.warning(
+                    f"[POSITION_OVERRIDE] {currency} SignalIntent marked as OVERWRITE: {signal_intent}"
+                )
         
-        # Additional check: Prevent rapid-fire signals within same 15-minute bar
-        cursor.execute("""
-        SELECT COUNT(*) 
-        FROM FXStrat_TradeSignalsSent 
-        WHERE SignalType = ? 
-        AND Currency = ?
-        AND SignalTime BETWEEN DATEADD(minute, -15, ?) AND ?
-        AND AlgoInstance = ?
-        """, 
-        signal_type, currency, signal_time, signal_time, ALGO_INSTANCE)
-        
-        rapid_fire_count = cursor.fetchone()[0]
-        
-        if rapid_fire_count > 0:
-            debug_logger.info(f"Prevented rapid-fire {currency} {signal_type} signal within 15m bar")
-            return True  # Not an error - duplicate prevention worked
-        
-        # Insert the new signal
+        # Insert the signal
         cursor.execute("""
         INSERT INTO FXStrat_TradeSignalsSent 
         (SignalTime, SignalType, Price, Currency, SignalIntent, AlgoInstance)
@@ -2285,15 +2123,15 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
         
         conn.commit()
         
-        # Enhanced logging with more context
+        # Enhanced logging
         debug_logger.warning(
-            f"✓ {currency} {signal_type.upper()} signal saved: {signal_intent} at {price:.5f}"
+            f"✅ {currency} {signal_type.upper()} signal SAVED: {signal_intent} at {price:.5f}"
         )
         
         return True
     
     except Exception as e:
-        debug_logger.error(f"Error saving {currency} signal to database: {e}", exc_info=True)
+        debug_logger.error(f"❌ CRITICAL ERROR saving {currency} signal to database: {e}", exc_info=True)
         if conn:
             try:
                 conn.rollback()
@@ -2307,7 +2145,6 @@ def save_signal_to_database(signal_type, price, signal_time=None, currency="EUR.
                 cursor.close()
             except:
                 pass
-        # DO NOT close the connection when using connection pooling
 
 # --------------------------------------------------------------------------
 # SQL DATA STORAGE FUNCTIONS
@@ -2460,100 +2297,7 @@ def sync_zones_to_database(currency="EUR.USD"):
                 pass
         # DO NOT close the connection when using connection pooling
 
-def store_bar_in_sql(bar_data):
-    """
-    Stores a single bar's data in the SQL database.
-    
-    Args:
-        bar_data (dict): Dictionary containing bar details
-            
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if not bar_data or not isinstance(bar_data, dict):
-        debug_logger.error("Invalid bar data provided to store_bar_in_sql")
-        return False
-    
-    # Extract required fields
-    required_fields = ['currency', 'bar_start_time', 'bar_end_time', 
-                       'open_price', 'high_price', 'low_price', 'close_price']
-    
-    for field in required_fields:
-        if field not in bar_data:
-            debug_logger.error(f"Missing required field '{field}' in bar_data")
-            return False
-    
-    # Get optional indicator values from external source
-    ind = external_indicators.get(bar_data.get('currency', 'EUR.USD'), {})
-    rsi_value = ind.get('rsi')
-    macd_value = ind.get('macd_line')
-    signal_value = ind.get('signal_line')
-    zones_count = bar_data.get('zones_count', 0)
-    
-    # Format decimal values as requested: prices and RSI to 5 decimals, MACD to 10
-    open_price = round(bar_data['open_price'], 5)
-    high_price = round(bar_data['high_price'], 5)
-    low_price = round(bar_data['low_price'], 5)
-    close_price = round(bar_data['close_price'], 5)
-    
-    # Only round non-None values
-    if rsi_value is not None:
-        rsi_value = round(rsi_value, 5)
-    if macd_value is not None:
-        macd_value = round(macd_value, 10)
-    if signal_value is not None:
-        signal_value = round(signal_value, 10)
-    
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        if conn is None:
-            return False
-        
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO FXStrat_AlgorithmBars 
-        (Currency, BarStartTime, BarEndTime, OpenPrice, HighPrice, LowPrice, ClosePrice, 
-         ZonesCount, RSI, MACD_Line, Signal_Line, AlgoInstance)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, 
-        bar_data['currency'], 
-        bar_data['bar_start_time'], 
-        bar_data['bar_end_time'],
-        open_price,  # Using rounded values
-        high_price, 
-        low_price, 
-        close_price,
-        zones_count,
-        rsi_value,
-        macd_value,
-        signal_value,
-        ALGO_INSTANCE
-        )
-        
-        conn.commit()
-        debug_logger.info(f"Successfully stored {bar_data['currency']} bar from {bar_data['bar_start_time']} in SQL database")
-        return True
-    
-    except Exception as e:
-        debug_logger.error(f"Error storing bar data in SQL: {e}", exc_info=True)
-        if conn:
-            try:
-                conn.rollback()
-            except:
-                pass
-        return False
-    
-    finally:
-        if cursor:
-            try:
-                cursor.close()
-            except:
-                pass
-        # DO NOT close the connection when using connection pooling
-        # The connection is managed by get_db_connection()
-        # Removing the connection close to fix the issue
+
 
 def store_zones_in_sql(zones_data):
     """
@@ -2668,73 +2412,7 @@ def store_zones_in_sql(zones_data):
                 pass
         # DO NOT close the connection when using connection pooling
 
-# --------------------------------------------------------------------------
-# ATR CALCULATION - OPTIMIZATION
-# --------------------------------------------------------------------------
-def calculate_atr_pips_required(data, currency="EUR.USD", use_cache=True):
-    """
-    Calculate the ATR-based pips required using a 4-day window.
-    Returns a value between 0.002 (20 pips) and 0.018 (180 pips).
-    Uses caching to avoid redundant calculations.
-    """
-    # Use cached value if available and requested
-    if use_cache and hasattr(calculate_atr_pips_required, "_cache"):
-        cache = calculate_atr_pips_required._cache
-        if currency in cache and cache[currency]["timestamp"] >= data.index[-1] - pd.Timedelta(minutes=30):
-            return cache[currency]["value"]
-    
-    try:
-        # Calculate True Range
-        data = data.copy()
-        
-        # Ensure data is numeric
-        data['high'] = pd.to_numeric(data['high'])
-        data['low'] = pd.to_numeric(data['low'])
-        data['close'] = pd.to_numeric(data['close'])
-        
-        data['prev_close'] = data['close'].shift(1)
-        
-        # True Range calculation
-        data['tr1'] = abs(data['high'] - data['low'])
-        data['tr2'] = abs(data['high'] - data['prev_close'])
-        data['tr3'] = abs(data['low'] - data['prev_close'])
-        
-        data['true_range'] = data[['tr1', 'tr2', 'tr3']].max(axis=1)
-        
-        # Check if we have enough data for ATR
-        non_nan_count = data['true_range'].notna().sum()
-        if non_nan_count < 14:  # Need at least 14 values for meaningful ATR
-            debug_logger.warning(f"Not enough data for ATR calculation ({non_nan_count} values), using default 30 pips")
-            return 0.003  # Default 30 pips
-            
-        # Calculate ATR with appropriate window size
-        window_size = min(96, max(14, non_nan_count // 2))  # Adjust window based on available data
-        atr = data['true_range'].rolling(window=window_size).mean().iloc[-1]
-        
-        if pd.isna(atr):
-            debug_logger.warning(f"ATR calculation resulted in NaN, using default 30 pips")
-            return 0.003  # Default value if ATR is NaN
-        
-        # Convert ATR to pips required (bounded between 20 and 180 pips)
-        pips_required = min(max(atr, 0.002), 0.018)  # 0.002 = 20 pips, 0.018 = 180 pips
-        
-        # Log less frequently
-        debug_logger.info(f"ATR value: {atr:.6f}, Pips required: {pips_required*10000:.1f} pips")
-        
-        # Cache the result
-        if not hasattr(calculate_atr_pips_required, "_cache"):
-            calculate_atr_pips_required._cache = {}
-        
-        calculate_atr_pips_required._cache[currency] = {
-            "value": pips_required,
-            "timestamp": data.index[-1]
-        }
-        
-        return pips_required
-        
-    except Exception as e:
-        debug_logger.error(f"Error in ATR calculation: {e}", exc_info=True)
-        return 0.003  # Default to 30 pips on error
+
 
 # --------------------------------------------------------------------------
 # MAIN TICK HANDLER
@@ -2752,7 +2430,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
     Returns:
         tuple: (signal, currency) where signal is 'buy', 'sell', or 'hold'
     """
-    global historical_ticks, bars, current_valid_zones_dict
+    global historical_ticks, current_valid_zones_dict
     global trades, last_trade_time, balance
     global last_non_hold_signal
 
@@ -2794,7 +2472,6 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # Initialize if not already present - combine into one block for efficiency
         if currency not in historical_ticks:
             historical_ticks[currency] = pd.DataFrame()
-            bars[currency] = pd.DataFrame(columns=["open", "high", "low", "close"])
             current_valid_zones_dict[currency] = {}
             trades[currency] = []
             last_trade_time[currency] = None
@@ -2835,17 +2512,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         cutoff_time = latest_time - pd.Timedelta(hours=12)
         historical_ticks[currency] = historical_ticks[currency][historical_ticks[currency].index >= cutoff_time]
 
-        # 4) Update bars and check if a bar was finalized
-        finalized_bar_data = update_bars_with_tick(tick_time, tick_price, currency)
-        
-        # If a bar was finalized, store it and sync zones to database
-        if finalized_bar_data:
-            # Store the finalized bar in SQL
-            store_bar_in_sql(finalized_bar_data)
-            
-        # Zones are external; no DB sync required. Log status if we have zones.
-            if current_valid_zones_dict[currency]:
-                log_zone_status("After Bar Completion", currency, force_detailed=False)
+
 
         # 5) Manage existing trades (stop loss/take profit checks)
         closed_any_trade = manage_trades(tick_price, tick_time, currency)
@@ -2857,50 +2524,20 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # 6) Re-validate after managing trades but with less logging
         validate_trade_state(tick_time, tick_price, currency)
 
-        # 7) Check if we have enough bar data
-        if bars[currency].empty:
-            return ('hold', currency)
-
-        rolling_window_data = bars[currency].tail(384).copy()
-        if len(rolling_window_data) < 35:
-            return ('hold', currency)
-
-        rolling_window_data['close'] = rolling_window_data['close'].where(
-            rolling_window_data['close'].notnull(), np.nan
-        )
-
-        # 8) Indicators are sourced externally; attach latest values for downstream consumers
-        # Use the latest external indicators for this currency, if available
-        latest_ind = external_indicators.get(currency, {})
-        rolling_window_data['RSI'] = np.nan
-        rolling_window_data['MACD_Line'] = np.nan
-        rolling_window_data['Signal_Line'] = np.nan
-        if latest_ind and latest_ind.get('rsi') is not None:
-            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('RSI')] = latest_ind['rsi']
-        if latest_ind and latest_ind.get('macd_line') is not None:
-            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('MACD_Line')] = latest_ind['macd_line']
-        if latest_ind and latest_ind.get('signal_line') is not None:
-            rolling_window_data.iloc[-1, rolling_window_data.columns.get_loc('Signal_Line')] = latest_ind['signal_line']
-
-        # 9) Zones are sourced externally, so skip endogenous detection. Keep invalidation only.
+        # 7) Zones are sourced externally, no bar data dependency needed
         # current_valid_zones_dict[currency] is populated by the external fetcher.
-
-        # Support/Resistance lines were previously derived from endogenous zones.
-        # With external zones, we skip adding those columns to the rolling data.
-        latest_bar_idx = rolling_window_data.index[-1]
-        i = rolling_window_data.index.get_loc(latest_bar_idx)
 
         # 10) Remove consecutive losers, invalidate zones
         current_valid_zones_dict[currency] = remove_consecutive_losers(trades[currency], current_valid_zones_dict[currency], currency)
         current_valid_zones_dict[currency] = invalidate_zones_via_sup_and_resist(tick_price, current_valid_zones_dict[currency], currency)
 
-        # 11) Attempt to open a new trade if none is open
+        # 8) Attempt to open a new trade if none is open
         trades_before = len(trades[currency])
         open_trades = [t for t in trades[currency] if t['status'] == 'open']
         if not open_trades:
-            # IMPORTANT FIX: Pass the actual zones directly, don't re-wrap them in a currency dictionary
+            # Pass tick data directly to entry conditions
             updated_zones = check_entry_conditions(
-                rolling_window_data, i, current_valid_zones_dict[currency], currency
+                tick_time, tick_price, current_valid_zones_dict[currency], currency
             )
             if updated_zones is not None:
                 current_valid_zones_dict[currency] = updated_zones
@@ -2919,7 +2556,15 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # -----------------------------------------------------------------
         # 13) Determine final signal: buy, sell, or 'hold' (NO MORE CLOSE SIGNALS)
         # -----------------------------------------------------------------
-        if closed_any_trade:
+        # CRITICAL FIX: Check if signal was already set by check_entry_conditions
+        # Store the signal state from before this tick processing
+        signal_before_tick = last_signals.get(currency, 'hold')
+        
+        # If a new trade was opened, the signal was already set in check_entry_conditions
+        if new_trade_opened:
+            raw_signal = signal_before_tick  # Use the signal set by check_entry_conditions
+            debug_logger.info(f"[SIGNAL] {currency} using signal set by trade opening: {raw_signal}")
+        elif closed_any_trade:
             # Find the just-closed trade's direction and send opposite signal
             last_closed_trade = get_last_closed_trade(currency)
             if last_closed_trade and last_closed_trade['direction'] == 'long':
@@ -3034,32 +2679,23 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 # Determine signal intent
                 signal_intent = determine_signal_intent(raw_signal, position_before, position_after)
                 
-                # VALIDATION: Check for invalid signal intent
+                # CRITICAL FIX: ALWAYS save signal regardless of validation
+                # This ensures perfect alignment between TWS and database
+                
+                # Log validation issues but don't block saving
                 if signal_intent == 'UNKNOWN':
                     debug_logger.error(
                         f"[SIGNAL_INTENT] Invalid signal transition for {currency}: "
-                        f"{raw_signal} from {position_before} to {position_after}"
+                        f"{raw_signal} from {position_before} to {position_after} - SAVING ANYWAY"
                     )
-                    # Don't save invalid signal intent
-                    pass
+                
+                # SAVE ALL NON-HOLD SIGNALS TO DATABASE - NO EXCEPTIONS
+                success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent, external_position)
+                
+                if not success:
+                    debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
                 else:
-                    # ENHANCED: Check against last SignalIntent to prevent duplicates
-                    last_intent_info = get_last_signal_intent_from_db(currency)
-                    if last_intent_info and last_intent_info['signal_intent'] == signal_intent:
-                        debug_logger.info(
-                            f"[SIGNAL_INTENT] Prevented duplicate {currency} SignalIntent: {signal_intent} "
-                            f"(last sent at {last_intent_info['signal_time']})"
-                        )
-                        # Don't save duplicate signal intent
-                        pass
-                    else:
-                        # SAVE NON-HOLD SIGNAL TO DATABASE WITH VALIDATED SIGNAL INTENT
-                        success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent)
-                        
-                        if not success:
-                            debug_logger.error(f"[SIGNAL_SAVE] Failed to save {currency} signal: {signal_intent}")
-                        else:
-                            debug_logger.info(f"[SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
+                    debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
 
                 # Enhanced signal logging - but less verbose
                 debug_logger.warning(
@@ -3280,84 +2916,7 @@ def load_recent_zones_from_database(limit=10):
                 pass
         # DO NOT close the connection when using connection pooling
 
-def load_recent_bars_with_indicators_from_database(limit=100):
-    """
-    Load recent bars with pre-calculated indicators from database.
-    This is used for smart restart to quickly populate bars with calculated indicators.
-    """
-    global bars_data_with_indicators
-    
-    try:
-        conn = get_db_connection()
-        if not conn:
-            debug_logger.error("Could not connect to database to load recent bars")
-            return 0
-        
-        cursor = conn.cursor()
-        total_loaded = 0
-        
-        for currency in SUPPORTED_CURRENCIES:
-            try:
-                # Query to get recent bars with indicators
-                cursor.execute("""
-                SELECT TOP (?) 
-                    BarStartTime, [Open], High, Low, [Close], Volume,
-                    SMA_20, EMA_12, EMA_26, MACD_Line, MACD_Signal, MACD_Histogram,
-                    RSI_14, BollingerUpper, BollingerLower, ATR_14
-                FROM FXStrat_AlgorithmBars
-                WHERE Currency = ?
-                AND AlgoInstance = ?
-                ORDER BY BarStartTime DESC
-                """, limit, currency, ALGO_INSTANCE)
-                
-                bars_data = cursor.fetchall()
-                
-                if bars_data:
-                    # Convert to DataFrame
-                    df_data = []
-                    for row in bars_data:
-                        df_data.append({
-                            'Time': row[0],
-                            'Open': float(row[1]),
-                            'High': float(row[2]),
-                            'Low': float(row[3]),
-                            'Close': float(row[4]),
-                            'Volume': int(row[5]) if row[5] else 0,
-                            'SMA_20': float(row[6]) if row[6] else None,
-                            'EMA_12': float(row[7]) if row[7] else None,
-                            'EMA_26': float(row[8]) if row[8] else None,
-                            'MACD_Line': float(row[9]) if row[9] else None,
-                            'MACD_Signal': float(row[10]) if row[10] else None,
-                            'MACD_Histogram': float(row[11]) if row[11] else None,
-                            'RSI_14': float(row[12]) if row[12] else None,
-                            'BollingerUpper': float(row[13]) if row[13] else None,
-                            'BollingerLower': float(row[14]) if row[14] else None,
-                            'ATR_14': float(row[15]) if row[15] else None
-                        })
-                    
-                    # Create DataFrame and reverse order (oldest first)
-                    df = pd.DataFrame(df_data)
-                    df = df.iloc[::-1].reset_index(drop=True)
-                    df['Time'] = pd.to_datetime(df['Time'])
-                    df.set_index('Time', inplace=True)
-                    
-                    # Store in global variable
-                    bars_data_with_indicators[currency] = df
-                    total_loaded += len(df)
-                    
-                    debug_logger.info(f"Loaded {len(df)} bars with indicators for {currency}")
-                    
-            except Exception as e:
-                debug_logger.error(f"Error loading bars for {currency}: {e}")
-                continue
-        
-        conn.close()
-        debug_logger.info(f"Successfully loaded {total_loaded} total bars with indicators from database")
-        return total_loaded
-        
-    except Exception as e:
-        debug_logger.error(f"Error in load_recent_bars_with_indicators_from_database: {e}")
-        return 0
+
 
 def save_algorithm_signal_state():
     """Save current signal state to disk for restoration after restart"""
@@ -3422,12 +2981,14 @@ def load_algorithm_signal_state():
                     intent = last_intent_info['signal_intent']
                     signal_time = last_intent_info['signal_time']
                     
-                    # Determine expected signal state from SignalIntent
-                    if intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
+                    # Determine expected signal state from SignalIntent (handles OVERWRITE variants)
+                    base_intent = intent.replace('_OVERWRITE', '') if intent else ''
+                    
+                    if base_intent in ['OPEN_LONG', 'CLOSE_SHORT_OPEN_LONG']:
                         expected_signal = 'buy'  # Should be in long position
-                    elif intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
+                    elif base_intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
                         expected_signal = 'sell'  # Should be in short position
-                    elif intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+                    elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
                         expected_signal = 'hold'  # Should be flat
                     else:
                         expected_signal = 'hold'  # Default for unknown intents
