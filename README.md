@@ -1,4 +1,4 @@
-# Diego FX Momentum Trading Algorithm
+# Liquidity Hunter Momentum Trading Algorithm
 
 A sophisticated algorithmic trading system for forex markets, designed for **external app integration**. The system provides pure signal generation based on liquidity zones, technical indicators, and momentum analysis.
 
