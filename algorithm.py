@@ -25,10 +25,8 @@ STOP_LOSS_PROPORTION = 0.11  # Default stop loss proportion (kept for backward c
 TAKE_PROFIT_PROPORTION = 0.65
 
 # Dynamic Stop Loss Proportions based on zone size (in pips)
-STOP_LOSS_SMALL_ZONE_THRESHOLD = 30  # pips
-STOP_LOSS_MEDIUM_ZONE_THRESHOLD = 40  # pips
-STOP_LOSS_SMALL_ZONE_PROPORTION = 0.20  # 20% for zones < 30 pips
-STOP_LOSS_MEDIUM_ZONE_PROPORTION = 0.15  # 15% for zones 30-40 pips
+STOP_LOSS_LARGE_ZONE_THRESHOLD = 40  # pips
+STOP_LOSS_SMALL_ZONE_PROPORTION = 0.15  # 15% for zones 30-40 pips
 STOP_LOSS_LARGE_ZONE_PROPORTION = 0.11  # 11% for zones > 40 pips
 LIQUIDITY_ZONE_ALERT = 0.002
 DEMAND_ZONE_RSI_TOP = 40
@@ -53,6 +51,10 @@ ALGO_INSTANCE = 1  # Default to 1, will be overridden by server.py
 # Signal state tracking to prevent duplicate signals after restart
 last_signals = {currency: 'hold' for currency in SUPPORTED_CURRENCIES}
 signal_state_file = 'algorithm_signals.json'
+
+# Signal timing buffer - ignore position updates for 15 seconds after sending signal
+last_signal_sent_time = {currency: None for currency in SUPPORTED_CURRENCIES}
+POSITION_BUFFER_SECONDS = 15  # Wait 15 seconds after signal before trusting position updates
 
 # Live trading mode flag - only save signal state when in live mode
 is_live_trading_mode = False
@@ -103,12 +105,10 @@ def get_stop_loss_proportion(zone_size):
     """
     zone_size_pips = zone_size * 10000  # Convert to pips
     
-    if zone_size_pips < STOP_LOSS_SMALL_ZONE_THRESHOLD:
-        return STOP_LOSS_SMALL_ZONE_PROPORTION
-    elif zone_size_pips < STOP_LOSS_MEDIUM_ZONE_THRESHOLD:
-        return STOP_LOSS_MEDIUM_ZONE_PROPORTION
+    if zone_size_pips < STOP_LOSS_LARGE_ZONE_THRESHOLD:
+        return STOP_LOSS_SMALL_ZONE_PROPORTION  # 15% for zones 30-40 pips
     else:
-        return STOP_LOSS_LARGE_ZONE_PROPORTION
+        return STOP_LOSS_LARGE_ZONE_PROPORTION  # 11% for zones > 40 pips
 
 # SQL script to clean duplicate zones - to be run manually
 CLEAN_DUPLICATE_ZONES_SQL = """
@@ -716,11 +716,29 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
     log_trade_state(current_time, "before_manage", currency)
     
     closed_any_trade = False
-    trades_to_process = [t for t in trades[currency] if t['status'] == 'open']
+    trades_to_process = [t for t in trades[currency] if t['status'] in ['open', 'closing']]
     
     for trade in trades_to_process:
+        # Handle different trade statuses
+        if trade.get('status') == 'closing':
+            # This is a force-close operation - check if position was actually closed
+            # For now, assume external app will close it and mark as closed after buffer period
+            time_since_close_signal = (current_time - trade.get('close_signal_sent', current_time)).total_seconds()
+            if time_since_close_signal > POSITION_BUFFER_SECONDS:
+                # Assume position was closed after buffer period
+                trade.update({
+                    'status': 'closed',
+                    'exit_time': current_time,
+                    'exit_price': current_price,
+                    'profit_loss': 0,  # Unknown P&L for force close
+                    'close_reason': 'force_close_completed'
+                })
+                debug_logger.info(f"[FORCE_CLOSE] {currency} marked force-close trade as completed")
+                closed_any_trade = True
+            continue  # Don't apply normal SL/TP logic to closing trades
+            
         # Skip if trade is already closed
-        if trade.get('status') != 'open':
+        elif trade.get('status') != 'open':
             continue
             
         # Track if this specific trade was closed in this iteration
@@ -1783,57 +1801,270 @@ def validate_position_against_signal_intent(currency, position_value):
             'position_value': position_value
         }
 
-def reconcile_position_conflict(currency, validation_result):
+def reconcile_position_conflict(currency, validation_result, current_price, current_zones):
     """
-    Handle position conflicts by updating internal state to match external position.
+    Handle position conflicts with intelligent trade recovery logic.
     
     Args:
         currency: Currency pair
         validation_result: Result from validate_position_against_signal_intent()
+        current_price: Current market price
+        current_zones: Dictionary of current valid zones for this currency
         
     Returns:
-        bool: True if reconciliation was successful
+        dict: {
+            'recovery_action': str,  # 'assume_trade', 'force_close', 'align_state'
+            'recovery_signal': str,  # Signal to send to API for position correction
+            'trade_details': dict    # Trade details if assuming a trade
+        }
     """
     try:
         if not validation_result['conflict_detected']:
-            return True  # No conflict to resolve
+            return {'recovery_action': 'none', 'recovery_signal': 'hold'}
         
+        expected_position = validation_result['expected_position']
         actual_position = validation_result['actual_position']
         position_value = validation_result['position_value']
         
-        # Update internal signal state to match external position
-        global last_signals
-        
-        if actual_position == 'LONG':
-            corrected_signal = 'buy'
-        elif actual_position == 'SHORT':
-            corrected_signal = 'sell'
-        elif actual_position == 'FLAT':
-            corrected_signal = 'hold'
-        else:
-            corrected_signal = 'hold'  # Default for unknown
-        
-        # Update in-memory state
-        old_signal = last_signals.get(currency, 'hold')
-        last_signals[currency] = corrected_signal
-        
-        # Save corrected state to file if in live trading mode
-        if is_live_trading_mode:
-            save_algorithm_signal_state()
-        
         debug_logger.warning(
-            f"[POSITION_RECONCILIATION] {currency} internal state updated:\n"
-            f"  Old signal state: {old_signal}\n"
-            f"  New signal state: {corrected_signal}\n"
-            f"  Based on external position: {actual_position} ({position_value})\n"
-            f"  Reason: External position is authoritative"
+            f"[POSITION_RECOVERY] {currency} conflict detected:\n"
+            f"  Expected: {expected_position}\n"
+            f"  Actual: {actual_position} ({position_value})\n"
+            f"  Current price: {current_price:.5f}"
         )
         
-        return True
+        # Case 1: Expected LONG/FLAT but actually SHORT
+        if actual_position == 'SHORT' and expected_position in ['LONG', 'FLAT']:
+            return handle_unexpected_short_position(currency, current_price, current_zones, validation_result)
+        
+        # Case 2: Expected SHORT/FLAT but actually LONG  
+        elif actual_position == 'LONG' and expected_position in ['SHORT', 'FLAT']:
+            return handle_unexpected_long_position(currency, current_price, current_zones, validation_result)
+        
+        # Case 3: Expected position but actually FLAT (trade didn't execute or was closed)
+        elif actual_position == 'FLAT' and expected_position in ['LONG', 'SHORT']:
+            return handle_unexpected_flat_position(currency, expected_position, validation_result)
+        
+        # Default case - simple alignment
+        else:
+            return align_signal_state(currency, actual_position, validation_result)
         
     except Exception as e:
-        debug_logger.error(f"[POSITION_RECONCILIATION] Error reconciling {currency}: {e}")
-        return False
+        debug_logger.error(f"[POSITION_RECOVERY] Error in {currency} recovery: {e}")
+        return {'recovery_action': 'error', 'recovery_signal': 'hold'}
+
+def handle_unexpected_short_position(currency, current_price, current_zones, validation_result):
+    """Handle case where we expected LONG/FLAT but external system shows SHORT"""
+    
+    # Find nearest supply zone to current price
+    supply_zones = [(zid, zdata) for zid, zdata in current_zones.items() 
+                   if zdata.get('zone_type') == 'supply']
+    
+    if not supply_zones:
+        debug_logger.warning(f"[RECOVERY] {currency} unexpected SHORT but no supply zones available")
+        return {
+            'recovery_action': 'force_close',
+            'recovery_signal': 'buy',
+            'reason': 'No supply zones to reference'
+        }
+    
+    # Find closest supply zone to current price
+    closest_zone = None
+    min_distance = float('inf')
+    
+    for zone_id, zone_data in supply_zones:
+        zone_start = zone_data['start_price']
+        distance = abs(current_price - zone_start)
+        if distance < min_distance:
+            min_distance = distance
+            closest_zone = (zone_id, zone_data)
+    
+    if closest_zone:
+        zone_id, zone_data = closest_zone
+        zone_start = zone_data['start_price']
+        zone_end = zone_data['end_price']
+        zone_size = zone_data['zone_size']
+        
+        # Check if we're within tight proximity of supply zone start
+        # Inside zone: 0.3x zone size from start, Outside zone: 0.2x zone size from start
+        if zone_start >= zone_end:  # Supply zone: start > end (descending)
+            inside_zone = zone_end <= current_price <= zone_start
+        else:  # Supply zone: start < end (ascending)
+            inside_zone = zone_start <= current_price <= zone_end
+        
+        max_distance_inside = zone_size * 0.3   # 30% of zone size inside
+        max_distance_outside = zone_size * 0.2  # 20% of zone size outside
+        max_allowed_distance = max_distance_inside if inside_zone else max_distance_outside
+        
+        debug_logger.info(
+            f"[RECOVERY] {currency} supply zone proximity check:\n"
+            f"  Zone: {zone_start:.5f}-{zone_end:.5f} (size: {zone_size*10000:.1f} pips)\n"
+            f"  Current: {current_price:.5f}\n"
+            f"  Inside zone: {inside_zone}\n"
+            f"  Distance: {min_distance*10000:.1f} pips\n"
+            f"  Max allowed: {max_allowed_distance*10000:.1f} pips ({'inside' if inside_zone else 'outside'} zone)"
+        )
+        
+        if min_distance <= max_allowed_distance:
+            # Assume we entered a short trade from this supply zone
+            stop_loss_proportion = get_stop_loss_proportion(zone_size)
+            entry_price = zone_start  # Assume entry at zone start
+            stop_loss = entry_price + (stop_loss_proportion * zone_size)
+            take_profit = entry_price - (TAKE_PROFIT_PROPORTION * zone_size)
+            
+            debug_logger.warning(
+                f"[RECOVERY] {currency} assuming SHORT trade from supply zone:\n"
+                f"  Zone: {zone_start:.5f}-{zone_data['end_price']:.5f}\n"
+                f"  Entry: {entry_price:.5f}\n"
+                f"  Current: {current_price:.5f}\n"
+                f"  SL: {stop_loss:.5f}, TP: {take_profit:.5f}\n"
+                f"  Distance from zone: {min_distance*10000:.1f} pips"
+            )
+            
+            return {
+                'recovery_action': 'assume_trade',
+                'recovery_signal': 'sell',  # Confirm the short position
+                'trade_details': {
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'zone_id': zone_id,
+                    'zone_data': zone_data,
+                    'direction': 'short'
+                }
+            }
+        else:
+            debug_logger.warning(
+                f"[RECOVERY] {currency} SHORT position too far from supply zones:\n"
+                f"  Distance: {min_distance*10000:.1f} pips\n"
+                f"  Max allowed: {max_allowed_distance*10000:.1f} pips ({'inside' if inside_zone else 'outside'} zone)"
+            )
+            return {
+                'recovery_action': 'force_close',
+                'recovery_signal': 'buy',
+                'reason': 'Too far from supply zones'
+            }
+
+def handle_unexpected_long_position(currency, current_price, current_zones, validation_result):
+    """Handle case where we expected SHORT/FLAT but external system shows LONG"""
+    
+    # Find nearest demand zone to current price
+    demand_zones = [(zid, zdata) for zid, zdata in current_zones.items() 
+                   if zdata.get('zone_type') == 'demand']
+    
+    if not demand_zones:
+        debug_logger.warning(f"[RECOVERY] {currency} unexpected LONG but no demand zones available")
+        return {
+            'recovery_action': 'force_close',
+            'recovery_signal': 'sell',
+            'reason': 'No demand zones to reference'
+        }
+    
+    # Find closest demand zone to current price
+    closest_zone = None
+    min_distance = float('inf')
+    
+    for zone_id, zone_data in demand_zones:
+        zone_start = zone_data['start_price']
+        distance = abs(current_price - zone_start)
+        if distance < min_distance:
+            min_distance = distance
+            closest_zone = (zone_id, zone_data)
+    
+    if closest_zone:
+        zone_id, zone_data = closest_zone
+        zone_start = zone_data['start_price']
+        zone_end = zone_data['end_price']
+        zone_size = zone_data['zone_size']
+        
+        # Check if we're within tight proximity of demand zone start
+        # Inside zone: 0.3x zone size from start, Outside zone: 0.2x zone size from start
+        if zone_start <= zone_end:  # Demand zone: start < end (ascending)
+            inside_zone = zone_start <= current_price <= zone_end
+        else:  # Demand zone: start > end (descending)
+            inside_zone = zone_end <= current_price <= zone_start
+        
+        max_distance_inside = zone_size * 0.3   # 30% of zone size inside
+        max_distance_outside = zone_size * 0.2  # 20% of zone size outside
+        max_allowed_distance = max_distance_inside if inside_zone else max_distance_outside
+        
+        debug_logger.info(
+            f"[RECOVERY] {currency} demand zone proximity check:\n"
+            f"  Zone: {zone_start:.5f}-{zone_end:.5f} (size: {zone_size*10000:.1f} pips)\n"
+            f"  Current: {current_price:.5f}\n"
+            f"  Inside zone: {inside_zone}\n"
+            f"  Distance: {min_distance*10000:.1f} pips\n"
+            f"  Max allowed: {max_allowed_distance*10000:.1f} pips ({'inside' if inside_zone else 'outside'} zone)"
+        )
+        
+        if min_distance <= max_allowed_distance:
+            # Assume we entered a long trade from this demand zone
+            stop_loss_proportion = get_stop_loss_proportion(zone_size)
+            entry_price = zone_start  # Assume entry at zone start
+            stop_loss = entry_price - (stop_loss_proportion * zone_size)
+            take_profit = entry_price + (TAKE_PROFIT_PROPORTION * zone_size)
+            
+            debug_logger.warning(
+                f"[RECOVERY] {currency} assuming LONG trade from demand zone:\n"
+                f"  Zone: {zone_start:.5f}-{zone_data['end_price']:.5f}\n"
+                f"  Entry: {entry_price:.5f}\n"
+                f"  Current: {current_price:.5f}\n"
+                f"  SL: {stop_loss:.5f}, TP: {take_profit:.5f}\n"
+                f"  Distance from zone: {min_distance*10000:.1f} pips"
+            )
+            
+            return {
+                'recovery_action': 'assume_trade',
+                'recovery_signal': 'buy',  # Confirm the long position
+                'trade_details': {
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'zone_id': zone_id,
+                    'zone_data': zone_data,
+                    'direction': 'long'
+                }
+            }
+        else:
+            debug_logger.warning(
+                f"[RECOVERY] {currency} LONG position too far from demand zones:\n"
+                f"  Distance: {min_distance*10000:.1f} pips\n"
+                f"  Max allowed: {max_allowed_distance*10000:.1f} pips ({'inside' if inside_zone else 'outside'} zone)"
+            )
+            return {
+                'recovery_action': 'force_close',
+                'recovery_signal': 'sell',
+                'reason': 'Too far from demand zones'
+            }
+
+def handle_unexpected_flat_position(currency, expected_position, validation_result):
+    """Handle case where we expected LONG/SHORT but external system shows FLAT"""
+    debug_logger.warning(
+        f"[RECOVERY] {currency} expected {expected_position} but position is FLAT\n"
+        f"  Likely: Trade didn't execute or was closed externally\n"
+        f"  Action: Reset to flat state and look for new opportunities"
+    )
+    
+    return {
+        'recovery_action': 'align_state',
+        'recovery_signal': 'hold',
+        'reason': 'Position was closed or never opened'
+    }
+
+def align_signal_state(currency, actual_position, validation_result):
+    """Simple state alignment for other cases"""
+    if actual_position == 'LONG':
+        signal = 'buy'
+    elif actual_position == 'SHORT':
+        signal = 'sell'
+    else:
+        signal = 'hold'
+    
+    return {
+        'recovery_action': 'align_state',
+        'recovery_signal': signal,
+        'reason': 'Simple state alignment'
+    }
 
 def get_last_signal_intent_from_db(currency):
     """
@@ -2444,28 +2675,45 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             else:
                 debug_logger.warning(f"Unsupported currency in data: {extracted_currency}. Using {currency} instead.")
         
-        # POSITION VALIDATION: Validate external position against our SignalIntent records
+        # POSITION VALIDATION: Check buffer period and validate external position
         position_validation_result = None
+        recovery_result = None
+        
         if external_position is not None:
-            position_validation_result = validate_position_against_signal_intent(currency, external_position)
+            # Check if we're still in buffer period after sending a signal
+            current_time_obj = datetime.datetime.now()
+            last_sent = last_signal_sent_time.get(currency)
             
-            # Handle position conflicts
-            if position_validation_result['conflict_detected']:
-                debug_logger.warning(
-                    f"[POSITION_CONFLICT] {currency} position conflict detected - "
-                    f"Expected: {position_validation_result['expected_position']}, "
-                    f"External: {position_validation_result['actual_position']} ({external_position})"
+            if last_sent and (current_time_obj - last_sent).total_seconds() < POSITION_BUFFER_SECONDS:
+                remaining_buffer = POSITION_BUFFER_SECONDS - (current_time_obj - last_sent).total_seconds()
+                debug_logger.info(
+                    f"[POSITION_BUFFER] {currency} ignoring position update - "
+                    f"still in {remaining_buffer:.1f}s buffer period after signal"
                 )
-                
-                # Reconcile the conflict (external position is authoritative)
-                reconciliation_success = reconcile_position_conflict(currency, position_validation_result)
-                
-                if reconciliation_success:
-                    debug_logger.info(f"[POSITION_CONFLICT] {currency} conflict resolved successfully")
-                else:
-                    debug_logger.error(f"[POSITION_CONFLICT] {currency} conflict resolution failed")
             else:
-                debug_logger.debug(f"[POSITION_VALIDATION] {currency} position validated: {external_position}")
+                # Outside buffer period - validate position
+                position_validation_result = validate_position_against_signal_intent(currency, external_position)
+                
+                # Handle position conflicts with intelligent recovery
+                if position_validation_result['conflict_detected']:
+                    debug_logger.warning(
+                        f"[POSITION_CONFLICT] {currency} position conflict detected - "
+                        f"Expected: {position_validation_result['expected_position']}, "
+                        f"External: {position_validation_result['actual_position']} ({external_position})"
+                    )
+                    
+                    # Use intelligent recovery system
+                    recovery_result = reconcile_position_conflict(
+                        currency, 
+                        position_validation_result, 
+                        tick_price, 
+                        current_valid_zones_dict.get(currency, {})
+                    )
+                    
+                    debug_logger.warning(f"[RECOVERY] {currency} recovery action: {recovery_result.get('recovery_action')}")
+                    
+                else:
+                    debug_logger.debug(f"[POSITION_VALIDATION] {currency} position validated: {external_position}")
         else:
             debug_logger.debug(f"[POSITION_VALIDATION] {currency} no external position provided")
         
@@ -2556,38 +2804,147 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # -----------------------------------------------------------------
         # 13) Determine final signal: buy, sell, or 'hold' (NO MORE CLOSE SIGNALS)
         # -----------------------------------------------------------------
-        # CRITICAL FIX: Check if signal was already set by check_entry_conditions
-        # Store the signal state from before this tick processing
-        signal_before_tick = last_signals.get(currency, 'hold')
         
-        # If a new trade was opened, the signal was already set in check_entry_conditions
-        if new_trade_opened:
-            raw_signal = signal_before_tick  # Use the signal set by check_entry_conditions
-            debug_logger.info(f"[SIGNAL] {currency} using signal set by trade opening: {raw_signal}")
-        elif closed_any_trade:
-            # Find the just-closed trade's direction and send opposite signal
-            last_closed_trade = get_last_closed_trade(currency)
-            if last_closed_trade and last_closed_trade['direction'] == 'long':
-                raw_signal = 'sell'  # Close long position with sell signal
-                debug_logger.info(f"[SIGNAL] {currency} long trade closed, sending sell signal")
-            elif last_closed_trade and last_closed_trade['direction'] == 'short':
-                raw_signal = 'buy'   # Close short position with buy signal
-                debug_logger.info(f"[SIGNAL] {currency} short trade closed, sending buy signal")
-            else:
-                # Fallback if we can't determine the closed trade direction
-                # This could indicate a restart scenario where trade history was lost
-                debug_logger.error(f"[SIGNAL] CRITICAL: {currency} trade closed but direction unknown!")
-                debug_logger.error(f"[SIGNAL] This may indicate trade state was lost during restart")
-                debug_logger.error(f"[SIGNAL] External app may have orphaned position - manual intervention needed")
-                raw_signal = 'hold'
-        elif new_trade_opened:
-            # Figure out direction of the newly opened trade
-            if trades[currency][-1]['direction'] == 'long':
-                raw_signal = 'buy'
-            else:
-                raw_signal = 'sell'
+        # PRIORITY 1: Handle recovery signals from position conflicts
+        if recovery_result and recovery_result.get('recovery_action') != 'none':
+            recovery_action = recovery_result.get('recovery_action', 'unknown')
+            
+            debug_logger.warning(f"[RECOVERY] {currency} recovery action: {recovery_action}")
+            
+            # Handle different recovery actions
+            if recovery_result.get('recovery_action') == 'assume_trade':
+                # Create trade object to track existing external position
+                trade_details = recovery_result.get('trade_details', {})
+                
+                trades[currency].append({
+                    'entry_time': tick_time,
+                    'entry_price': trade_details['entry_price'],
+                    'stop_loss': trade_details['stop_loss'],
+                    'take_profit': trade_details['take_profit'],
+                    'position_size': 1.0,  # Default size for recovery trades
+                    'status': 'open',
+                    'direction': trade_details['direction'],
+                    'zone_start_price': trade_details['zone_data']['start_price'],
+                    'zone_end_price': trade_details['zone_data']['end_price'],
+                    'zone_length': trade_details['zone_data'].get('zone_size', 0),
+                    'currency': currency,
+                    'recovery_trade': True  # Mark as recovery trade
+                })
+                
+                debug_logger.warning(
+                    f"[RECOVERY_TRADE] {currency} created assumed {trade_details['direction']} trade:\n"
+                    f"  Entry: {trade_details['entry_price']:.5f}\n"
+                    f"  SL: {trade_details['stop_loss']:.5f}\n"
+                    f"  TP: {trade_details['take_profit']:.5f}\n"
+                    f"  NO API SIGNAL SENT - position already exists externally"
+                )
+                
+                # CRITICAL: Don't send signal to API - position already exists!
+                raw_signal = 'hold'  # Return hold to avoid duplicate position
+                
+            elif recovery_result.get('recovery_action') == 'force_close':
+                # Send close signal to API AND track the close operation in memory
+                raw_signal = recovery_result.get('recovery_signal', 'hold')
+                expected_pos = position_validation_result['expected_position']
+                actual_pos = position_validation_result['actual_position']
+                
+                # Create temporary trade object to track the close operation
+                # This prevents duplicate close signals and provides audit trail
+                close_direction = 'long' if actual_pos == 'LONG' else 'short'
+                
+                trades[currency].append({
+                    'entry_time': tick_time,
+                    'entry_price': tick_price,  # Current price as proxy
+                    'stop_loss': 0,  # Not applicable for force close
+                    'take_profit': 0,  # Not applicable for force close
+                    'position_size': 1.0,
+                    'status': 'closing',  # Special status for pending close
+                    'direction': close_direction,
+                    'zone_start_price': 0,
+                    'zone_end_price': 0,
+                    'zone_length': 0,
+                    'currency': currency,
+                    'force_close_trade': True,  # Mark as force close operation
+                    'close_signal_sent': tick_time,
+                    'close_reason': 'force_close_unwanted_position'
+                })
+                
+                debug_logger.warning(
+                    f"[RECOVERY_CLOSE] {currency} sending close signal: {raw_signal} to exit unwanted {close_direction} position\n"
+                    f"  Created tracking trade object with status='closing'"
+                )
+                
+            elif recovery_result.get('recovery_action') == 'align_state':
+                # CRITICAL: Update memory state to match external reality
+                expected_pos = position_validation_result['expected_position']
+                actual_pos = position_validation_result['actual_position']
+                
+                if actual_pos == 'FLAT' and expected_pos in ['LONG', 'SHORT']:
+                    # Close any phantom trades in memory to align with flat reality
+                    open_trades = [t for t in trades[currency] if t['status'] == 'open']
+                    for trade in open_trades:
+                        trade.update({
+                            'status': 'closed',
+                            'exit_time': tick_time,
+                            'exit_price': tick_price,
+                            'profit_loss': 0,  # Unknown P&L for phantom trade
+                            'close_reason': 'align_to_flat_reality'
+                        })
+                        debug_logger.warning(
+                            f"[ALIGN_STATE] {currency} closed phantom {trade['direction']} trade - "
+                            f"external system shows FLAT"
+                        )
+                    
+                    # Also remove from DB position tracking
+                    delete_current_position_from_db(currency)
+                
+                # Update signal state to match external reality
+                if actual_pos == 'FLAT':
+                    last_signals[currency] = 'hold'
+                elif actual_pos == 'LONG':
+                    last_signals[currency] = 'buy'
+                elif actual_pos == 'SHORT':
+                    last_signals[currency] = 'sell'
+                
+                debug_logger.warning(
+                    f"[RECOVERY_ALIGN] {currency} memory state aligned to reality: {actual_pos}\n"
+                    f"  Signal state updated to: {last_signals[currency]}"
+                )
+                raw_signal = 'hold'  # Return hold - external position already correct
+        
         else:
-            raw_signal = 'hold'
+            # PRIORITY 2: Normal trading logic
+            # Store the signal state from before this tick processing
+            signal_before_tick = last_signals.get(currency, 'hold')
+            
+            # If a new trade was opened, the signal was already set in check_entry_conditions
+            if new_trade_opened:
+                raw_signal = signal_before_tick  # Use the signal set by check_entry_conditions
+                debug_logger.info(f"[SIGNAL] {currency} using signal set by trade opening: {raw_signal}")
+            elif closed_any_trade:
+                # Find the just-closed trade's direction and send opposite signal
+                last_closed_trade = get_last_closed_trade(currency)
+                if last_closed_trade and last_closed_trade['direction'] == 'long':
+                    raw_signal = 'sell'  # Close long position with sell signal
+                    debug_logger.info(f"[SIGNAL] {currency} long trade closed, sending sell signal")
+                elif last_closed_trade and last_closed_trade['direction'] == 'short':
+                    raw_signal = 'buy'   # Close short position with buy signal
+                    debug_logger.info(f"[SIGNAL] {currency} short trade closed, sending buy signal")
+                else:
+                    # Fallback if we can't determine the closed trade direction
+                    # This could indicate a restart scenario where trade history was lost
+                    debug_logger.error(f"[SIGNAL] CRITICAL: {currency} trade closed but direction unknown!")
+                    debug_logger.error(f"[SIGNAL] This may indicate trade state was lost during restart")
+                    debug_logger.error(f"[SIGNAL] External app may have orphaned position - manual intervention needed")
+                    raw_signal = 'hold'
+            elif new_trade_opened:
+                # Figure out direction of the newly opened trade
+                if trades[currency][-1]['direction'] == 'long':
+                    raw_signal = 'buy'
+                else:
+                    raw_signal = 'sell'
+            else:
+                raw_signal = 'hold'
 
         # 14) Block consecutive signals of the same type
         # This prevents duplicate buy/buy or sell/sell signals
@@ -2690,7 +3047,18 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                     )
                 
                 # SAVE ALL NON-HOLD SIGNALS TO DATABASE - NO EXCEPTIONS
-                success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent, external_position)
+                # NOTE: Recovery signals are NOT saved to DB - natural convergence only
+                if recovery_result and recovery_result.get('recovery_action') != 'none':
+                    # Recovery signal - don't save to DB, just send to API for position correction
+                    debug_logger.info(f"[NATURAL_CONVERGENCE] {currency} recovery signal NOT saved to DB - natural convergence will occur on next legitimate trade")
+                    success = True  # Mark as successful for buffer logic
+                else:
+                    # Normal trading signal - save to DB as usual
+                    success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent, external_position)
+                
+                # Record signal timestamp for buffer logic
+                if success:
+                    last_signal_sent_time[currency] = datetime.datetime.now()
                 
                 if not success:
                     debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
