@@ -25,7 +25,7 @@ STOP_LOSS_PROPORTION = 0.11  # Default stop loss proportion (kept for backward c
 TAKE_PROFIT_PROPORTION = 0.65
 
 # Dynamic Stop Loss Proportions based on zone size (in pips)
-STOP_LOSS_LARGE_ZONE_THRESHOLD = 40  # pips
+STOP_LOSS_LARGE_ZONE_THRESHOLD = 40  # this doesnt mean a max of 40 pip loss, it means any zone larger than this has a different sl
 STOP_LOSS_SMALL_ZONE_PROPORTION = 0.15  # 15% for zones 30-40 pips
 STOP_LOSS_LARGE_ZONE_PROPORTION = 0.11  # 11% for zones > 40 pips
 LIQUIDITY_ZONE_ALERT = 0.002
@@ -2919,7 +2919,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             
             # If a new trade was opened, the signal was already set in check_entry_conditions
             if new_trade_opened:
-                raw_signal = signal_before_tick  # Use the signal set by check_entry_conditions
+                raw_signal = last_signals[currency]  # Use the NEW signal set by check_entry_conditions
                 debug_logger.info(f"[SIGNAL] {currency} using signal set by trade opening: {raw_signal}")
             elif closed_any_trade:
                 # Find the just-closed trade's direction and send opposite signal
