@@ -2672,7 +2672,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             debug_logger.warning(f"[MISSING_DATA] {currency} indicators are missing - returning StaleData signal")
             return ('StaleData', currency)
         
-        # POSITION VALIDATION: Check buffer period and validate external position
+        # POSITION VALIDATION: Check buffer period (detailed processing after price extraction)
         position_validation_result = None
         recovery_result = None
         
@@ -2688,29 +2688,8 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                     f"still in {remaining_buffer:.1f}s buffer period after signal"
                 )
             else:
-                # Outside buffer period - validate position
+                # Outside buffer period - validate position (detailed processing after price extraction)
                 position_validation_result = validate_position_against_signal_intent(currency, external_position)
-                
-                # Handle position conflicts with intelligent recovery
-                if position_validation_result['conflict_detected']:
-                    debug_logger.warning(
-                        f"[POSITION_CONFLICT] {currency} position conflict detected - "
-                        f"Expected: {position_validation_result['expected_position']}, "
-                        f"External: {position_validation_result['actual_position']} ({external_position})"
-                    )
-                    
-                    # Use intelligent recovery system
-                    recovery_result = reconcile_position_conflict(
-                        currency, 
-                        position_validation_result, 
-                        tick_price, 
-                        current_valid_zones_dict.get(currency, {})
-                    )
-                    
-                    debug_logger.warning(f"[RECOVERY] {currency} recovery action: {recovery_result.get('recovery_action')}")
-                    
-                else:
-                    debug_logger.debug(f"[POSITION_VALIDATION] {currency} position validated: {external_position}")
         else:
             debug_logger.debug(f"[POSITION_VALIDATION] {currency} no external position provided")
         
@@ -2745,6 +2724,24 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # Extract tick time and price early for use throughout function
         tick_time = new_data_point.index[-1]
         tick_price = float(new_data_point['Price'].iloc[-1])
+        
+        # Handle position conflicts with intelligent recovery (now that tick_price is defined)
+        if position_validation_result and position_validation_result['conflict_detected']:
+            debug_logger.warning(
+                f"[POSITION_CONFLICT] {currency} position conflict detected - "
+                f"Expected: {position_validation_result['expected_position']}, "
+                f"External: {position_validation_result['actual_position']} ({external_position})"
+            )
+            
+            # Use intelligent recovery system
+            recovery_result = reconcile_position_conflict(
+                currency, 
+                position_validation_result, 
+                tick_price, 
+                current_valid_zones_dict.get(currency, {})
+            )
+            
+            debug_logger.warning(f"[RECOVERY] {currency} recovery action: {recovery_result.get('recovery_action')}")
         
         # 2) Validate trade state at the start - but log less verbose
         validate_trade_state(tick_time, tick_price, currency)
