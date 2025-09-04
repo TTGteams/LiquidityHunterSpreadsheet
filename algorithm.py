@@ -32,7 +32,7 @@ LIQUIDITY_ZONE_ALERT = 0.002
 DEMAND_ZONE_RSI_TOP = 40
 SUPPLY_ZONE_RSI_BOTTOM = 60
 INVALIDATE_ZONE_LENGTH = 0.0013
-COOLDOWN_SECONDS = 7200
+COOLDOWN_SECONDS = 3600  # 1 hour cooldown after losses only
 RISK_PROPORTION = 0.03
 MAX_PIP_LOSS = 0.0030  # 30 pips maximum loss
 
@@ -66,6 +66,7 @@ historical_ticks = {currency: pd.DataFrame() for currency in SUPPORTED_CURRENCIE
 # Trading zones and state
 current_valid_zones_dict = {currency: {} for currency in SUPPORTED_CURRENCIES}
 last_trade_time = {currency: None for currency in SUPPORTED_CURRENCIES}
+last_loss_time = {currency: None for currency in SUPPORTED_CURRENCIES}  # Track losses for cooldown
 trades = {currency: [] for currency in SUPPORTED_CURRENCIES}
 balance = {currency: 100000 for currency in SUPPORTED_CURRENCIES}  # Initialize balance per currency
 
@@ -81,7 +82,7 @@ invalidated_zones_memory = {currency: [] for currency in SUPPORTED_CURRENCIES}  
 
 # External data fetching configuration
 EXTERNAL_DATA_FETCH_INTERVAL = 300  # 5 minutes in seconds
-INDICATOR_STALENESS_WARNING = 600  # 10 minutes in seconds
+INDICATOR_STALENESS_WARNING = 1800  # 30 minutes in seconds
 MAX_INVALIDATED_ZONES_MEMORY = 500  # Maximum zones to remember per currency
 external_data_timer = None  # Will hold the timer object
 
@@ -505,7 +506,7 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
         valid_zones_dict: Dictionary of current valid zones
         currency: The currency pair to process
     """
-    global trades, last_trade_time, balance
+    global trades, last_trade_time, last_loss_time, balance
     
     # Add diagnostic logging to track critical values
     debug_logger.warning(f"\n\nENTRY CONDITION CHECK for {currency}:")
@@ -524,6 +525,8 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
         trades[currency] = []
     if currency not in last_trade_time:
         last_trade_time[currency] = None
+    if currency not in last_loss_time:
+        last_loss_time[currency] = None
     if currency not in balance:
         balance[currency] = 100000
         
@@ -541,11 +544,11 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
             if isinstance(zone_data, dict) and 'zone_type' in zone_data:
                 debug_logger.warning(f"    {zone_data['zone_type'].upper()} zone: {zone_id[0]:.5f}-{zone_id[1]:.5f}")
     
-    # Check if we're in cooldown period
-    if last_trade_time[currency] is not None:
-        seconds_since_last_trade = (current_time - last_trade_time[currency]).total_seconds()
-        if seconds_since_last_trade < COOLDOWN_SECONDS:
-            debug_logger.warning(f"  Still in cooldown period ({seconds_since_last_trade:.0f}s / {COOLDOWN_SECONDS}s)")
+    # Check if we're in cooldown period (only after losses)
+    if last_loss_time[currency] is not None:
+        seconds_since_last_loss = (current_time - last_loss_time[currency]).total_seconds()
+        if seconds_since_last_loss < COOLDOWN_SECONDS:
+            debug_logger.warning(f"  Still in loss cooldown period ({seconds_since_last_loss:.0f}s / {COOLDOWN_SECONDS}s)")
             return zones_dict
 
 
@@ -708,7 +711,7 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
     Enhanced version with better state tracking and validation.
     Manages open trades for stop loss and take profit.
     """
-    global trades, balance
+    global trades, balance, last_loss_time
     debug_logger.info(f"Managing trades at {current_time} price {current_price}")
     
     # Validate trade state before processing
@@ -768,6 +771,9 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                     'close_reason': 'max_pip_loss'
                 })
                 
+                # Set cooldown after loss
+                last_loss_time[currency] = current_time
+                
                 # Remove position from database
                 delete_current_position_from_db(currency)
                 
@@ -795,6 +801,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'stop_loss'
                     })
+                    # Set cooldown after loss
+                    last_loss_time[currency] = current_time
                     # Remove position from database
                     delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Long trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
@@ -828,6 +836,8 @@ def manage_trades(current_price, current_time, currency="EUR.USD"):
                         'profit_loss': trade_result,
                         'close_reason': 'stop_loss'
                     })
+                    # Set cooldown after loss
+                    last_loss_time[currency] = current_time
                     # Remove position from database
                     delete_current_position_from_db(currency)
                     trade_logger.info(f"{currency} Short trade hit stop loss at {trade['stop_loss']}. P/L: {trade_result}")
@@ -962,7 +972,8 @@ def fetch_active_zones_from_db():
                 cursor.close()
             except:
                 pass
-        # Don't close connection when using connection pooling
+        if conn:
+            conn.close()
 
 def fetch_latest_indicators_from_db():
     """
@@ -1047,7 +1058,8 @@ def fetch_latest_indicators_from_db():
                 cursor.close()
             except:
                 pass
-        # Don't close connection when using connection pooling
+        if conn:
+            conn.close()
 
 def is_zone_locally_invalidated(currency, zone_start, zone_end, confirmation_time):
     """
@@ -1205,8 +1217,8 @@ def stop_external_data_fetching():
 # Replace existing get_db_connection function with connection pooling version
 def get_db_connection():
     """
-    Creates and returns a connection to the SQL Server database using the DB_CONFIG.
-    Uses connection pooling to avoid excessive connection overhead.
+    Creates and returns a NEW connection to the SQL Server database using the DB_CONFIG.
+    Each call gets its own connection to prevent concurrent access issues.
     
     Returns:
         pyodbc.Connection or None: Database connection object if successful, None otherwise
@@ -1222,59 +1234,22 @@ def get_db_connection():
         f"TrustServerCertificate=yes;"  # Add for SSL/TLS issues
     )
     
-    # Check for existing connection
-    if not hasattr(get_db_connection, "_connection") or get_db_connection._connection is None:
-        # Create new connection if none exists
-        try:
-            get_db_connection._connection = pyodbc.connect(conn_str, autocommit=False)
-            get_db_connection._connection.timeout = 30  # Set query timeout
-            debug_logger.info(f"Successfully connected to {DB_CONFIG['database']} on {DB_CONFIG['server']}")
-        except Exception as e:
-            debug_logger.error(f"Database connection error: {e}", exc_info=True)
-            get_db_connection._connection = None
-            return None
-    
-    # Test if connection is still valid, reconnect if needed
-    if get_db_connection._connection is not None:
-        try:
-            # Use a simpler test query that should work even on busy servers
-            cursor = get_db_connection._connection.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()  # Actually fetch the result
-            cursor.close()
-        except Exception as e:
-            debug_logger.warning(f"Connection test failed, reconnecting: {e}")
-            try:
-                get_db_connection._connection.close()
-            except:
-                pass
-            get_db_connection._connection = None
-            
-            # Create a fresh connection - don't use recursion to avoid stack overflow
-            try:
-                get_db_connection._connection = pyodbc.connect(conn_str, autocommit=False)
-                get_db_connection._connection.timeout = 30
-                debug_logger.info("Successfully reconnected to database")
-            except Exception as reconnect_error:
-                debug_logger.error(f"Failed to reconnect: {reconnect_error}")
-                get_db_connection._connection = None
-                return None
-    
-    return get_db_connection._connection
+    try:
+        # Create a fresh connection for each call
+        connection = pyodbc.connect(conn_str, autocommit=False)
+        connection.timeout = 30  # Set query timeout
+        debug_logger.debug(f"Created new database connection to {DB_CONFIG['database']}")
+        return connection
+    except Exception as e:
+        debug_logger.error(f"Database connection error: {e}", exc_info=True)
+        return None
 
 # Updated function to close the connection when needed
 def close_db_connection():
     """Explicitly close the database connection when shutting down"""
     # Stop external data fetching system
     stop_external_data_fetching()
-    
-    if hasattr(get_db_connection, "_connection") and get_db_connection._connection is not None:
-        try:
-            get_db_connection._connection.close()
-            get_db_connection._connection = None
-            debug_logger.info("Database connection closed successfully")
-        except Exception as e:
-            debug_logger.error(f"Error closing database connection: {e}")
+    debug_logger.info("Database connections will be closed automatically (individual connections per call)")
 
 def create_tables_if_not_exist():
     """
@@ -2526,7 +2501,8 @@ def sync_zones_to_database(currency="EUR.USD"):
                 cursor.close()
             except:
                 pass
-        # DO NOT close the connection when using connection pooling
+        if conn:
+            conn.close()
 
 
 
@@ -2641,7 +2617,8 @@ def store_zones_in_sql(zones_data):
                 cursor.close()
             except:
                 pass
-        # DO NOT close the connection when using connection pooling
+        if conn:
+            conn.close()
 
 
 
@@ -2659,10 +2636,10 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         external_position: Position from external system (negative=short, positive=long, 0=flat, None=unknown)
         
     Returns:
-        tuple: (signal, currency) where signal is 'buy', 'sell', or 'hold'
+        tuple: (signal, currency) where signal is 'buy', 'sell', 'hold', or 'StaleData'
     """
     global historical_ticks, current_valid_zones_dict
-    global trades, last_trade_time, balance
+    global trades, last_trade_time, last_loss_time, balance
     global last_non_hold_signal
 
     try:
@@ -2674,6 +2651,16 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 debug_logger.info(f"Using currency from data: {currency}")
             else:
                 debug_logger.warning(f"Unsupported currency in data: {extracted_currency}. Using {currency} instead.")
+        
+        # Check indicator freshness - return StaleData if indicators are stale
+        ind = external_indicators.get(currency, {})
+        freshness_status = ind.get('freshness_status', 'missing')
+        if freshness_status == 'stale':
+            debug_logger.warning(f"[STALE_DATA] {currency} indicators are stale - returning StaleData signal")
+            return ('StaleData', currency)
+        elif freshness_status == 'missing':
+            debug_logger.warning(f"[MISSING_DATA] {currency} indicators are missing - returning StaleData signal")
+            return ('StaleData', currency)
         
         # POSITION VALIDATION: Check buffer period and validate external position
         position_validation_result = None
@@ -2723,6 +2710,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             current_valid_zones_dict[currency] = {}
             trades[currency] = []
             last_trade_time[currency] = None
+            last_loss_time[currency] = None
             balance[currency] = 100000
             last_non_hold_signal[currency] = None
             debug_logger.info(f"Initialized data structures for {currency}")
@@ -2744,6 +2732,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             debug_logger.error(f"Received NaN or None price value for {currency}")
             return ('hold', currency)
 
+        # Extract tick time and price early for use throughout function
         tick_time = new_data_point.index[-1]
         tick_price = float(new_data_point['Price'].iloc[-1])
         
@@ -3111,7 +3100,7 @@ def check_pip_based_loss(current_price, current_time, currency):
         debug_logger.error(f"Unsupported currency in check_pip_based_loss: {currency}")
         return False
         
-    global trades, balance
+    global trades, balance, last_loss_time
     
     force_closed = False
     open_trades = [t for t in trades[currency] if t['status'] == 'open']
@@ -3164,6 +3153,9 @@ def check_pip_based_loss(current_price, current_time, currency):
                     'profit_loss': trade_result,
                     'close_reason': 'max_pip_loss'
                 })
+                
+                # Set cooldown after loss
+                last_loss_time[currency] = current_time
                 
                 trade_logger.warning(
                     f"{currency} trade force closed due to max pip loss.\n"
@@ -3282,7 +3274,8 @@ def load_recent_zones_from_database(limit=10):
                 cursor.close()
             except:
                 pass
-        # DO NOT close the connection when using connection pooling
+        if conn:
+            conn.close()
 
 
 
