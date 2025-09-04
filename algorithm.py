@@ -1016,9 +1016,19 @@ def fetch_latest_indicators_from_db():
                     signal_line = float(row[2]) if row[2] is not None else None
                     timestamp = row[3]
                     
-                    # Calculate data freshness
+                    # Calculate data freshness with MST timezone handling
                     if timestamp:
-                        time_diff = (datetime.datetime.now() - timestamp).total_seconds()
+                        import pytz
+                        # Get current time in MST (database timezone)
+                        mst_tz = pytz.timezone('US/Mountain')
+                        current_time_mst = datetime.datetime.now(mst_tz).replace(tzinfo=None)
+                        
+                        # Database timestamp is already in MST, treat as timezone-naive
+                        time_diff = (current_time_mst - timestamp).total_seconds()
+                        
+                        # Log the calculation for debugging
+                        debug_logger.info(f"[EXTERNAL_INDICATORS] {currency} time calculation: Current_MST={current_time_mst}, DB_MST={timestamp}, Diff={time_diff/60:.1f} min")
+                        
                         if time_diff <= INDICATOR_STALENESS_WARNING:
                             freshness_status = 'fresh'
                         else:
