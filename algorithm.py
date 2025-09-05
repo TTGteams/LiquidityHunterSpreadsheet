@@ -680,9 +680,9 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
 
                 # Exit immediately after opening a trade
                 # NOTE: Signal state will be updated in process_market_data after API return
-                # Do NOT update signal state here - let the corrected sequence handle it
+                # Return signal info so process_market_data can handle the API return
                 
-                return zones_dict
+                return zones_dict, signal_type
 
     return zones_dict
 
@@ -2782,13 +2782,19 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # 8) Attempt to open a new trade if none is open
         trades_before = len(trades[currency])
         open_trades = [t for t in trades[currency] if t['status'] == 'open']
+        entry_signal = None
         if not open_trades:
             # Pass tick data directly to entry conditions
-            updated_zones = check_entry_conditions(
+            entry_result = check_entry_conditions(
                 tick_time, tick_price, current_valid_zones_dict[currency], currency
             )
-            if updated_zones is not None:
+            # Handle both old return format (zones only) and new format (zones, signal)
+            if isinstance(entry_result, tuple) and len(entry_result) == 2:
+                updated_zones, entry_signal = entry_result
                 current_valid_zones_dict[currency] = updated_zones
+                signal_flow_logger.info(f"[ENTRY_SIGNAL] {currency} entry conditions returned: {entry_signal}")
+            elif entry_result is not None:
+                current_valid_zones_dict[currency] = entry_result
         new_trade_opened = (len(trades[currency]) > trades_before)
 
         # 12) Final validations and logging - reduced verbosity
@@ -2917,10 +2923,10 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             # Store the signal state from before this tick processing
             signal_before_tick = last_signals.get(currency, 'hold')
             
-            # If a new trade was opened, the signal was already set in check_entry_conditions
-            if new_trade_opened:
-                raw_signal = last_signals[currency]  # Use the NEW signal set by check_entry_conditions
-                debug_logger.info(f"[SIGNAL] {currency} using signal set by trade opening: {raw_signal}")
+            # If a new trade was opened, use the signal from entry conditions
+            if new_trade_opened and entry_signal:
+                raw_signal = entry_signal  # Use the signal returned from check_entry_conditions
+                debug_logger.info(f"[SIGNAL] {currency} using signal from entry conditions: {raw_signal}")
             elif closed_any_trade:
                 # Find the just-closed trade's direction and send opposite signal
                 last_closed_trade = get_last_closed_trade(currency)
