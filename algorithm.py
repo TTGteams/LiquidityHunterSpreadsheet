@@ -56,8 +56,8 @@ signal_state_file = 'algorithm_signals.json'
 last_signal_sent_time = {currency: None for currency in SUPPORTED_CURRENCIES}
 POSITION_BUFFER_SECONDS = 15  # Wait 15 seconds after signal before trusting position updates
 
-# Live trading mode flag - only save signal state when in live mode
-is_live_trading_mode = False
+# Live trading mode is always enabled - no conditional signal state updates
+is_live_trading_mode = True
 
 # Initialize global variables as dictionaries with currency keys
 # Raw tick-by-tick data (trimmed to 12 hours)
@@ -675,9 +675,8 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                 last_signals[currency] = signal_type
                 last_non_hold_signal[currency] = signal_type
                 
-                # Save signal state if in live trading mode
-                if is_live_trading_mode:
-                    save_algorithm_signal_state()
+                # Save signal state (always enabled)
+                save_algorithm_signal_state()
                 
                 return zones_dict
 
@@ -2992,94 +2991,83 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 debug_logger.error(f"[POSITION_VALIDATION] Error validating {currency} position: {e}")
                 # Continue with signal anyway - validation is non-blocking
 
-        # 16) Check against previous signal to prevent duplicates after restart
-        previous_signal = last_signals.get(currency, 'hold')
+        # Store the signal for database saving and logging, but don't update in-memory state yet
+        signal_to_return = raw_signal
         
-        # Only process if signal actually changed
-        if raw_signal != previous_signal:
-            # Update the signal state
-            last_signals[currency] = raw_signal
+        # Only save to database and log if signal actually changed
+        previous_signal = last_signals.get(currency, 'hold')
+        if signal_to_return != previous_signal and signal_to_return not in ['hold']:
+            # DETERMINE SIGNAL INTENT WITH ENHANCED VALIDATION
+            position_before = get_current_position_state(currency)
             
-            # Save signal state to disk for restart persistence (only in live trading mode)
-            if is_live_trading_mode:
-                save_algorithm_signal_state()
+            # Determine position after based on signal and current state
+            if signal_to_return == 'buy':
+                if closed_any_trade:
+                    # This is a close signal (closing short position)
+                    position_after = 'FLAT'
+                else:
+                    # This is an open signal (opening long position)
+                    position_after = 'LONG'
+            elif signal_to_return == 'sell':
+                if closed_any_trade:
+                    # This is a close signal (closing long position)
+                    position_after = 'FLAT'
+                else:
+                    # This is an open signal (opening short position)
+                    position_after = 'SHORT'
+            else:
+                position_after = position_before  # No change for hold
             
-            # Update the last_non_hold_signal if we have a real signal
-            if raw_signal not in ['hold']:
-                last_non_hold_signal[currency] = raw_signal
-                
-                # DETERMINE SIGNAL INTENT WITH ENHANCED VALIDATION
-                position_before = get_current_position_state(currency)
-                
-                # Determine position after based on signal and current state
-                if raw_signal == 'buy':
-                    if closed_any_trade:
-                        # This is a close signal (closing short position)
-                        position_after = 'FLAT'
-                    else:
-                        # This is an open signal (opening long position)
-                        position_after = 'LONG'
-                elif raw_signal == 'sell':
-                    if closed_any_trade:
-                        # This is a close signal (closing long position)
-                        position_after = 'FLAT'
-                    else:
-                        # This is an open signal (opening short position)
-                        position_after = 'SHORT'
-                else:
-                    position_after = position_before  # No change for hold
-                
-                # Determine signal intent
-                signal_intent = determine_signal_intent(raw_signal, position_before, position_after)
-                
-                # CRITICAL FIX: ALWAYS save signal regardless of validation
-                # This ensures perfect alignment between TWS and database
-                
-                # Log validation issues but don't block saving
-                if signal_intent == 'UNKNOWN':
-                    debug_logger.error(
-                        f"[SIGNAL_INTENT] Invalid signal transition for {currency}: "
-                        f"{raw_signal} from {position_before} to {position_after} - SAVING ANYWAY"
-                    )
-                
-                # SAVE ALL NON-HOLD SIGNALS TO DATABASE - NO EXCEPTIONS
-                # NOTE: Recovery signals are NOT saved to DB - natural convergence only
-                if recovery_result and recovery_result.get('recovery_action') != 'none':
-                    # Recovery signal - don't save to DB, just send to API for position correction
-                    debug_logger.info(f"[NATURAL_CONVERGENCE] {currency} recovery signal NOT saved to DB - natural convergence will occur on next legitimate trade")
-                    success = True  # Mark as successful for buffer logic
-                else:
-                    # Normal trading signal - save to DB as usual
-                    success = save_signal_to_database(raw_signal, tick_price, tick_time, currency, signal_intent, external_position)
-                
-                # Record signal timestamp for buffer logic
-                if success:
-                    last_signal_sent_time[currency] = datetime.datetime.now()
-                
-                if not success:
-                    debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
-                else:
-                    debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
-
-                # Enhanced signal logging - but less verbose
-                debug_logger.warning(
-                    f"{currency} TRADE SIGNAL: {raw_signal.upper()} at {tick_price:.5f}, Time: {tick_time}"
+            # Determine signal intent
+            signal_intent = determine_signal_intent(signal_to_return, position_before, position_after)
+            
+            # Log validation issues but don't block saving
+            if signal_intent == 'UNKNOWN':
+                debug_logger.error(
+                    f"[SIGNAL_INTENT] Invalid signal transition for {currency}: "
+                    f"{signal_to_return} from {position_before} to {position_after} - SAVING ANYWAY"
                 )
+            
+            # SAVE ALL NON-HOLD SIGNALS TO DATABASE - NO EXCEPTIONS
+            if recovery_result and recovery_result.get('recovery_action') != 'none':
+                # Recovery signal - don't save to DB, just send to API for position correction
+                debug_logger.info(f"[NATURAL_CONVERGENCE] {currency} recovery signal NOT saved to DB - natural convergence will occur on next legitimate trade")
+                success = True  # Mark as successful for buffer logic
+            else:
+                # Normal trading signal - save to DB as usual
+                success = save_signal_to_database(signal_to_return, tick_price, tick_time, currency, signal_intent, external_position)
+            
+            # Record signal timestamp for buffer logic
+            if success:
+                last_signal_sent_time[currency] = datetime.datetime.now()
+            
+            if not success:
+                debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
+            else:
+                debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
 
-            # 16) Log only non-hold signals that actually changed
-            if raw_signal not in ['hold']:
-                if is_live_trading_mode:
-                    trade_logger.info(f"{currency} signal determined: {raw_signal}")
-                else:
-                    debug_logger.debug(f"[BACKTEST] {currency} signal determined: {raw_signal}")
+            # Enhanced signal logging
+            debug_logger.warning(
+                f"{currency} TRADE SIGNAL: {signal_to_return.upper()} at {tick_price:.5f}, Time: {tick_time}"
+            )
+            
+            trade_logger.info(f"{currency} signal determined: {signal_to_return}")
+
+        # CRITICAL: Return signal BEFORE updating in-memory state
+        return_value = (signal_to_return, currency)
+        
+        # NOW update in-memory state after signal has been determined for return
+        if signal_to_return != previous_signal:
+            last_signals[currency] = signal_to_return
+            if signal_to_return not in ['hold']:
+                last_non_hold_signal[currency] = signal_to_return
+            # Save signal state to disk for restart persistence
+            save_algorithm_signal_state()
         else:
-            # Signal hasn't changed, don't generate duplicate
-            if is_live_trading_mode:
-                debug_logger.debug(f"[SIGNAL_STATE] {currency} signal unchanged: {raw_signal}")
-            # Still update last_signals to ensure it's current (in case of restart)
-            last_signals[currency] = raw_signal
+            # Signal unchanged - just ensure state is current
+            last_signals[currency] = signal_to_return
 
-        return (raw_signal, currency)
+        return return_value
 
     except Exception as e:
         debug_logger.error(f"Error in process_market_data for {currency}: {e}", exc_info=True)
