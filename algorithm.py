@@ -3033,9 +3033,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 # Normal trading signal - save to DB as usual
                 success = save_signal_to_database(signal_to_return, tick_price, tick_time, currency, signal_intent, external_position)
             
-            # Record signal timestamp for buffer logic
-            if success:
-                last_signal_sent_time[currency] = datetime.datetime.now()
+            # Signal timestamp is now set after return value creation for ALL signals
             
             if not success:
                 debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
@@ -3052,13 +3050,16 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # CRITICAL: Return signal BEFORE updating in-memory state
         return_value = (signal_to_return, currency)
         
+        # Set signal timestamp for ALL non-hold signals (for position buffer logic)
+        if signal_to_return not in ['hold']:
+            last_signal_sent_time[currency] = datetime.datetime.now()
+        
         # NOW update in-memory state after signal has been determined for return
         if signal_to_return != previous_signal:
             last_signals[currency] = signal_to_return
             if signal_to_return not in ['hold']:
                 last_non_hold_signal[currency] = signal_to_return
-            # Save signal state to disk for restart persistence
-            save_algorithm_signal_state()
+            # Signal state is managed in-memory only - no file persistence needed
         else:
             # Signal unchanged - just ensure state is current
             last_signals[currency] = signal_to_return
