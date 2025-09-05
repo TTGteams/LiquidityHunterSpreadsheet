@@ -2177,7 +2177,7 @@ def determine_position_from_signal_history(currency):
             elif base_intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
                 debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: SHORT ({intent})")
                 return 'SHORT'
-            elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+            elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT', 'SYSTEM_RESET']:
                 debug_logger.info(f"[POSITION_HISTORY] {currency} position from SignalIntent: FLAT ({intent})")
                 return 'FLAT'
         
@@ -3376,7 +3376,7 @@ def load_algorithm_signal_state():
                         expected_signal = 'buy'  # Should be in long position
                     elif base_intent in ['OPEN_SHORT', 'CLOSE_LONG_OPEN_SHORT']:
                         expected_signal = 'sell'  # Should be in short position
-                    elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT']:
+                    elif base_intent in ['CLOSE_LONG', 'CLOSE_SHORT', 'SYSTEM_RESET']:
                         expected_signal = 'hold'  # Should be flat
                     else:
                         expected_signal = 'hold'  # Default for unknown intents
