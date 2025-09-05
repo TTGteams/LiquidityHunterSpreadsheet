@@ -14,6 +14,11 @@ import threading
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
 
+# Create dedicated signal flow logger for tracking signal processing
+signal_flow_logger = logging.getLogger("signal_flow_logger")
+signal_flow_logger.setLevel(logging.INFO)
+signal_flow_logger.propagate = False
+
 # Define supported currencies
 SUPPORTED_CURRENCIES = ["EUR.USD", "USD.CAD", "GBP.USD"]
 
@@ -627,6 +632,7 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
             if not any(trade.get('status', '') == 'open' for trade in trades_for_currency):
                 # Create the trade
                 debug_logger.warning(f"\n  >> TRADE SIGNAL GENERATED for {currency}: {zone_type} at {entry_price:.5f}!")
+                signal_flow_logger.info(f"[SIGNAL_GEN] {currency} {signal_type} generated at {entry_price:.5f}")
                 
                 trade_direction = 'long' if zone_type == 'demand' else 'short'
                 
@@ -657,8 +663,10 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                 success = save_signal_to_database(signal_type, entry_price, current_time, currency, signal_intent)
                 if not success:
                     debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
+                    signal_flow_logger.info(f"[DB_SAVE_FAIL] {currency} {signal_type} DB save failed")
                 else:
                     debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
+                    signal_flow_logger.info(f"[DB_SAVED] {currency} {signal_type} saved to DB")
                 
                 trade_logger.info(
                     f"{currency} Signal generated: {zone_type} trade at {entry_price} "
@@ -2678,6 +2686,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             
             if last_sent and (current_time_obj - last_sent).total_seconds() < POSITION_BUFFER_SECONDS:
                 remaining_buffer = POSITION_BUFFER_SECONDS - (current_time_obj - last_sent).total_seconds()
+                signal_flow_logger.info(f"[BUFFER_ACTIVE] {currency} position ignored ({remaining_buffer:.1f}s remaining)")
                 debug_logger.info(
                     f"[POSITION_BUFFER] {currency} ignoring position update - "
                     f"still in {remaining_buffer:.1f}s buffer period after signal"
@@ -2940,6 +2949,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # 14) Block consecutive signals of the same type
         # This prevents duplicate buy/buy or sell/sell signals
         if raw_signal in ['buy', 'sell'] and last_non_hold_signal[currency] == raw_signal:
+            signal_flow_logger.info(f"[DUPLICATE_BLOCKED] {currency} {raw_signal} → hold (last_non_hold: {last_non_hold_signal[currency]})")
             # Already had the same signal before, so return hold to prevent duplicates
             raw_signal = 'hold'
 
@@ -3053,12 +3063,14 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # Set signal timestamp for ALL non-hold signals (for position buffer logic)
         if signal_to_return not in ['hold']:
             last_signal_sent_time[currency] = datetime.datetime.now()
+            signal_flow_logger.info(f"[API_RETURN] {currency} → {signal_to_return} (buffer activated for 15s)")
         
         # NOW update in-memory state after signal has been determined for return
         if signal_to_return != previous_signal:
             last_signals[currency] = signal_to_return
             if signal_to_return not in ['hold']:
                 last_non_hold_signal[currency] = signal_to_return
+                signal_flow_logger.info(f"[STATE_UPDATED] {currency} last_non_hold_signal → {signal_to_return}")
             # Signal state is managed in-memory only - no file persistence needed
         else:
             # Signal unchanged - just ensure state is current

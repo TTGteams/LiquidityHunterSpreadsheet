@@ -20,12 +20,15 @@ SKIP_MODE3 = False
 
 trade_logger = logging.getLogger("trade_logger")
 debug_logger = logging.getLogger("debug_logger")
+signal_flow_logger = logging.getLogger("signal_flow_logger")
 
 trade_logger.setLevel(logging.INFO)
 debug_logger.setLevel(logging.WARNING)
+signal_flow_logger.setLevel(logging.INFO)
 
 trade_logger.propagate = False
 debug_logger.propagate = False
+signal_flow_logger.propagate = False
 
 # Custom formatter class to handle MST timezone
 class MSTFormatter(logging.Formatter):
@@ -60,6 +63,17 @@ debug_handler.setLevel(logging.DEBUG)
 debug_formatter = MSTFormatter('%(asctime)s - %(levelname)s - %(message)s')
 debug_handler.setFormatter(debug_formatter)
 debug_logger.addHandler(debug_handler)
+
+# Signal flow logger - dedicated file for signal tracking
+signal_flow_handler = RotatingFileHandler(
+    'signal_flow.log',
+    maxBytes=5000000,  # 5MB per file
+    backupCount=2
+)
+signal_flow_handler.setLevel(logging.INFO)
+signal_flow_formatter = MSTFormatter('%(asctime)s - %(message)s')
+signal_flow_handler.setFormatter(signal_flow_formatter)
+signal_flow_logger.addHandler(signal_flow_handler)
 
 # Create a lock for thread safety
 state_lock = threading.Lock()
