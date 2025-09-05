@@ -61,6 +61,10 @@ signal_state_file = 'algorithm_signals.json'
 last_signal_sent_time = {currency: None for currency in SUPPORTED_CURRENCIES}
 POSITION_BUFFER_SECONDS = 15  # Wait 15 seconds after signal before trusting position updates
 
+# Tick processing buffer - prevent rapid tick processing after non-hold signals
+last_tick_processed_time = {currency: None for currency in SUPPORTED_CURRENCIES}
+TICK_PROCESSING_BUFFER_SECONDS = 1.5  # Wait 1.5 seconds after non-hold signal before processing next tick
+
 # Live trading mode is always enabled - no conditional signal state updates
 is_live_trading_mode = True
 
@@ -2656,6 +2660,15 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
     global last_non_hold_signal
 
     try:
+        # Check tick processing buffer - prevent rapid processing after non-hold signals
+        current_time_obj = datetime.datetime.now()
+        last_processed = last_tick_processed_time.get(currency)
+        
+        if last_processed and (current_time_obj - last_processed).total_seconds() < TICK_PROCESSING_BUFFER_SECONDS:
+            remaining_buffer = TICK_PROCESSING_BUFFER_SECONDS - (current_time_obj - last_processed).total_seconds()
+            signal_flow_logger.info(f"[TICK_BUFFER] {currency} tick ignored ({remaining_buffer:.1f}s remaining)")
+            return ('hold', currency)
+        
         # Extract currency from data if available, otherwise use the provided currency
         if 'Currency' in new_data_point.columns:
             extracted_currency = new_data_point['Currency'].iloc[0]
@@ -3069,7 +3082,8 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         # Set signal timestamp for ALL non-hold signals (for position buffer logic)
         if signal_to_return not in ['hold']:
             last_signal_sent_time[currency] = datetime.datetime.now()
-            signal_flow_logger.info(f"[API_RETURN] {currency} → {signal_to_return} (buffer activated for 15s)")
+            last_tick_processed_time[currency] = datetime.datetime.now()  # Set tick buffer
+            signal_flow_logger.info(f"[API_RETURN] {currency} → {signal_to_return} (15s position buffer + 1.5s tick buffer activated)")
         
         # NOW update in-memory state after signal has been determined for return
         if signal_to_return != previous_signal:

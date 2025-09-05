@@ -176,6 +176,8 @@ def trade_signal():
         # Only log if signal is not 'hold'
         if signal != 'hold':
             trade_logger.info(f"Generated {processed_currency} signal: {signal}")
+            # Log to signal flow to verify API response
+            algorithm.signal_flow_logger.info(f"[API_RESPONSE] {processed_currency} → {signal} (sent to external app)")
             
         # Always return the signal and currency, even if it's 'hold'
         return jsonify({'signal': signal, 'currency': processed_currency}), 200
