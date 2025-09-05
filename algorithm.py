@@ -662,16 +662,8 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
 
                 last_trade_time[currency] = current_time
                 
-                # CRITICAL FIX: SAVE SIGNAL TO DATABASE FOR ALL PATHS
-                signal_intent = 'OPEN_LONG' if zone_type == 'demand' else 'OPEN_SHORT'
-                
-                success = save_signal_to_database(signal_type, entry_price, current_time, currency, signal_intent)
-                if not success:
-                    debug_logger.error(f"❌ [SIGNAL_SAVE] CRITICAL: Failed to save {currency} signal: {signal_intent}")
-                    signal_flow_logger.info(f"[DB_SAVE_FAIL] {currency} {signal_type} DB save failed")
-                else:
-                    debug_logger.info(f"✅ [SIGNAL_SAVE] Successfully saved {currency} signal: {signal_intent}")
-                    signal_flow_logger.info(f"[DB_SAVED] {currency} {signal_type} saved to DB")
+                # IMPORTANT: Do not save to FXStrat_TradeSignalsSent here.
+                # Signal will be saved exactly once in process_market_data() after final decision.
                 
                 trade_logger.info(
                     f"{currency} Signal generated: {zone_type} trade at {entry_price} "

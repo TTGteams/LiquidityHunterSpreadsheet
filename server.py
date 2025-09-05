@@ -78,9 +78,9 @@ signal_flow_logger.addHandler(signal_flow_handler)
 # Create a lock for thread safety
 state_lock = threading.Lock()
 
-# API throttling - limit ticks to every 0.8 seconds per currency
+# API throttling - limit ticks to every 5 seconds per currency (allows external app processing time)
 last_api_call_time = {}
-API_THROTTLE_SECONDS = 0.8
+API_THROTTLE_SECONDS = 5.0
 
 @app.route('/trade_signal', methods=['POST'])
 def trade_signal():
