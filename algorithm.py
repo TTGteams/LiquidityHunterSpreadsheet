@@ -671,12 +671,8 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                 debug_logger.warning(f"  Open trades: {len([t for t in trades[currency] if t['status'] == 'open'])}")
 
                 # Exit immediately after opening a trade
-                # CRITICAL FIX: Set signal state so it gets returned to API
-                last_signals[currency] = signal_type
-                last_non_hold_signal[currency] = signal_type
-                
-                # Save signal state (always enabled)
-                save_algorithm_signal_state()
+                # NOTE: Signal state will be updated in process_market_data after API return
+                # Do NOT update signal state here - let the corrected sequence handle it
                 
                 return zones_dict
 
