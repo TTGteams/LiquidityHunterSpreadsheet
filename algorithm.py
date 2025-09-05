@@ -2660,14 +2660,6 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
     global last_non_hold_signal
 
     try:
-        # Check tick processing buffer - prevent rapid processing after non-hold signals
-        current_time_obj = datetime.datetime.now()
-        last_processed = last_tick_processed_time.get(currency)
-        
-        if last_processed and (current_time_obj - last_processed).total_seconds() < TICK_PROCESSING_BUFFER_SECONDS:
-            remaining_buffer = TICK_PROCESSING_BUFFER_SECONDS - (current_time_obj - last_processed).total_seconds()
-            signal_flow_logger.info(f"[TICK_BUFFER] {currency} tick ignored ({remaining_buffer:.1f}s remaining)")
-            return ('hold', currency)
         
         # Extract currency from data if available, otherwise use the provided currency
         if 'Currency' in new_data_point.columns:
@@ -2792,11 +2784,20 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         current_valid_zones_dict[currency] = remove_consecutive_losers(trades[currency], current_valid_zones_dict[currency], currency)
         current_valid_zones_dict[currency] = invalidate_zones_via_sup_and_resist(tick_price, current_valid_zones_dict[currency], currency)
 
-        # 8) Attempt to open a new trade if none is open
+        # 8) Check tick processing buffer before attempting new trades
         trades_before = len(trades[currency])
         open_trades = [t for t in trades[currency] if t['status'] == 'open']
         entry_signal = None
-        if not open_trades:
+        
+        # Check tick processing buffer - prevent rapid signal generation
+        current_time_obj = datetime.datetime.now()
+        last_processed = last_tick_processed_time.get(currency)
+        
+        if (not open_trades and last_processed and 
+            (current_time_obj - last_processed).total_seconds() < TICK_PROCESSING_BUFFER_SECONDS):
+            remaining_buffer = TICK_PROCESSING_BUFFER_SECONDS - (current_time_obj - last_processed).total_seconds()
+            signal_flow_logger.info(f"[TICK_BUFFER] {currency} new trade check skipped ({remaining_buffer:.1f}s remaining)")
+        elif not open_trades:
             # Pass tick data directly to entry conditions
             entry_result = check_entry_conditions(
                 tick_time, tick_price, current_valid_zones_dict[currency], currency
@@ -2939,6 +2940,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             # If a new trade was opened, use the signal from entry conditions
             if new_trade_opened and entry_signal:
                 raw_signal = entry_signal  # Use the signal returned from check_entry_conditions
+                signal_flow_logger.info(f"[SIGNAL_LOGIC] {currency} using signal from entry conditions: {raw_signal}")
                 debug_logger.info(f"[SIGNAL] {currency} using signal from entry conditions: {raw_signal}")
             elif closed_any_trade:
                 # Find the just-closed trade's direction and send opposite signal
@@ -2964,6 +2966,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                     raw_signal = 'sell'
             else:
                 raw_signal = 'hold'
+                signal_flow_logger.info(f"[SIGNAL_LOGIC] {currency} no conditions met → hold")
 
         # 14) Block consecutive signals of the same type
         # This prevents duplicate buy/buy or sell/sell signals

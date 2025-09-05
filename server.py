@@ -78,6 +78,10 @@ signal_flow_logger.addHandler(signal_flow_handler)
 # Create a lock for thread safety
 state_lock = threading.Lock()
 
+# API throttling - limit ticks to every 0.8 seconds per currency
+last_api_call_time = {}
+API_THROTTLE_SECONDS = 0.8
+
 @app.route('/trade_signal', methods=['POST'])
 def trade_signal():
     try:
@@ -102,6 +106,18 @@ def trade_signal():
             error_msg = f"Unsupported currency: {currency}"
             trade_logger.error(error_msg)
             return jsonify({'error': error_msg}), 400
+        
+        # API throttling - limit ticks to every 0.8 seconds per currency
+        current_time = datetime.datetime.now()
+        last_call = last_api_call_time.get(currency)
+        
+        if last_call and (current_time - last_call).total_seconds() < API_THROTTLE_SECONDS:
+            remaining_throttle = API_THROTTLE_SECONDS - (current_time - last_call).total_seconds()
+            algorithm.signal_flow_logger.info(f"[API_THROTTLE] {currency} request throttled ({remaining_throttle:.1f}s remaining)")
+            return jsonify({'signal': 'hold', 'currency': currency}), 200
+        
+        # Update last call time for this currency
+        last_api_call_time[currency] = current_time
         
         # Validate input data
         required_fields = ['Time', 'Price']
