@@ -641,7 +641,7 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                 signal_type = 'buy' if zone_type == 'demand' else 'sell'
                 signal_flow_logger.info(f"[SIGNAL_GEN] {currency} {signal_type} generated at {entry_price:.5f}")
                 
-                trades_for_currency.append({
+                new_trade = {
                     'entry_time': current_time,
                     'entry_price': entry_price,
                     'stop_loss': stop_loss,
@@ -652,9 +652,10 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                     'zone_start_price': zone_start,
                     'zone_end_price': zone_end,
                     'zone_length': zone_data.get('zone_length', 0),
-
                     'currency': currency  # Store the currency for reference
-                })
+                }
+                trades_for_currency.append(new_trade)
+                signal_flow_logger.info(f"[TRADE_CREATED] {currency} {trade_direction} trade created at {entry_price:.5f}")
                 
                 # Save position to database for crash recovery
                 save_current_position_to_db(currency, trade_direction, current_time, entry_price)
@@ -2809,6 +2810,8 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 signal_flow_logger.info(f"[ENTRY_SIGNAL] {currency} entry conditions returned: {entry_signal}")
             elif entry_result is not None:
                 current_valid_zones_dict[currency] = entry_result
+        
+        # Check for new trades AFTER entry conditions
         new_trade_opened = (len(trades[currency]) > trades_before)
 
         # 12) Final validations and logging - reduced verbosity
@@ -2938,6 +2941,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
             signal_before_tick = last_signals.get(currency, 'hold')
             
             # If a new trade was opened, use the signal from entry conditions
+            signal_flow_logger.info(f"[SIGNAL_DEBUG] {currency} new_trade_opened: {new_trade_opened}, entry_signal: {entry_signal}")
             if new_trade_opened and entry_signal:
                 raw_signal = entry_signal  # Use the signal returned from check_entry_conditions
                 signal_flow_logger.info(f"[SIGNAL_LOGIC] {currency} using signal from entry conditions: {raw_signal}")
