@@ -632,9 +632,10 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
             if not any(trade.get('status', '') == 'open' for trade in trades_for_currency):
                 # Create the trade
                 debug_logger.warning(f"\n  >> TRADE SIGNAL GENERATED for {currency}: {zone_type} at {entry_price:.5f}!")
-                signal_flow_logger.info(f"[SIGNAL_GEN] {currency} {signal_type} generated at {entry_price:.5f}")
                 
                 trade_direction = 'long' if zone_type == 'demand' else 'short'
+                signal_type = 'buy' if zone_type == 'demand' else 'sell'
+                signal_flow_logger.info(f"[SIGNAL_GEN] {currency} {signal_type} generated at {entry_price:.5f}")
                 
                 trades_for_currency.append({
                     'entry_time': current_time,
@@ -657,7 +658,6 @@ def check_entry_conditions(current_time, current_price, valid_zones_dict, curren
                 last_trade_time[currency] = current_time
                 
                 # CRITICAL FIX: SAVE SIGNAL TO DATABASE FOR ALL PATHS
-                signal_type = 'buy' if zone_type == 'demand' else 'sell'
                 signal_intent = 'OPEN_LONG' if zone_type == 'demand' else 'OPEN_SHORT'
                 
                 success = save_signal_to_database(signal_type, entry_price, current_time, currency, signal_intent)
@@ -3387,8 +3387,7 @@ def load_algorithm_signal_state():
         
         if db_state_loaded:
             debug_logger.warning("[SIGNAL_STATE] Used database SignalIntent to correct signal state")
-            # Save corrected state back to file
-            save_algorithm_signal_state()
+            # Signal state managed in-memory only - no file needed
         
         debug_logger.info(f"[SIGNAL_STATE] Final signal state: {last_signals}")
         return file_loaded or db_state_loaded
@@ -3482,8 +3481,7 @@ def reset_trading_state_for_live_trading():
         debug_logger.info("[TRADING_RESET] Recovering positions from database...")
         recover_positions_from_database()
         
-        # Save fresh signal state
-        save_algorithm_signal_state()
+        # Signal state managed in-memory only
         
         debug_logger.info("[TRADING_RESET] Trading state reset for live trading - all signals set to 'hold'")
         debug_logger.info("[TRADING_RESET] Live trading mode ENABLED - signal state will now be saved")
