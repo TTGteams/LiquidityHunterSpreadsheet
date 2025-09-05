@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import pandas as pd
-import algorithm
+# DO NOT import algorithm here - import it after setting ALGO_INSTANCE
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
@@ -79,6 +79,9 @@ def trade_signal():
         
         # Check if this is a forwarded signal from batch processing
         is_forwarded = content.get('source') == 'batch_forward'
+        
+        # Import algorithm module (will be available after main block sets ALGO_INSTANCE)
+        import algorithm
         
         # Validate currency is in supported list
         if currency not in algorithm.SUPPORTED_CURRENCIES:
@@ -288,7 +291,7 @@ are handled by your external trading application."""
                     'timestamp': current_time.isoformat(),
                     'price_data': price_info,
                     'total_zones': sum(len(zones) for zones in algorithm.current_valid_zones_dict.values()),
-                    'supported_currencies': algorithm.SUPPORTED_CURRENCIES
+                    'supported_currencies': ['EUR.USD', 'USD.CAD', 'GBP.USD']  # Hardcoded to avoid import issues
                 }
                 
                 return jsonify({
@@ -314,7 +317,7 @@ def health_check():
     return jsonify({
         'status': 'running',
         'timestamp': datetime.datetime.now().isoformat(),
-        'supported_currencies': algorithm.SUPPORTED_CURRENCIES
+        'supported_currencies': ['EUR.USD', 'USD.CAD', 'GBP.USD']  # Hardcoded to avoid import issues
     }), 200
 
 @app.route('/algorithm_state', methods=['GET'])
@@ -602,17 +605,25 @@ if __name__ == '__main__':
     import os
     ALGO_INSTANCE = int(os.environ.get('ALGO_INSTANCE', '1'))
     
+    # CRITICAL: Set environment variable BEFORE importing algorithm module
+    os.environ['ALGO_INSTANCE'] = str(ALGO_INSTANCE)
+    
     # Show immediate startup message
     print(f"Starting Algorithm Trading Server - Instance #{ALGO_INSTANCE}...")
     if SKIP_MODE2 and SKIP_MODE3:
         print("SKIP MODE enabled (legacy flag - warmup disabled)")
     print("Initializing database connections...")
     
-    # Import algorithm but DON'T run warmup during startup (avoid circular dependency)
+    # NOW import algorithm module - it will read the correct ALGO_INSTANCE
     import algorithm
     
-    # Set the instance ID in the algorithm module
-    algorithm.ALGO_INSTANCE = ALGO_INSTANCE
+    # Verify the instance ID was set correctly
+    if algorithm.ALGO_INSTANCE != ALGO_INSTANCE:
+        print(f"WARNING: Algorithm instance mismatch! Expected {ALGO_INSTANCE}, got {algorithm.ALGO_INSTANCE}")
+        algorithm.ALGO_INSTANCE = ALGO_INSTANCE  # Force set as backup
+        print(f"Forced algorithm instance to {ALGO_INSTANCE}")
+    else:
+        print(f"✅ Algorithm instance correctly set to {algorithm.ALGO_INSTANCE}")
     
     # Initialize database and basic algorithm state
     debug_logger.info(f"Initializing algorithm database connections for instance {ALGO_INSTANCE}...")

@@ -45,8 +45,8 @@ DB_CONFIG = {
     'driver': 'ODBC Driver 17 for SQL Server'
 }
 
-# Algorithm instance ID (set by server.py)
-ALGO_INSTANCE = 1  # Default to 1, will be overridden by server.py
+# Algorithm instance ID (read from environment variable)
+ALGO_INSTANCE = int(os.environ.get('ALGO_INSTANCE', '1'))  # Read from environment, default to 1
 
 # Signal state tracking to prevent duplicate signals after restart
 last_signals = {currency: 'hold' for currency in SUPPORTED_CURRENCIES}
