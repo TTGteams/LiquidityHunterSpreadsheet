@@ -2989,7 +2989,7 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
                 # Compare positions
                 if db_position and memory_position:
                     if (db_position['direction'] != memory_position['direction'] or 
-                        abs(db_position['entry_price'] - memory_position['entry_price']) > 0.00001):
+                        abs(float(db_position['entry_price']) - float(memory_position['entry_price'])) > 0.00001):
                         debug_logger.warning(
                             f"[POSITION_VALIDATION] {currency} position mismatch detected!\n"
                             f"  DB: {db_position['direction']} at {db_position['entry_price']}\n"
@@ -3022,7 +3022,11 @@ def process_market_data(new_data_point, currency="EUR.USD", external_position=No
         previous_signal = last_signals.get(currency, 'hold')
         if signal_to_return != previous_signal and signal_to_return not in ['hold']:
             # DETERMINE SIGNAL INTENT WITH ENHANCED VALIDATION
-            position_before = get_current_position_state(currency)
+            try:
+                position_before = get_current_position_state(currency)
+            except Exception as e:
+                debug_logger.error(f"[POSITION_STATE] Error getting position state for {currency}: {e}")
+                position_before = 'FLAT'  # Default to FLAT on error
             
             # Determine position after based on signal and current state
             if signal_to_return == 'buy':
